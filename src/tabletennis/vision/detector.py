@@ -69,9 +69,12 @@ def create_detector(kind: str) -> Any:
 
 
 def _create_pose_detector() -> Any:
-    """创建 RTMPose 姿态检测器（延迟 import 避免循环依赖）。"""
+    """创建 RTMPose 姿态检测器（延迟 import 避免循环依赖）。
+
+    默认 GPU + TensorRT（缺 TensorRT/CUDA 时自动回退 CUDA EP / CPU）。
+    """
     from .pose.rtmpose_pose import RTMPoseDetector
-    return RTMPoseDetector()
+    return RTMPoseDetector(device="cuda", backend="tensorrt")
 
 
 def _create_table_detector() -> Any:
