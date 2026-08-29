@@ -230,6 +230,71 @@ class RTMPoseDetector(PoseDetector):
             )
         return poses
 
+    def detect_batch(self, frames: List[Frame]) -> List[List[Pose2D]]:
+        """批处理多帧姿态检测，返回与 ``frames`` 等长的 ``List[List[Pose2D]]``。
+
+        多相机实时用：把 4 台相机的人框收集起来，RTMPose 一次 forward 处理所有
+        裁剪（RTMPose ONNX 的 batch 维是动态的），相比逐人逐帧调用少掉大量
+        kernel 启动与传输开销。YOLOX 的 ONNX 是固定 batch=1（且已内置 NMS），
+        无法批，仍逐帧跑——但它经 TensorRT 后单帧 ~1-2ms，4 路也就几 ms。
+        """
+        n = len(frames)
+        results: List[List[Pose2D]] = [[] for _ in range(n)]
+        if n == 0:
+            return results
+
+        # 1) 逐帧 YOLOX 检测（模型固定 batch=1）
+        dets: List = []  # 每帧: (bgr 或 None, bboxes)
+        for frame in frames:
+            if frame.image is None or frame.image.size == 0:
+                dets.append((None, []))
+                continue
+            bgr = np.stack([frame.image] * 3, axis=-1) if frame.image.ndim == 2 else frame.image
+            bboxes = self._det_model(bgr)
+            dets.append((bgr, [] if bboxes is None or len(bboxes) == 0 else bboxes))
+
+        # 2) 收集所有 (帧, 人) 的裁剪与 center/scale
+        crops: List[np.ndarray] = []
+        meta: List = []  # (frame_idx, person_idx, center, scale)
+        for fi, (bgr, bboxes) in enumerate(dets):
+            if bgr is None:
+                continue
+            for pi, bbox in enumerate(bboxes):
+                img, center, scale = self._pose_model.preprocess(bgr, bbox)
+                crops.append(img)
+                meta.append((fi, pi, center, scale))
+
+        # 3) RTMPose 批量 forward（一次 session.run 处理所有裁剪）
+        if crops:
+            batch = np.ascontiguousarray(
+                np.stack(crops).transpose(0, 3, 1, 2), dtype=np.float32
+            )  # (N, 3, H, W)
+            sess = self._pose_model.session
+            sess_input = {sess.get_inputs()[0].name: batch}
+            sess_output = [o.name for o in sess.get_outputs()]
+            outputs = sess.run(sess_output, sess_input)
+            simcc_x, simcc_y = outputs[0], outputs[1]  # (N, K, Wx) / (N, K, Wy)
+
+            for i, (fi, pi, center, scale) in enumerate(meta):
+                # 逐人 postprocess（复用 rtmlib 逻辑，保持单人的 center/scale 语义）
+                kpts, scs = self._pose_model.postprocess(
+                    [simcc_x[i:i + 1], simcc_y[i:i + 1]], center, scale
+                )
+                kpts = np.asarray(kpts[0], dtype=np.float32)  # (K, 2)
+                scs = np.asarray(scs[0], dtype=np.float32)    # (K,)
+                kpts3 = np.concatenate([kpts, scs[:, None]], axis=1)  # (K, 3)
+                bbox = np.asarray(dets[fi][1][pi], dtype=np.float32)[:4]
+                results[fi].append(
+                    Pose2D(
+                        camera_id=frames[fi].camera_id,
+                        keypoints=kpts3,
+                        score=float(np.max(scs)) if len(scs) else 0.0,
+                        bbox=bbox,
+                        skeleton=self._skeleton,
+                    )
+                )
+        return results
+
     def close(self) -> None:
         self._det_model = None
         self._pose_model = None
