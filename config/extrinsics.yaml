@@ -1,0 +1,40 @@
+# 多相机外参标定配置（scripts/calibrate_extrinsics.py 使用）
+
+# ---- ChArUco 标定板 ----
+# 关键：这些参数必须与实际打印的板完全一致，否则检测不到 / 位姿算错。
+charuco:
+  squares_x: 13             # 格子列数（长边方向）
+  squares_y: 9              # 格子行数（短边方向）
+  square_length_m: 0.084    # 每格边长(米)：A4 板=0.021，1 米板=0.08
+  marker_length_m: 0.063    # 格内 ArUco 标记边长(米)，须按实际打印板测量
+  dictionary: DICT_5X5_250  # ArUco 字典，须与打印板一致（13x9 需 >=58 个标记，别用 *_50）
+  legacy_pattern: false     # 打印板若由 OpenCV <4.6 生成，偶数行布局有差异，改 true
+  min_corners: 10           # 判定「检测成功」的最少 ChArUco 角点数
+
+# ---- 内参结果目录（读取 cam_N.yaml，须先跑 scripts/calibrate_intrinsics.py）----
+intrinsics_dir: data/calibration
+
+# ---- 采集照片与结果输出目录（相对项目根目录）----
+output_dir: data/extrinsics
+
+# 建议每台相机至少成功采集的次数（低于此值仅提示）
+min_snapshots: 1
+
+# 相对外参的参考相机（世界系原点 = 该相机光心），通常用相机 0
+reference_camera: 0
+
+# ---- 桌面坐标系标定（四个大 ArUco 标记定四角）----
+# 四个大标记平放桌面四个角：ID0 原点角、ID1 短边角、ID2 对角、ID3 长边角。
+# 标记边对齐球桌边、朝向一致。
+table:
+  marker_dict: DICT_5X5_50    # 大标记字典（DICT_5X5_50 的 ID0/ID1/ID2/ID3）
+  marker_length_m: 0.18       # 标记**黑色部分**边长(米)=18cm；白边不算入
+  white_border_m: 0.02        # 白边(静默区)宽度(米)=2cm；原点=白边角
+  marker_origin_id: 0         # 原点角 (0,0)
+  marker_short_id: 1          # 短边角 (W,0)
+  marker_diagonal_id: 2       # 对角   (W,L)
+  marker_long_id: 3           # 长边角 (0,L)
+  origin_offset_m: [0.0, 0.0, 0.0]   # 原点相对标记0原点角的偏移(米)，通常 [0,0,0]
+  # 几何校验：ID0↔ID2 应相距≈桌面对角线(2.74x1.525 ≈ 3.136m)。
+  expected_marker_distance_m: 3.136   # 留空则自动按标准尺寸算
+  marker_distance_tol_m: 0.5          # 允许偏差(米)，超过即判定为误检

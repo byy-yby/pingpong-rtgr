@@ -1,0 +1,13 @@
+# 相机控制模块阶段（阶段 1~2）最小依赖：numpy + pyyaml
+numpy
+pyyaml
+
+# 后续阶段（标定 / 视觉 / 可视化）按需启用：
+opencv-python   # 标定(棋盘格)、球检测、预览显示
+pyside6         # 内参标定 GUI（scripts/calibrate_intrinsics.py）
+open3d          # 3D 可视化
+mediapipe       # 人体 2D 关键点（备选，已用 RTMPose 取代）
+
+# 姿态识别（RTMPose-l，top-down，当前实时预览用）：
+onnxruntime     # ONNX 推理后端（CPU；GT 1030 无需 -gpu 版）
+rtmlib          # RTMPose / YOLOX 的轻量 ONNX Runtime 推理封装

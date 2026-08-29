@@ -1,0 +1,40 @@
+# 相机配置模板（4 台海康 MV-CS016-10UM，USB3 黑白面阵）
+# 运行 scripts/list_cameras.py 拿到实际序列号后，填入下方 cameras 列表完成绑定。
+
+# ---- 触发 ----
+# mode: external(信号发生器接 Line0) | software(软触发调试) | continuous(自由采集)
+trigger:
+  mode: external
+  source: Line0          # 外部触发源；低延迟可换 Line2
+  activation: RisingEdge # 触发沿
+  debouncer_us: 50       # Line0 滤波时间(us)，防误触发
+  delay_us: 0.0          # 触发延迟(us)
+
+# ---- 图像 ----
+image:
+  pixel_format: Mono8    # 黑白相机固定 Mono8
+  frame_rate_hz: 60.0    # 采集帧率(仅 continuous 模式生效)
+
+# ---- 曝光 ----
+exposure:
+  auto: false            # 关掉自动曝光，手动控制
+  time_us: 5000.0        # 曝光时间(微秒)，可运行 query_parameters.py 看合法范围
+
+# ---- 增益 ----
+gain:
+  auto: false
+  db: 0.0                # 增益(dB)
+
+# ---- 其它图像参数（可选，注释掉表示不设置）----
+# gamma: 1.0             # 伽马
+# black_level: 0.0       # 黑电平（"曝光补偿"的暗部偏移）
+# brightness: 0          # 亮度(Integer，部分机型不支持)
+# contrast: 1.0          # 对比度
+
+# ---- 相机序列号 -> 逻辑索引映射 ----
+# serial 留空则按枚举顺序绑定 index 0..N-1。
+cameras:
+  - { index: 0, serial: "" }
+  - { index: 1, serial: "" }
+  - { index: 2, serial: "" }
+  - { index: 3, serial: "" }

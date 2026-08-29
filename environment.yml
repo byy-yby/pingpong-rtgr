@@ -1,0 +1,16 @@
+name: tt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11          # 注意：本机 base 是 3.14，太新，torch/open3d 等可能缺 wheels
+  - pip
+  - numpy
+  - pyyaml
+  - pip:
+      - opencv-python
+      - pyside6      # 内参标定 GUI（scripts/calibrate_intrinsics.py）
+      - open3d
+      - mediapipe
+      - onnxruntime   # RTMPose 推理后端（CPU）
+      - rtmlib        # RTMPose / YOLOX 轻量封装

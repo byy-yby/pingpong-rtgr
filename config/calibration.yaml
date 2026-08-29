@@ -1,0 +1,18 @@
+# 相机内参标定配置（scripts/calibrate_intrinsics.py 使用）
+
+# ChArUco 标定板（须与实际打印的板完全一致，否则检测不到 / 内参算错）
+charuco:
+  squares_x: 13             # 格子列数（长边方向）
+  squares_y: 9              # 格子行数（短边方向）
+  square_length_m: 0.021    # 每格边长(米)：A4 板 = 2.1cm
+  marker_length_m: 0.0157    # 格内 ArUco 标记边长(米)，须按实际打印板测量
+  dictionary: DICT_5X5_250  # ArUco 字典，须与打印板一致（13x9 需 >=58 个标记，别用 *_50）
+  legacy_pattern: false     # 打印板若由 OpenCV <4.6 生成，偶数行布局有差异，改 true
+  min_corners: 10           # 判定单张「检测成功」的最少 ChArUco 角点数
+
+# 采集张数要求
+min_images: 15              # 建议每路最少采集张数（低于此值界面只提示）
+min_images_hard: 5          # 硬下限，低于此值该相机跳过标定
+
+# 标定图像与结果输出目录（相对项目根目录）
+output_dir: data/calibration
