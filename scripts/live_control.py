@@ -467,10 +467,10 @@ class LiveControl:
         if self._triangulator is not None:
             people = match_people(poses_per_cam, self._triangulator)
             skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
-            # 时序跟踪稳定身份（否则 match_people 逐帧独立，两人顺序会闪变）
+            # 硬编码身份：按球桌长边(Y)两侧分 ID（Y 中点 2.74/2=1.37m），绝对稳定
             if self._pose_tracker is None:
                 from tabletennis.reconstruction import PoseTracker
-                self._pose_tracker = PoseTracker()
+                self._pose_tracker = PoseTracker(partition_axis=1, partition_threshold=1.37)
             skeletons = self._pose_tracker.update(skeletons)
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)

@@ -191,10 +191,10 @@ class ReconstructPose:
             self.triangulator.triangulate_pose(obs, min_conf=self.args.min_conf)
             for obs in people
         ]
-        # 时序跟踪稳定身份（否则 match_people 逐帧独立，多人顺序会闪变）
+        # 硬编码身份：按球桌长边(Y)两侧分 ID（Y 中点 2.74/2=1.37m），绝对稳定
         if self._pose_tracker is None:
             from tabletennis.reconstruction import PoseTracker
-            self._pose_tracker = PoseTracker()
+            self._pose_tracker = PoseTracker(partition_axis=1, partition_threshold=1.37)
         return self._pose_tracker.update(skeletons)
 
     # ------------------------------------------------------------------
