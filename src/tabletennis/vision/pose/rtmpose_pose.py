@@ -19,6 +19,7 @@ import logging
 import os
 from typing import List, Optional
 
+import cv2
 import numpy as np
 
 from ...core.types import Frame, Pose2D
@@ -247,7 +248,7 @@ class RTMPoseDetector(PoseDetector):
             return []
 
         if frame.image.ndim == 2:
-            bgr = np.stack([frame.image] * 3, axis=-1)
+            bgr = cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR)
         else:
             bgr = frame.image
 
@@ -289,7 +290,7 @@ class RTMPoseDetector(PoseDetector):
         多相机实时用：把 4 台相机的人框收集起来，RTMPose 一次 forward 处理所有
         裁剪（RTMPose ONNX 的 batch 维是动态的），相比逐人逐帧调用少掉大量
         kernel 启动与传输开销。YOLOX 的 ONNX 是固定 batch=1（且已内置 NMS），
-        无法批，仍逐帧跑——但它经 TensorRT 后单帧 ~1-2ms，4 路也就几 ms。
+        无法批，仍逐帧跑（多线程并行因 GIL 不生效，实测无收益）。
         """
         n = len(frames)
         results: List[List[Pose2D]] = [[] for _ in range(n)]
@@ -302,7 +303,7 @@ class RTMPoseDetector(PoseDetector):
             if frame.image is None or frame.image.size == 0:
                 dets.append((None, []))
                 continue
-            bgr = np.stack([frame.image] * 3, axis=-1) if frame.image.ndim == 2 else frame.image
+            bgr = cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR) if frame.image.ndim == 2 else frame.image
             bboxes = self._det_model(bgr)
             dets.append((bgr, [] if bboxes is None or len(bboxes) == 0 else bboxes))
 

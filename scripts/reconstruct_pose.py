@@ -152,6 +152,7 @@ class ReconstructPose:
         self.table = Table3D()
         self.viewer3d = None
         self._last_poses: Dict[int, List[Pose2D]] = {}
+        self._pose_tracker = None
 
     def _assoc_config(self) -> AssociationConfig:
         return AssociationConfig(
@@ -186,10 +187,15 @@ class ReconstructPose:
     # ------------------------------------------------------------------
     def reconstruct_frame(self, poses_per_cam: Dict[int, List[Pose2D]]) -> List[Skeleton3D]:
         people = match_people(poses_per_cam, self.triangulator, self._assoc_config())
-        return [
+        skeletons = [
             self.triangulator.triangulate_pose(obs, min_conf=self.args.min_conf)
             for obs in people
         ]
+        # 时序跟踪稳定身份（否则 match_people 逐帧独立，多人顺序会闪变）
+        if self._pose_tracker is None:
+            from tabletennis.reconstruction import PoseTracker
+            self._pose_tracker = PoseTracker()
+        return self._pose_tracker.update(skeletons)
 
     # ------------------------------------------------------------------
     # 真实相机循环

@@ -116,6 +116,7 @@ class LiveControl:
         self._triangulator = None
         self._recon_extrinsics: Dict[int, object] = {}
         self._last_poses: Dict[int, list] = {}
+        self._pose_tracker = None
         self._frame_idx = 0
 
     # ------------------------------------------------------------------
@@ -452,6 +453,11 @@ class LiveControl:
         if self._triangulator is not None:
             people = match_people(poses_per_cam, self._triangulator)
             skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
+            # 时序跟踪稳定身份（否则 match_people 逐帧独立，两人顺序会闪变）
+            if self._pose_tracker is None:
+                from tabletennis.reconstruction import PoseTracker
+                self._pose_tracker = PoseTracker()
+            skeletons = self._pose_tracker.update(skeletons)
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)
             # 诊断日志：前 5 帧 + 每 60 帧打印一次，定位骨架不出现的环节
