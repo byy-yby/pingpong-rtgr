@@ -207,10 +207,11 @@ class RTMPoseDetector(PoseDetector):
 
         if use_trt:
             cache_dir = _default_trt_cache_dir()
-            logger.info("TensorRT 引擎构建中（首次较慢，之后走缓存 %s）...", cache_dir)
+            print("[TensorRT] 首次构建引擎（约 30~40 秒，之后走缓存秒开），请稍候...", flush=True)
             # 逐模型尝试 TRT：YOLOX 需先 patch 掉预 NMS 的 TopK(5000→3000)，
             # 某模型转换失败则回退 CUDA EP。
             for name, model in (("YOLOX", self._det_model), ("RTMPose", self._pose_model)):
+                print(f"[TensorRT] 构建 {name} 引擎...", flush=True)
                 try:
                     onnx_path = model.onnx_model
                     if name == "YOLOX":
@@ -222,7 +223,9 @@ class RTMPoseDetector(PoseDetector):
             side = max(det_input_size)
             dummy = np.zeros((side, side, 3), dtype=np.uint8)
             self._det_model(dummy)
+            print("[TensorRT] YOLOX 引擎完成，构建 RTMPose 引擎（约 30 秒）...", flush=True)
             self._pose_model(dummy, bboxes=[[0, 0, side, side]])
+            print("[TensorRT] 全部引擎构建完成 ✓", flush=True)
 
         # 校验 CUDA 是否真正生效：onnxruntime 缺 CUDA 库时会静默回退 CPU
         # （get_available_providers 仍列出 CUDAExecutionProvider，但 session 实际用 CPU）。
