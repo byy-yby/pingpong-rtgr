@@ -37,14 +37,15 @@ def make_frame(camera_id: int = 0, h: int = 1080, w: int = 1440) -> Frame:
 def main() -> None:
     ap = argparse.ArgumentParser(description="RTMPose 检测延迟基准")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--backend", default="tensorrt")
     ap.add_argument("--model", default="rtmpose-l-halpe26")
     ap.add_argument("--frames", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=5)
     args = ap.parse_args()
 
-    print(f"加载 RTMPose（{args.model}, {args.device}）...")
+    print(f"加载 RTMPose（{args.model}, {args.device}, backend={args.backend}）...")
     t0 = time.time()
-    det = RTMPoseDetector(model=args.model, device=args.device)
+    det = RTMPoseDetector(model=args.model, device=args.device, backend=args.backend)
     print(f"  模型加载耗时 {time.time() - t0:.2f}s")
 
     frame = make_frame()

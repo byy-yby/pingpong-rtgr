@@ -68,6 +68,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--device", default="cuda", help="cpu / cuda（默认 cuda，缺 CUDA 自动回退）")
     ap.add_argument("--input-size", type=int, nargs=2, default=(192, 256), metavar=("H", "W"))
     ap.add_argument("--score-thr", type=float, default=0.5, help="人体检测置信度阈值")
+    ap.add_argument("--backend", default="tensorrt", help="onnxruntime / tensorrt（默认 tensorrt）")
     ap.add_argument("--stride", type=int, default=1, help="隔 N 帧检测一次（复用上次结果提速）")
     ap.add_argument("--max-side", type=int, default=None, help="检测前长边缩到该像素（提速）")
 
@@ -258,6 +259,7 @@ class ReconstructPose:
                 model=self.args.model,
                 input_size=tuple(self.args.input_size),
                 device=self.args.device,
+                backend=self.args.backend,
                 score_thr=self.args.score_thr,
             )
         except Exception as exc:  # noqa: BLE001

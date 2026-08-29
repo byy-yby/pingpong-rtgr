@@ -16,6 +16,7 @@ bounding box，再对每个框跑 RTMPose 回归关键点。相比 one-stage 方
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -59,6 +60,35 @@ YOLOX_MODEL_URLS = {
 }
 
 
+def _default_trt_cache_dir() -> str:
+    """TensorRT engine 缓存目录（构建一次、之后复用，避免每次启动重建引擎）。"""
+    return os.path.join(os.path.expanduser("~"), ".cache", "tabletennis", "trt_engines")
+
+
+def _trt_session(onnx_path: str, cache_dir: str, fp16: bool = True):
+    """用 TensorrtExecutionProvider 创建 onnxruntime 会话（FP16 + engine 缓存）。
+
+    复用 rtmlib 的 pre/postprocess（其 ``inference()`` 只调用 ``self.session.run``），
+    这里仅把 session 换成 TRT EP。TRT 对不支持的算子自动回退 CUDA/CPU EP。
+    """
+    import onnxruntime as ort
+
+    os.makedirs(cache_dir, exist_ok=True)
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    providers = [
+        ("TensorrtExecutionProvider", {
+            "device_id": 0,
+            "trt_fp16_enable": fp16,
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": cache_dir,
+        }),
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    return ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
+
+
 class RTMPoseDetector(PoseDetector):
     """RTMPose top-down 2D 姿态检测器（YOLOX 检测 + RTMPose 关键点）。
 
@@ -71,7 +101,8 @@ class RTMPoseDetector(PoseDetector):
         det: 人体检测器标识（"yolox-m"/"yolox-x"/"yolox-tiny"）或本地/URL。
         det_input_size: 检测器输入尺寸 (H, W)，默认 (640, 640)。
         device: "cpu" 或 "cuda"。GT 1030 建议 cpu，换好 GPU 后改 cuda。
-        backend: 推理后端，默认 "onnxruntime"。
+        backend: 推理后端，默认 "onnxruntime"；"tensorrt" 走 TensorrtExecutionProvider
+            （FP16 + engine 缓存，需已装 tensorrt 运行库）。
         score_thr: 人体检测置信度阈值（YOLOX），默认 0.5。
         nms_thr: 检测 NMS IoU 阈值，默认 0.45。
         to_openpose: 是否转 OpenPose 输出（默认 False，保持模型自身关键点集）。
@@ -108,10 +139,15 @@ class RTMPoseDetector(PoseDetector):
         else:
             self._skeleton = "coco17"
 
+        # rtmlib 只认 onnxruntime 后端；backend="tensorrt" 时先用 CUDA EP 建好，
+        # 再把两个模型的 session 换成 TensorrtExecutionProvider（复用其 pre/postprocess）。
+        use_trt = backend == "tensorrt"
+        rtmlib_backend = "onnxruntime" if use_trt else backend
+
         self._det_model = YOLOX(
             YOLOX_MODEL_URLS.get(det, det),
             model_input_size=det_input_size,
-            backend=backend,
+            backend=rtmlib_backend,
             device=device,
             score_thr=score_thr,
             nms_thr=nms_thr,
@@ -119,14 +155,28 @@ class RTMPoseDetector(PoseDetector):
         self._pose_model = RTMPose(
             RTMPOSE_MODEL_URLS.get(model, model),
             model_input_size=input_size,
-            backend=backend,
+            backend=rtmlib_backend,
             device=device,
             to_openpose=to_openpose,
         )
 
+        if use_trt:
+            cache_dir = _default_trt_cache_dir()
+            logger.info("TensorRT 引擎构建中（首次较慢，之后走缓存 %s）...", cache_dir)
+            self._det_model.session = _trt_session(self._det_model.onnx_model, cache_dir)
+            self._pose_model.session = _trt_session(self._pose_model.onnx_model, cache_dir)
+            # 预热触发 TRT engine 构建（含 FP16），避免首帧卡顿
+            side = max(det_input_size)
+            dummy = np.zeros((side, side, 3), dtype=np.uint8)
+            self._det_model(dummy)
+            self._pose_model(dummy, bboxes=[[0, 0, side, side]])
+            actual = self._det_model.session.get_providers()
+            if not actual or actual[0] != "TensorrtExecutionProvider":
+                logger.warning("TensorRT EP 未生效（实际 providers=%s），已回退 CUDA/CPU", actual)
+
         # 校验 CUDA 是否真正生效：onnxruntime 缺 CUDA 库时会静默回退 CPU
         # （get_available_providers 仍列出 CUDAExecutionProvider，但 session 实际用 CPU）。
-        if device == "cuda":
+        elif device == "cuda":
             actual = self._det_model.session.get_providers()
             if not actual or actual[0] != "CUDAExecutionProvider":
                 logger.warning(
