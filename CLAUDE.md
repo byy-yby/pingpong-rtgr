@@ -215,7 +215,10 @@ SetIntValueEx("LineDebouncerTime", 50)             # us，防误触发
   待接入 `register_detector("ball", ...)`。（球桌已实现并注册。）
 - [ ] **YOLO 微调训练**（2026-08-29 进行中）：数据集已统一框 + 增强 3000→11944，
   用 `scripts/train_ball.py`（yolov8n.pt 预训练迁移，imgsz 1280，single_cls，--patience 早停）
-  训练单类 ball。torch 栈见「torch 训练栈」节。
+  训练单类 ball。torch 栈见「torch 训练栈」节。训练完重导 ONNX 时：用
+  `dynamic=True` 导出后必须跑 `scripts/fix_onnx_dynamic.py` 把 h/w 固化成静态（否则
+  TRT EP 静默回退 CUDA），并复制到主仓库 `runs/detect/ball/weights/best.onnx`；
+  TRT 引擎缓存会自动重建（后台线程，不卡 UI）。
 - [ ] 后续模块目录待建：`pipeline/`（`reconstruction/` 已建，姿态三角化 + 匹配完成）。
 - [ ] **姿态重建精度受相机距离限制**：相机距桌面约 3~6m（球在画面 ~12~24px），
   合成 1.5px 噪声下 3D 关节误差约 cm 级；更精确需更高分辨率或更近的机位。
