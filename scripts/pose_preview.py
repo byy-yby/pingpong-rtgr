@@ -54,6 +54,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="rtmpose-l-halpe26 / rtmpose-m-halpe26 / rtmpose-s-halpe26 / "
                          "rtmpose-x-halpe26（26点）；不带 -halpe26 为 COCO-17 模型；或本地 onnx 路径")
     ap.add_argument("--device", default="cuda", help="cpu 或 cuda（默认 cuda，缺 CUDA 自动回退）")
+    ap.add_argument("--backend", default="tensorrt", help="onnxruntime / tensorrt（默认 tensorrt）")
     ap.add_argument("--input-size", type=int, nargs=2, default=(192, 256),
                     metavar=("H", "W"), help="姿态模型输入尺寸(H W)，rtmpose-l 用 192 256")
     ap.add_argument("--score-thr", type=float, default=0.5, help="人体检测置信度阈值")
@@ -120,9 +121,10 @@ def main() -> None:
                     model=args.model,
                     input_size=tuple(args.input_size),
                     device=args.device,
+                    backend=args.backend,
                     score_thr=args.score_thr,
                 )
-                print(f"RTMPose 模型加载完成（{args.model}, {args.device}）", flush=True)
+                print(f"RTMPose 模型加载完成（{args.model}, {args.device}, {args.backend}）", flush=True)
             except Exception as exc:  # noqa: BLE001
                 print(f"[警告] RTMPose 加载失败，降级为纯画面预览：{exc}", flush=True)
                 detector = None

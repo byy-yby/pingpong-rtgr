@@ -25,6 +25,8 @@ from typing import Dict, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+from dataclasses import replace
+
 import cv2
 import numpy as np
 
@@ -68,6 +70,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--device", default="cuda", help="cpu / cuda（默认 cuda，缺 CUDA 自动回退）")
     ap.add_argument("--input-size", type=int, nargs=2, default=(192, 256), metavar=("H", "W"))
     ap.add_argument("--score-thr", type=float, default=0.5, help="人体检测置信度阈值")
+    ap.add_argument("--backend", default="tensorrt", help="onnxruntime / tensorrt（默认 tensorrt）")
     ap.add_argument("--stride", type=int, default=1, help="隔 N 帧检测一次（复用上次结果提速）")
     ap.add_argument("--max-side", type=int, default=None, help="检测前长边缩到该像素（提速）")
 
@@ -222,14 +225,10 @@ class ReconstructPose:
                 mgr.start()
                 while True:
                     bundle = mgr.get_synchronized_bundle(block=True, timeout=1.0)
-                    poses_per_cam: Dict[int, List[Pose2D]] = {}
-                    for cid, frame in bundle.frames.items():
-                        if frame_idx % max(self.args.stride, 1) == 0:
-                            poses = self._detect(detector, frame)
-                            self._last_poses[cid] = poses
-                        else:
-                            poses = self._last_poses.get(cid, [])
-                        poses_per_cam[cid] = poses
+                    # 批处理检测：YOLOX 逐帧、RTMPose 把 4 路所有人框拼一批
+                    poses_per_cam = self._detect_batch_frame(
+                        detector, sorted(bundle.frames.items()), frame_idx
+                    )
 
                     skeletons = self.reconstruct_frame(poses_per_cam)
                     if self.viewer3d is not None:
@@ -258,6 +257,7 @@ class ReconstructPose:
                 model=self.args.model,
                 input_size=tuple(self.args.input_size),
                 device=self.args.device,
+                backend=self.args.backend,
                 score_thr=self.args.score_thr,
             )
         except Exception as exc:  # noqa: BLE001
@@ -265,7 +265,6 @@ class ReconstructPose:
             return None
 
     def _detect(self, detector, frame: Frame) -> List[Pose2D]:
-        from dataclasses import replace
         det_frame = frame
         scale = 1.0
         if self.args.max_side and max(frame.height, frame.width) > self.args.max_side:
@@ -278,6 +277,43 @@ class ReconstructPose:
             for p in poses:
                 p.keypoints[:, :2] /= scale
         return poses
+
+    def _detect_batch_frame(self, detector, frames_items, frame_idx: int) -> Dict[int, List[Pose2D]]:
+        """批处理一帧：stride 隔帧复用 + max_side 降采样 + ``detector.detect_batch``。
+
+        Args:
+            frames_items: ``[(cid, Frame), ...]`` 同一同步时刻的各相机帧。
+        Returns:
+            ``{cid: [Pose2D, ...]}``。
+        """
+        poses_per_cam: Dict[int, List[Pose2D]] = {}
+        if frame_idx % max(self.args.stride, 1) != 0:
+            for cid, _ in frames_items:
+                poses_per_cam[cid] = self._last_poses.get(cid, [])
+            return poses_per_cam
+
+        # 需要检测的相机：应用 max_side 降采样
+        detect_cids, detect_frames, scales = [], [], {}
+        for cid, frame in frames_items:
+            scale = 1.0
+            det_frame = frame
+            if self.args.max_side and max(frame.height, frame.width) > self.args.max_side:
+                scale = self.args.max_side / max(frame.height, frame.width)
+                small = cv2.resize(frame.image, None, fx=scale, fy=scale,
+                                   interpolation=cv2.INTER_AREA)
+                det_frame = replace(frame, image=small)
+            detect_cids.append(cid)
+            detect_frames.append(det_frame)
+            scales[cid] = scale
+
+        results = detector.detect_batch(detect_frames)
+        for cid, poses in zip(detect_cids, results):
+            if scales[cid] != 1.0:
+                for p in poses:
+                    p.keypoints[:, :2] /= scales[cid]
+            self._last_poses[cid] = poses
+            poses_per_cam[cid] = poses
+        return poses_per_cam
 
     def _show_2d(self, bundle, poses_per_cam: Dict[int, List[Pose2D]]) -> int:
         images = []

@@ -21,7 +21,11 @@ from typing import List
 
 
 def nvidia_lib_dirs() -> List[str]:
-    """返回所有 ``site-packages/nvidia/<pkg>/lib`` 目录（pip 装的 CUDA/cuDNN）。"""
+    """返回 pip 装的 CUDA/cuDNN/TensorRT 运行库目录。
+
+    含 ``site-packages/nvidia/<pkg>/lib``（CUDA/cuDNN）与
+    ``site-packages/tensorrt_libs``（libnvinfer.so / libnvinfer_plugin.so）。
+    """
     roots = list(site.getsitepackages())
     try:
         roots.append(site.getusersitepackages())
@@ -32,6 +36,8 @@ def nvidia_lib_dirs() -> List[str]:
         if not r or not os.path.isdir(r):
             continue
         for d in sorted(glob.glob(os.path.join(r, "nvidia", "*", "lib"))):
+            dirs.append(d)
+        for d in sorted(glob.glob(os.path.join(r, "tensorrt_libs"))):
             dirs.append(d)
     return dirs
 

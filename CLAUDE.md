@@ -80,7 +80,16 @@
   - `MVCAM_SDK_PATH=/opt/MVS`
 - Python：base 是 **3.14.6**（miniconda）。太新，open3d/torch/mediapipe 可能缺 wheels，
   **务必用 Python 3.11 环境**（见 `environment.yml`，conda env 名 `tt`）。
-- GPU：GT 1030 2GB，很弱；姿态估计跑 CPU（RTMPose-l，换好 GPU 后 `device=cuda`）。
+- GPU：已换 **RTX 5080**（Blackwell sm_120，驱动 580 / CUDA 13.0，16GB）。姿态估计已部署
+  GPU：onnxruntime-gpu 1.26（**最后一个支持 CUDA 12 的版本**，1.27 起切 CUDA 13）+ pip 的
+  `nvidia-*-cu12` 运行库（CUDA 12.9 / cuDNN 9.25）。`device` 默认 `cuda`，`backend` 支持
+  `tensorrt`（TensorrtExecutionProvider FP16，需 TensorRT 10.x 运行库，装
+  `tensorrt-cu12-libs==10.14.1.48`，其 wheel **3.96GB**、安装时从 pypi.nvidia.com 现下）。
+  **CUDA 13 的 nvidia pip wheel 尚未发布**（PyPI 上是 0.0.0a0 占位），所以别用 cu13。
+  实测：YOLOX TRT 11.3→2.26ms、RTMPose TRT 3.9→1.08ms、单相机 detect 端到端 14.6→8.0ms。
+  **坑**：mmpose SDK 的 YOLOX 烤入 EfficientNMS，预 NMS TopK K=5000 超 TensorRT 上限 3840，
+  走 TRT 会报 `K exceeds the maximum value allowed (3840)`，`_patch_yolox_for_trt` 把 K 改 3000
+  解决。详见 `vision/gpu_env.py` 与 `vision/pose/rtmpose_pose.py`。
 
 ## SDK 用法（已踩平的关键点）
 
@@ -179,10 +188,12 @@ SetIntValueEx("LineDebouncerTime", 50)             # us，防误触发
   用 `TriggerDelay` 错峰。
 - [ ] **单通道喂模型**：本机是黑白 Mono8，RTMPose 训练在 RGB 上，`rtmpose_pose.py` 里把灰度
   复制成 3 通道再送模型（存在 domain gap，靠固定短曝光 + 补光缓解）。
-- [ ] **RTMPose 性能**：GT 1030 无 Tensor Core，CPU 推理偏慢；实时预览用
-  「单路 + `--max-side` 降分辨率 + `--stride` 隔帧」，换好 GPU 后 `device=cuda`。
-- [ ] **球检测未实现**：接口已在 `vision/detector.py`（`BallDetector`），算法待实现后
-  `register_detector("ball", ...)` 即可接入 `live_control.py`。（球桌已实现并注册。）
+- [x] **RTMPose 性能**：已上 TensorRT——YOLOX 11.3→2.26ms、RTMPose 3.9→1.08ms、单相机
+  detect 端到端 14.6→8.0ms（GPU 不再瓶颈，剩余是 CPU 预处理/NMS 开销）。YOLOX 因烤入
+  NMS 的 TopK-5000 走 TRT 需先 patch 成 3000（`_patch_yolox_for_trt`）。要再提速：
+  ① 换 RTMO（one-stage，砍掉 YOLOX+逐人 RTMPose）；② YOLOX 重新导出成动态 batch 以批处理。
+- [ ] **球检测**：接口已在 `vision/detector.py`（`BallDetector`），经典 CV 路线（阈值/连通域）
+  待接入 `register_detector("ball", ...)`。（球桌已实现并注册。）
 - [ ] 后续模块目录待建：`pipeline/`（`reconstruction/` 已建，姿态三角化 + 匹配完成）。
-- [ ] **姿态重建精度受相机距离限制**：当前外参里四机光心距桌面 ~14m，1px≈8mm，
-  实测合成 1.5px 噪声下 3D 关节中位误差 ~4cm。要更精确需相机更近或更高分辨率。
+- [ ] **姿态重建精度受相机距离限制**：相机距桌面约 3~6m（球在画面 ~12~24px），
+  合成 1.5px 噪声下 3D 关节误差约 cm 级；更精确需更高分辨率或更近的机位。

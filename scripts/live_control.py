@@ -112,6 +112,12 @@ class LiveControl:
         self._record_detector = None
         self._record_saved_framenum: Dict[int, int] = {}
 
+        # 3D 姿态重建（按 P）：标定三角化器 + 各相机最近一帧的 2D 姿态
+        self._triangulator = None
+        self._recon_extrinsics: Dict[int, object] = {}
+        self._last_poses: Dict[int, list] = {}
+        self._frame_idx = 0
+
     # ------------------------------------------------------------------
     # 参数应用
     # ------------------------------------------------------------------
@@ -259,6 +265,14 @@ class LiveControl:
                 self._disable_table()
             return
 
+        # 姿态：GPU 实时 3D 重建（按 P）
+        if kind == "pose":
+            if self.enable[kind]:
+                self._enable_pose_recon()
+            else:
+                self._disable_pose_recon()
+            return
+
         if self.enable[kind] and self.detectors[kind] is None:
             self.detectors[kind] = create_detector(kind)   # 首次开启才加载模型
             if self.detectors[kind] is None:
@@ -370,6 +384,7 @@ class LiveControl:
         }
         self.viewer3d = SceneViewer3D()
         self.viewer3d.build_scene(self._table_detector.table, camera_poses, intrinsics)
+        self.viewer3d.add_skeleton_layer(skeleton="halpe26", max_people=8)
         self.viewer3d.start()
         print("✓ 已生成 3D 场景窗口（Open3D，可鼠标旋转 / 缩放）。")
 
@@ -377,6 +392,77 @@ class LiveControl:
         if self.viewer3d is not None:
             self.viewer3d.close()
             self.viewer3d = None
+
+    # ------------------------------------------------------------------
+    # 3D 姿态重建（按 P）
+    # ------------------------------------------------------------------
+    def _enable_pose_recon(self) -> None:
+        """按 P 开启 GPU 实时 3D 姿态重建：加载标定三角化器 + 启动 3D 场景。"""
+        if self.detectors["pose"] is None:
+            self.detectors["pose"] = create_detector("pose")
+            if self.detectors["pose"] is None:
+                print("[检测] 姿态: ON（接口已定义，算法待实现）")
+                return
+        if self._triangulator is None:
+            try:
+                from tabletennis.reconstruction import (
+                    MultiViewTriangulator,
+                    load_camera_rig,
+                )
+                intrinsics, extrinsics = load_camera_rig()
+                if not extrinsics:
+                    print("[检测] 姿态: 未找到标定外参（table_extrinsics.yaml），仅 2D 显示")
+                    return
+                self._recon_extrinsics = extrinsics
+                self._triangulator = MultiViewTriangulator(intrinsics, extrinsics)
+                print(f"[检测] 姿态: 三角化器已加载 {len(self._triangulator.cameras)} 台相机")
+                # 用标定外参当桌面系相机位姿（与 table 检测 fallback 一致）
+                self._table_poses = {cid: (e.R, e.t) for cid, e in extrinsics.items()}
+                if self._table_detector is None:
+                    self._table_detector = create_detector("table")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[检测] 姿态: 标定加载失败（{exc}），仅 2D 显示")
+                return
+        self._start_viewer()
+        print("[检测] 姿态: ON（GPU 实时 3D 重建 + Open3D）")
+
+    def _disable_pose_recon(self) -> None:
+        self._last_poses = {}
+        print("[检测] 姿态: OFF")
+
+    def _reconstruct_frame(self) -> None:
+        """批处理检测所有相机 + 跨视角匹配 + 三角化，更新 Open3D 骨架与 2D 姿态。"""
+        from tabletennis.reconstruction import match_people
+
+        detector = self.detectors["pose"]
+        frames_items = [
+            (cid, f) for cid, f in sorted(self._latest.items()) if f is not None
+        ]
+        if not frames_items:
+            return
+        cids = [c for c, _ in frames_items]
+        frames = [f for _, f in frames_items]
+        try:
+            poses_list = detector.detect_batch(frames)
+        except AttributeError:  # 检测器无批处理接口则逐帧回退
+            poses_list = [detector.detect(f) for f in frames]
+        poses_per_cam = dict(zip(cids, poses_list))
+        self._last_poses = poses_per_cam
+
+        if self._triangulator is not None:
+            people = match_people(poses_per_cam, self._triangulator)
+            skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
+            if self.viewer3d is not None:
+                self.viewer3d.set_skeletons(skeletons)
+            # 诊断日志：前 5 帧 + 每 60 帧打印一次，定位骨架不出现的环节
+            self._frame_idx += 1
+            if self._frame_idx <= 5 or self._frame_idx % 60 == 0:
+                n_det = {c: len(poses_per_cam.get(c, [])) for c in cids}
+                n_valid = sum(
+                    int(np.isfinite(s.keypoints).all(axis=1).sum()) for s in skeletons
+                )
+                print(f"[3D重建] 帧{self._frame_idx}: 各相机检测 {n_det} | "
+                      f"匹配 {len(people)} 人 | 有效关节 {n_valid}")
 
     # ------------------------------------------------------------------
     # 鼠标：拖拽滑块
@@ -415,8 +501,9 @@ class LiveControl:
         bgr = gray_to_bgr(gray)
 
         if frame is not None:
-            if self.enable["pose"] and self.detectors["pose"] is not None:
-                for pose in self.detectors["pose"].detect(frame):
+            if self.enable["pose"]:
+                # 姿态由 _reconstruct_frame 批处理检测，这里只画缓存结果
+                for pose in self._last_poses.get(cid, []):
                     draw_pose(bgr, pose)
             if self.enable["ball"] and self.detectors["ball"] is not None:
                 for ball in self.detectors["ball"].detect(frame):
@@ -565,6 +652,10 @@ class LiveControl:
                             print("✓ 触发信号已恢复，开始出图。")
 
                 self._tick_record(latest)
+
+                # 3D 姿态重建（按 P 开启后每帧批处理检测 + 三角化 + Open3D 骨架）
+                if self.enable["pose"] and self.detectors["pose"] is not None:
+                    self._reconstruct_frame()
 
                 canvas = self._compose_canvas()
                 cv2.imshow(MAIN_WIN, canvas)
