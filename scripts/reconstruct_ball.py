@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import cv2
 import numpy as np
 
-from tabletennis.core.types import Ball2D, Frame
+from tabletennis.core.types import Ball2D, CameraExtrinsics, Frame, Table3D
 from tabletennis.reconstruction import (
     BallTracker,
     MultiViewTriangulator,
@@ -78,6 +78,8 @@ class ReconstructBall:
         self.intrinsics, self.extrinsics = load_camera_rig()
         self.triangulator = MultiViewTriangulator(self.intrinsics, self.extrinsics)
         self.tracker = BallTracker()
+        self.table = Table3D()
+        self.viewer3d = None
         # 每相机一个独立检测器（背景模型各不相同）
         self.detectors: Dict[int, ClassicalBallDetector] = {
             cid: ClassicalBallDetector(
@@ -117,6 +119,25 @@ class ReconstructBall:
     def reconstruct_frame(self, balls_per_cam: Dict[int, Ball2D]):
         return triangulate_ball(balls_per_cam, self.triangulator, min_conf=self.args.min_conf)
 
+    def _start_viewer(self) -> None:
+        """启动 Open3D 3D 场景（球桌 + 相机 + 球轨迹），--no-display 时跳过。"""
+        if self.args.no_display:
+            return
+        from tabletennis.visualization.viewer3d import SceneViewer3D
+
+        camera_poses = {
+            cid: CameraExtrinsics(R=e.R, t=e.t) for cid, e in self.extrinsics.items()
+        }
+        self.viewer3d = SceneViewer3D()
+        self.viewer3d.build_scene(self.table, camera_poses, self.intrinsics)
+        self.viewer3d.add_ball_layer()
+        self.viewer3d.start()
+
+    def _stop_viewer(self) -> None:
+        if self.viewer3d is not None:
+            self.viewer3d.close()
+            self.viewer3d = None
+
     # ------------------------------------------------------------------
     # 真实相机循环
     # ------------------------------------------------------------------
@@ -143,6 +164,7 @@ class ReconstructBall:
             ) as mgr:
                 print(f"已连接 {len(mgr.cameras)} 台相机（触发 {self.args.trigger}），按 ESC/q 退出")
                 mgr.start()
+                self._start_viewer()
                 while True:
                     bundle = mgr.get_synchronized_bundle(block=True, timeout=1.0)
                     balls_per_cam: Dict[int, Ball2D] = {}
@@ -158,6 +180,8 @@ class ReconstructBall:
                     if res is not None:
                         X3, conf, err, nv, ang = res
                     X3 = self.tracker.update(X3, conf if res else 0.0)
+                    if self.viewer3d is not None:
+                        self.viewer3d.set_ball(X3)
 
                     if not self.args.no_display:
                         key = self._show_2d(bundle, balls_per_cam)
@@ -172,6 +196,8 @@ class ReconstructBall:
                         print(f"  {fps:6.1f} fps{pos}", flush=True)
         except KeyboardInterrupt:
             pass
+        finally:
+            self._stop_viewer()
 
     def _show_2d(self, bundle, balls_per_cam: Dict[int, Ball2D]) -> int:
         images = []
@@ -193,6 +219,7 @@ class ReconstructBall:
     # ------------------------------------------------------------------
     def run_synthetic(self) -> None:
         print(f"合成自检：投影已知 3D 轨迹 → 三角化（噪声 {self.args.noise_px}px，无需相机）")
+        self._start_viewer()
         traj = make_synthetic_trajectory(self.args.n_frames)
         rng = np.random.default_rng(0)
         errs: List[float] = []
@@ -204,6 +231,8 @@ class ReconstructBall:
                 continue
             X, _c, _e, nv, _a = res
             errs.append(float(np.linalg.norm(X - X_gt)))
+            if self.viewer3d is not None:
+                self.viewer3d.set_ball(X)
 
         if not errs:
             print("[错误] 合成自检没有成功三角化任何一帧，检查标定是否加载。")
@@ -211,6 +240,9 @@ class ReconstructBall:
         med = float(np.median(errs))
         print(f"合成自检完成：成功 {len(errs)}/{self.args.n_frames} 帧")
         print(f"  3D 球心中位误差 ≈ {med * 1000:.2f} mm（噪声 {self.args.noise_px}px）")
+        if self.viewer3d is not None:
+            time.sleep(0.5)  # 让渲染线程多跑一会再关
+        self._stop_viewer()
 
 
 def main() -> None:
