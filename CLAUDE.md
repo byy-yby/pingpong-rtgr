@@ -83,9 +83,13 @@
 - GPU：已换 **RTX 5080**（Blackwell sm_120，驱动 580 / CUDA 13.0，16GB）。姿态估计已部署
   GPU：onnxruntime-gpu 1.26（**最后一个支持 CUDA 12 的版本**，1.27 起切 CUDA 13）+ pip 的
   `nvidia-*-cu12` 运行库（CUDA 12.9 / cuDNN 9.25）。`device` 默认 `cuda`，`backend` 支持
-  `tensorrt`（TensorrtExecutionProvider FP16，需 TensorRT 10.x 运行库）。**CUDA 13 的 nvidia
-  pip wheel 尚未发布**（PyPI 上是 0.0.0a0 占位），所以别用 cu13。详见 `vision/gpu_env.py`
-  与 `vision/pose/rtmpose_pose.py`。
+  `tensorrt`（TensorrtExecutionProvider FP16，需 TensorRT 10.x 运行库，装
+  `tensorrt-cu12-libs==10.14.1.48`，其 wheel **3.96GB**、安装时从 pypi.nvidia.com 现下）。
+  **CUDA 13 的 nvidia pip wheel 尚未发布**（PyPI 上是 0.0.0a0 占位），所以别用 cu13。
+  实测：YOLOX TRT 11.3→2.26ms、RTMPose TRT 3.9→1.08ms、单相机 detect 端到端 14.6→8.0ms。
+  **坑**：mmpose SDK 的 YOLOX 烤入 EfficientNMS，预 NMS TopK K=5000 超 TensorRT 上限 3840，
+  走 TRT 会报 `K exceeds the maximum value allowed (3840)`，`_patch_yolox_for_trt` 把 K 改 3000
+  解决。详见 `vision/gpu_env.py` 与 `vision/pose/rtmpose_pose.py`。
 
 ## SDK 用法（已踩平的关键点）
 
@@ -184,9 +188,10 @@ SetIntValueEx("LineDebouncerTime", 50)             # us，防误触发
   用 `TriggerDelay` 错峰。
 - [ ] **单通道喂模型**：本机是黑白 Mono8，RTMPose 训练在 RGB 上，`rtmpose_pose.py` 里把灰度
   复制成 3 通道再送模型（存在 domain gap，靠固定短曝光 + 补光缓解）。
-- [ ] **RTMPose 性能**：RTX 5080 上 CUDA EP 单相机 detect 端到端 ~14.6ms（YOLOX ~11.3ms
-  是瓶颈、RTMPose ~3.9ms）；4 相机串行 ~17 FPS。实时需 TensorRT（YOLOX 可到 ~1-2ms）或
-  并行检测（`reconstruct_pose.py` 已加线程池）。
+- [x] **RTMPose 性能**：已上 TensorRT——YOLOX 11.3→2.26ms、RTMPose 3.9→1.08ms、单相机
+  detect 端到端 14.6→8.0ms（GPU 不再瓶颈，剩余是 CPU 预处理/NMS 开销）。YOLOX 因烤入
+  NMS 的 TopK-5000 走 TRT 需先 patch 成 3000（`_patch_yolox_for_trt`）。要再提速：
+  ① 换 RTMO（one-stage，砍掉 YOLOX+逐人 RTMPose）；② YOLOX 重新导出成动态 batch 以批处理。
 - [ ] **球检测**：接口已在 `vision/detector.py`（`BallDetector`），经典 CV 路线（阈值/连通域）
   待接入 `register_detector("ball", ...)`。（球桌已实现并注册。）
 - [ ] 后续模块目录待建：`pipeline/`（`reconstruction/` 已建，姿态三角化 + 匹配完成）。
