@@ -90,6 +90,25 @@
   **坑**：mmpose SDK 的 YOLOX 烤入 EfficientNMS，预 NMS TopK K=5000 超 TensorRT 上限 3840，
   走 TRT 会报 `K exceeds the maximum value allowed (3840)`，`_patch_yolox_for_trt` 把 K 改 3000
   解决。详见 `vision/gpu_env.py` 与 `vision/pose/rtmpose_pose.py`。
+- **torch 训练栈（RTX 5080 用 CUDA 12.8）**：Blackwell sm_120 没有 cu121/cu124 的 wheel，
+  必须 `torch==2.11.0+cu128` + `torchvision==0.26.0+cu128`（cp311，2026-08 实测可用）。
+  网络是国内环境：**download.pytorch.org 被墙**（直连 ~247B/s），本地代理对国内镜像反而
+  拖慢，装包前必须 `export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= all_proxy= ALL_PROXY=`
+  清空代理。torch/torchvision 走阿里云 wheel 目录（扁平目录**不是**合法 simple-index，要用
+  `--find-links https://mirrors.aliyun.com/pytorch-wheels/cu128/`），其余依赖走
+  `--index-url https://mirrors.aliyun.com/pypi/simple`（完整 pypi 镜像）。tuna/阿里云对
+  >90MB 大文件偶发断连，小包可靠。
+  **省流量技巧**：环境里已有 onnxruntime-gpu 的 `nvidia-*-cu12` 运行库（cudnn 9.25/cublas
+  12.9 比 torch pin 的新版但 ABI 兼容），可 `--no-deps` 只装 torch+torchvision，再用 `ldd`
+  枚举 `torch/lib/libtorch_cuda.so` 缺的库逐个补：
+  - `libcusparseLt.so.0`→`nvidia-cusparselt-cu12==0.7.1`
+  - `libnccl.so.2`→`nvidia-nccl-cu12==2.28.9`、`libnvshmem_host.so.3`→`nvidia-nvshmem-cu12==3.4.5`、
+    `libcupti.so.12`→`nvidia-cuda-cupti-cu12`
+  - `libcufile.so.0`→**`nvidia-cufile-cu12`**（torch 的 `cuda-toolkit[cufile]` extra 映射到它，
+    不是 `nvidia-cuda-cufile-cu12` 也不是 `cuda-cufile-12-8`，后两者在 PyPI 上是 404）
+  triton（torch 的硬依赖，188MB）装不上也不影响普通训练，只有 `torch.compile` 才需要。
+  **磁盘告急**：多次装大 wheel 会把 `~/.cache/pip` 撑爆（曾到 7.1G，触发 Errno 28 磁盘满），
+  先 `pip cache purge`。训练脚本 `scripts/train_ball.py` 已加 `--patience` 早停。
 
 ## SDK 用法（已踩平的关键点）
 
@@ -194,6 +213,9 @@ SetIntValueEx("LineDebouncerTime", 50)             # us，防误触发
   ① 换 RTMO（one-stage，砍掉 YOLOX+逐人 RTMPose）；② YOLOX 重新导出成动态 batch 以批处理。
 - [ ] **球检测**：接口已在 `vision/detector.py`（`BallDetector`），经典 CV 路线（阈值/连通域）
   待接入 `register_detector("ball", ...)`。（球桌已实现并注册。）
+- [ ] **YOLO 微调训练**（2026-08-29 进行中）：数据集已统一框 + 增强 3000→11944，
+  用 `scripts/train_ball.py`（yolov8n.pt 预训练迁移，imgsz 1280，single_cls，--patience 早停）
+  训练单类 ball。torch 栈见「torch 训练栈」节。
 - [ ] 后续模块目录待建：`pipeline/`（`reconstruction/` 已建，姿态三角化 + 匹配完成）。
 - [ ] **姿态重建精度受相机距离限制**：相机距桌面约 3~6m（球在画面 ~12~24px），
   合成 1.5px 噪声下 3D 关节误差约 cm 级；更精确需更高分辨率或更近的机位。

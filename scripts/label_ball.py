@@ -70,7 +70,9 @@ def main() -> None:
 
     idx = 0
     box: Optional[tuple] = None   # 归一化 (cx, cy, w, h)
-    dragging = None               # 像素起始点 (x0, y0)
+    mode = None                   # 当前鼠标动作: "draw"(画新框) / "move"(拖动已有框)
+    drag_anchor = None            # draw 模式: 按压起始点 (x0, y0) 像素
+    grab_off = None               # move 模式: 点击点相对框左上角的偏移 (ox, oy)
     img = None
     W = H = 0
 
@@ -88,18 +90,39 @@ def main() -> None:
                 int((cx + w / 2) * W), int((cy + h / 2) * H))
 
     def on_mouse(event, x, y, flags, param) -> None:
-        nonlocal box, dragging
+        nonlocal box, mode, drag_anchor, grab_off
         if event == cv2.EVENT_LBUTTONDOWN:
-            dragging = (x, y)
-        elif event == cv2.EVENT_MOUSEMOVE and dragging is not None:
-            x0, y0 = dragging
-            cx = (x0 + x) / 2.0 / W
-            cy = (y0 + y) / 2.0 / H
-            w = abs(x - x0) / W
-            h = abs(y - y0) / H
-            box = (cx, cy, w, h)
+            # 点在已有框内 → 进入 move；否则 → 进入 draw
+            inside = False
+            if box is not None:
+                bx0, by0, bx1, by1 = norm_to_px(box)
+                inside = bx0 <= x <= bx1 and by0 <= y <= by1
+            if inside:
+                mode = "move"
+                grab_off = (x - bx0, y - by0)
+            else:
+                mode = "draw"
+                drag_anchor = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if mode == "draw" and drag_anchor is not None:
+                x0, y0 = drag_anchor
+                x1, y1 = x, y
+                tlx, tly = min(x0, x1), min(y0, y1)
+                brx, bry = max(x0, x1), max(y0, y1)
+                cx = (tlx + brx) / 2.0 / W
+                cy = (tly + bry) / 2.0 / H
+                w = (brx - tlx) / W
+                h = (bry - tly) / H
+                box = (cx, cy, w, h)
+            elif mode == "move" and grab_off is not None:
+                ox, oy = grab_off
+                cx = (x - ox + box[2] * W / 2.0) / W
+                cy = (y - oy + box[3] * H / 2.0) / H
+                box = (cx, cy, box[2], box[3])
         elif event == cv2.EVENT_LBUTTONUP:
-            dragging = None
+            mode = None
+            drag_anchor = None
+            grab_off = None
 
     def save() -> None:
         nonlocal box
@@ -121,11 +144,11 @@ def main() -> None:
             cv2.rectangle(disp, (x0, y0), (x1, y1), (0, 0, 255), 2)
         cv2.putText(disp, f"{idx+1}/{len(names)}  {names[idx]}", (8, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(disp, "拖框标球 | 空格=保存+下一张 | d=删框 | n/p=翻页 | q=退出", (8, 44),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(disp, "拖框标球 / 点住框内拖动可移动 | 空格=保存+下一张 | d=删框 | n/p=翻页 | q=退出",
+                    (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.imshow(WIN, disp)
 
-        key = cv2.waitKey(0) & 0xFF
+        key = cv2.waitKey(10) & 0xFF  # 轮询而非阻塞：拖动时每 10ms 重绘一次，实时看到框
         if key in (27, ord("q")):
             break
         elif key == ord(" "):
