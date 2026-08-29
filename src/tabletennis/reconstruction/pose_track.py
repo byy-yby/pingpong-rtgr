@@ -1,13 +1,18 @@
-"""3D 骨架跨帧身份跟踪：按 3D 质心最近邻关联，稳定多人的身份 ID。
+"""3D 骨架跨帧身份分配：把多个球员稳定地对应到固定 ID。
 
 背景：``match_people`` 是逐帧独立的几何匹配，返回的骨架顺序每帧可能翻转，
-导致两个球员的身份/颜色闪来闪去。本模块在三角化之后加一层时序跟踪：每个
-活跃 track 维护一个稳定 ID 与 3D 质心，每帧把新骨架贪心关联到最近的 track
-（质心距离 < 门限），输出按 ID 稳定排序的骨架列表，供可视化按 ID 配色。
+导致两个球员的身份/颜色闪来闪去。本模块提供两种稳定策略：
+
+- **分区模式（推荐，硬编码）**：按 3D 质心在球桌世界系某轴（如长边 Y）的位置，
+  把球桌两侧的人固定成 ID=0 / ID=1。绝对稳定，不受时序影响——乒乓球两人分居
+  球桌长边两侧，天然适合。
+- **时序跟踪模式**：跨帧按 3D 质心最近邻关联稳定 ID（适合没有固定分区语义的场景）。
+
+输出都按 ID 稳定排序，供可视化按 ID 配色。
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 
@@ -26,32 +31,60 @@ def _centroid(skel: Skeleton3D) -> Optional[np.ndarray]:
 
 
 class PoseTracker:
-    """3D 骨架多目标跟踪器（贪心最近邻 + 按 ID 稳定排序）。"""
+    """3D 骨架身份分配器（分区硬编码 或 时序最近邻）。"""
 
-    def __init__(self, max_dist: float = 0.8, max_miss: int = 15) -> None:
+    def __init__(
+        self,
+        max_dist: float = 0.8,
+        max_miss: int = 15,
+        partition_axis: Optional[int] = None,
+        partition_threshold: Optional[float] = None,
+    ) -> None:
         """
         Args:
-            max_dist: 关联门限（米）。新骨架与某 track 质心的距离小于该值才算同一个人。
-                帧间人移动通常 <0.1m，取 0.8m 足够稳健又不会把两个人串起来。
-            max_miss: 连续丢失帧数上限，超过则删除该 track。
+            max_dist: 时序跟踪的关联门限（米）。
+            max_miss: 时序跟踪的连续丢失帧数上限。
+            partition_axis: 分区模式用的世界系坐标轴（0=X 短边, 1=Y 长边, 2=Z）。
+                设为 None 则走时序跟踪。
+            partition_threshold: 分区阈值（米）。质心该轴坐标 < 阈值 → ID=0，否则 ID=1。
         """
         self.max_dist = float(max_dist)
         self.max_miss = int(max_miss)
-        self._tracks: List[dict] = []  # {id, centroid, miss}
+        self.partition_axis = partition_axis
+        self.partition_threshold = partition_threshold
+        self._tracks: List[dict] = []
         self._next_id = 0
 
+    # ------------------------------------------------------------------
     def update(self, skeletons: List[Skeleton3D]) -> List[Skeleton3D]:
-        """喂入一帧骨架，返回**按稳定 ID 排序**的骨架列表。
+        """喂入一帧骨架，返回**按稳定 ID 排序**的骨架列表。"""
+        if self.partition_axis is not None:
+            return self._partition_update(skeletons)
+        return self._track_update(skeletons)
 
-        排序保证：同一个人的骨架在跨帧列表中位置稳定（除非其 ID 顺序被新出现的人
-        插入），从而可视化按顺序配色的身份不闪变。
-        """
+    # ------------------------------------------------------------------
+    def _partition_update(self, skeletons: List[Skeleton3D]) -> List[Skeleton3D]:
+        """分区硬编码：按质心在该轴坐标，< 阈值 → ID=0，≥ 阈值 → ID=1。"""
+        axis = self.partition_axis
+        thr = self.partition_threshold
+        key = []
+        for s in skeletons:
+            c = _centroid(s)
+            if c is None:
+                key.append((1, 1))  # 无质心排最后
+            else:
+                key.append((0, 0 if float(c[axis]) < thr else 1))
+        order = sorted(range(len(skeletons)), key=lambda j: key[j])
+        return [skeletons[j] for j in order]
+
+    # ------------------------------------------------------------------
+    def _track_update(self, skeletons: List[Skeleton3D]) -> List[Skeleton3D]:
+        """时序最近邻：贪心关联到最近的 track，保持 ID 跨帧稳定。"""
         n = len(skeletons)
         centroids = [_centroid(s) for s in skeletons]
         used = [False] * n
         assign = [-1] * n
 
-        # 1) 每个 track 贪心抢最近的未分配骨架
         for track in self._tracks:
             best_j, best_d = -1, self.max_dist
             for j in range(n):
@@ -68,7 +101,6 @@ class PoseTracker:
             else:
                 track["miss"] += 1
 
-        # 2) 未关联的骨架 → 新建 track
         for j in range(n):
             if not used[j] and centroids[j] is not None:
                 assign[j] = self._next_id
@@ -76,15 +108,10 @@ class PoseTracker:
                 self._next_id += 1
                 used[j] = True
 
-        # 3) 删除丢失过久的 track
         self._tracks = [t for t in self._tracks if t["miss"] <= self.max_miss]
 
-        # 4) 按 ID 稳定排序（无有效质心的骨架排最后，保持原顺序）
-        ordered = sorted(
-            (assign[j], j) for j in range(n)
-        )
-        ordered.sort(key=lambda t: (t[0] < 0, t[0]))
-        return [skeletons[j] for _, j in ordered]
+        order = sorted(range(n), key=lambda j: (assign[j] < 0, assign[j]))
+        return [skeletons[j] for j in order]
 
     def reset(self) -> None:
         self._tracks = []

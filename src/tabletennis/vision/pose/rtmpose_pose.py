@@ -144,8 +144,8 @@ class RTMPoseDetector(PoseDetector):
             "rtmpose-s"/"rtmpose-s-halpe26"/"rtmpose-x"/"rtmpose-x-halpe26"，
             或本地 onnx 路径 / 下载 URL。
         input_size: 姿态模型输入尺寸 (H, W)，默认 (192, 256)（对应 256×192）。
-        det: 人体检测器标识（"yolox-m"/"yolox-x"/"yolox-tiny"）或本地/URL。
-        det_input_size: 检测器输入尺寸 (H, W)，默认 (640, 640)。
+        det: 人体检测器标识（"yolox-tiny"/"yolox-m"/"yolox-x"）或本地/URL。默认 tiny（快）。
+        det_input_size: 检测器输入尺寸 (H, W)，默认 (416, 416)（须与 yolox-tiny 匹配）。
         device: "cpu" 或 "cuda"。GT 1030 建议 cpu，换好 GPU 后改 cuda。
         backend: 推理后端，默认 "onnxruntime"；"tensorrt" 走 TensorrtExecutionProvider
             （FP16 + engine 缓存，需已装 tensorrt 运行库）。
@@ -158,8 +158,8 @@ class RTMPoseDetector(PoseDetector):
         self,
         model: str = "rtmpose-l-halpe26",
         input_size: tuple = (192, 256),
-        det: str = "yolox-m",
-        det_input_size: tuple = (640, 640),
+        det: str = "yolox-tiny",
+        det_input_size: tuple = (416, 416),
         device: str = "cuda",
         backend: str = "onnxruntime",
         score_thr: float = 0.5,
