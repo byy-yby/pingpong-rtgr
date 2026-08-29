@@ -37,6 +37,7 @@ from tabletennis.visualization.overlay2d import (
     gray_to_bgr,
     tile_images,
 )
+from tabletennis.vision.ball import ClassicalBallDetector
 from tabletennis.vision.detector import create_detector
 
 MAIN_WIN = "Cameras"
@@ -103,6 +104,14 @@ class LiveControl:
         self._table_poses: Dict[int, tuple] = {}   # cid -> (R, t)（桌面系 -> 相机系）
         self.viewer3d = None
 
+        # 数据录制（按 r）：倒计时 3s → 存图 + 经典检测器预标注
+        self._recording = False
+        self._record_countdown_until = 0.0
+        self._record_count = 0
+        self._record_base = 0
+        self._record_detector = None
+        self._record_saved_framenum: Dict[int, int] = {}
+
         # 3D 姿态重建（按 P）：标定三角化器 + 各相机最近一帧的 2D 姿态
         self._triangulator = None
         self._recon_extrinsics: Dict[int, object] = {}
@@ -132,6 +141,89 @@ class LiveControl:
         save_camera_settings(self.values["exposure"], self.values["gain"], self.values["gamma"])
         self._save_flash_until = time.time() + 1.5
         print("✓ 已保存曝光/增益/伽马到 config/camera_settings.json")
+
+    # ------------------------------------------------------------------
+    # 数据录制（按 r）：倒计时 3s → 存图 + 预标注，再按 r 停止
+    # ------------------------------------------------------------------
+    def toggle_record(self) -> None:
+        """切换录制：录制中按 r 立即停止；空闲按 r 开始 3s 倒计时。"""
+        if self._recording:
+            self._recording = False
+            print(f"[录制] ■ 停止，本次共保存 {self._record_count} 组帧 → data/ball_dataset/")
+            return
+        if self._record_countdown_until > 0:
+            self._record_countdown_until = 0.0  # 倒计时中再按 → 取消
+            print("[录制] 已取消")
+            return
+        self._record_countdown_until = time.time() + 3.0
+        self._record_count = 0
+        self._record_base = self._next_record_index()
+        self._record_saved_framenum = {}
+        print("[录制] 3 秒后开始录制（再按 r 停止）...")
+        print(f"        保存到 data/ball_dataset/（从 f{self._record_base:06d} 起）")
+
+    def _next_record_index(self) -> int:
+        """扫描已有数据，返回下一个可用编号，避免覆盖之前的录制。"""
+        img_dir = os.path.join(project_root(), "data", "ball_dataset", "images")
+        if not os.path.isdir(img_dir):
+            return 0
+        max_idx = -1
+        for name in os.listdir(img_dir):
+            base = name.split("_c")[0]
+            if base.startswith("f") and base[1:].isdigit():
+                max_idx = max(max_idx, int(base[1:]))
+        return max_idx + 1
+
+    def _tick_record(self, latest: Dict[int, Frame]) -> None:
+        """每帧驱动录制状态机：倒计时（预热背景）→ 录制（存图 + 预标注）。"""
+        if self._record_countdown_until <= 0 and not self._recording:
+            return
+
+        if self._record_detector is None:
+            self._record_detector = ClassicalBallDetector()
+
+        # 倒计时阶段：喂帧预热背景，到点转录制
+        if not self._recording:
+            for f in latest.values():
+                if f is not None:
+                    self._record_detector.detect(f)
+            if time.time() >= self._record_countdown_until:
+                self._recording = True
+                self._record_countdown_until = 0.0
+                print("[录制] ▶ 开始录制（再按 r 停止）")
+            return
+
+        # 录制阶段：按帧号去重，保存新帧 + YOLO 预标注
+        img_dir = os.path.join(project_root(), "data", "ball_dataset", "images")
+        lbl_dir = os.path.join(project_root(), "data", "ball_dataset", "labels")
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(lbl_dir, exist_ok=True)
+
+        saved_any = False
+        for cid, f in latest.items():
+            if f is None:
+                continue
+            if self._record_saved_framenum.get(cid) == f.frame_num:
+                continue
+            self._record_saved_framenum[cid] = f.frame_num
+            name = f"f{self._record_base + self._record_count:06d}_c{cid}"
+            cv2.imwrite(os.path.join(img_dir, name + ".png"), f.image)
+            balls = self._record_detector.detect(f)
+            line = self._ball_to_yolo(balls[0], f.width, f.height) if balls else ""
+            with open(os.path.join(lbl_dir, name + ".txt"), "w") as fh:
+                fh.write(line + ("\n" if line else ""))
+            saved_any = True
+        if saved_any:
+            self._record_count += 1
+
+    @staticmethod
+    def _ball_to_yolo(ball, W: int, H: int) -> str:
+        """Ball2D → YOLO 标签行 ``0 cx cy w h``（归一化）。"""
+        cx = min(max(float(ball.center[0]) / W, 0.0), 1.0)
+        cy = min(max(float(ball.center[1]) / H, 0.0), 1.0)
+        w = min(max(float(2.0 * ball.radius) / W, 0.0), 1.0)
+        h = min(max(float(2.0 * ball.radius) / H, 0.0), 1.0)
+        return f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"
 
     # ------------------------------------------------------------------
     # 触发信号检查
@@ -191,6 +283,9 @@ class LiveControl:
     def handle_key(self, key: int) -> None:
         if key == ord("s"):
             self.save_settings()
+            return
+        if key == ord("r"):
+            self.toggle_record()
             return
         for kind, (_, k) in DETECTION_TOGGLES.items():
             if key == ord(k):
@@ -431,6 +526,17 @@ class LiveControl:
             s = self.max_width / w
             grid = cv2.resize(grid, (int(w * s), int(h * s)))
 
+        # 录制状态指示（左上角红点 + 计数 / 倒计时）
+        if self._recording:
+            cv2.circle(grid, (16, 16), 9, (0, 0, 255), -1)
+            cv2.putText(grid, f"REC {self._record_count}", (32, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        elif self._record_countdown_until > 0:
+            n = max(1, int(self._record_countdown_until - time.time()) + 1)
+            cv2.circle(grid, (16, 16), 9, (0, 165, 255), -1)
+            cv2.putText(grid, f"{n}", (32, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 165, 255), 2, cv2.LINE_AA)
+
         # 触发信号报错叠加在画面上
         if self.trigger_error:
             cv2.putText(grid, "NO TRIGGER SIGNAL", (20, 60),
@@ -493,10 +599,17 @@ class LiveControl:
         )
         cv2.putText(hint, f"检测: {toggles}", (12, 18), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (0, 220, 255), 1, cv2.LINE_AA)
-        if time.time() < self._save_flash_until:
+        if self._recording:
+            cv2.putText(hint, f"● REC {self._record_count} 帧", (w - 200, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv2.LINE_AA)
+        elif self._record_countdown_until > 0:
+            n = max(1, int(self._record_countdown_until - time.time()) + 1)
+            cv2.putText(hint, f"录制倒计时 {n}s", (w - 200, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1, cv2.LINE_AA)
+        elif time.time() < self._save_flash_until:
             cv2.putText(hint, "已保存 ✓", (w - 110, 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]识别球桌+3D场景  [s]保存  退出:[q]/ESC/X",
+        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [r]录制 [s]保存  退出:[q]/ESC/X",
                     (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
         return hint
 
@@ -537,6 +650,8 @@ class LiveControl:
                         if self.trigger_error:
                             self.trigger_error = False
                             print("✓ 触发信号已恢复，开始出图。")
+
+                self._tick_record(latest)
 
                 # 3D 姿态重建（按 P 开启后每帧批处理检测 + 三角化 + Open3D 骨架）
                 if self.enable["pose"] and self.detectors["pose"] is not None:
