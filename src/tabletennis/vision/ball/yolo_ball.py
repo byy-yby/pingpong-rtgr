@@ -85,7 +85,13 @@ class YoloBallDetector(BallDetector):
         self.iou_thresh = float(iou_thresh)
         self.refine_enabled = bool(refine)
 
-        providers = ort.get_available_providers()
+        # 只选 CUDA（有则用，无则 CPU）。不能传 get_available_providers() 全量列表：
+        # 本机装了 tensorrt-cu12-libs，TensorrtExecutionProvider 也在可用列表里，
+        # 全量传会让 session 初始化先去建 TRT 引擎（实测 ~52s），主线程里按 b 直接卡死 UI。
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            providers = ["CPUExecutionProvider"]
         self.session = ort.InferenceSession(model_path, providers=providers)
         self.input_name = self.session.get_inputs()[0].name
 
