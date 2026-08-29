@@ -25,6 +25,8 @@ from typing import Dict, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 import numpy as np
 
@@ -223,14 +225,19 @@ class ReconstructPose:
                 mgr.start()
                 while True:
                     bundle = mgr.get_synchronized_bundle(block=True, timeout=1.0)
-                    poses_per_cam: Dict[int, List[Pose2D]] = {}
-                    for cid, frame in bundle.frames.items():
-                        if frame_idx % max(self.args.stride, 1) == 0:
-                            poses = self._detect(detector, frame)
-                            self._last_poses[cid] = poses
-                        else:
-                            poses = self._last_poses.get(cid, [])
-                        poses_per_cam[cid] = poses
+                    # 多相机并行检测：GPU 推理是串行点，但各相机的预处理/NMS/传输可重叠
+                    frames_items = list(bundle.frames.items())
+                    if len(frames_items) > 1:
+                        with ThreadPoolExecutor(max_workers=len(frames_items)) as ex:
+                            results = ex.map(
+                                lambda kv: self._detect_one(detector, kv[0], kv[1], frame_idx),
+                                frames_items,
+                            )
+                        poses_per_cam = dict(results)
+                    else:
+                        poses_per_cam = {}
+                        for cid, frame in frames_items:
+                            poses_per_cam[cid] = self._detect_one(detector, cid, frame, frame_idx)[1]
 
                     skeletons = self.reconstruct_frame(poses_per_cam)
                     if self.viewer3d is not None:
@@ -280,6 +287,15 @@ class ReconstructPose:
             for p in poses:
                 p.keypoints[:, :2] /= scale
         return poses
+
+    def _detect_one(self, detector, cid: int, frame: Frame, frame_idx: int):
+        """单相机检测（含 stride 隔帧复用），供线程池并行调用，返回 ``(cid, poses)``。"""
+        if frame_idx % max(self.args.stride, 1) == 0:
+            poses = self._detect(detector, frame)
+            self._last_poses[cid] = poses
+        else:
+            poses = self._last_poses.get(cid, [])
+        return cid, poses
 
     def _show_2d(self, bundle, poses_per_cam: Dict[int, List[Pose2D]]) -> int:
         images = []
