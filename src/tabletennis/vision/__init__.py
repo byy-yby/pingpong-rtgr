@@ -1,8 +1,17 @@
-"""视觉识别模块：2D 检测（球 / 姿态）。
+"""视觉识别模块：2D 检测（球 / 姿态 / 球桌）。
 
-目前只实现姿态检测（RTMPose-l，top-down）。球检测（``ball/``）留待后续阶段。
+姿态检测（RTMPose-l，top-down）；球检测（``ball/``：经典无训练路线 + 亚像素精修）。
 """
-from .detector import Detector, PoseDetector
+from .ball import ClassicalBallDetector, refine_ball_center
+from .detector import BallDetector, Detector, PoseDetector, TableDetector
 from .pose.rtmpose_pose import RTMPoseDetector
 
-__all__ = ["Detector", "PoseDetector", "RTMPoseDetector"]
+__all__ = [
+    "Detector",
+    "PoseDetector",
+    "BallDetector",
+    "TableDetector",
+    "RTMPoseDetector",
+    "ClassicalBallDetector",
+    "refine_ball_center",
+]
