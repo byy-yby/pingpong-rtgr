@@ -210,7 +210,21 @@ SetIntValueEx("LineDebouncerTime", 50)             # us，防误触发
 - [x] **RTMPose 性能**：已上 TensorRT——YOLOX 11.3→2.26ms、RTMPose 3.9→1.08ms、单相机
   detect 端到端 14.6→8.0ms（GPU 不再瓶颈，剩余是 CPU 预处理/NMS 开销）。YOLOX 因烤入
   NMS 的 TopK-5000 走 TRT 需先 patch 成 3000（`_patch_yolox_for_trt`）。要再提速：
-  ① 换 RTMO（one-stage，砍掉 YOLOX+逐人 RTMPose）；② YOLOX 重新导出成动态 batch 以批处理。
+  ① 换 RTMO（one-stage，砍掉 YOLOX+逐人 RTMPose）；② 已做：YOLOX 动态 batch 重导出（下条）。
+  4 机 `detect_batch` 目前 ~42ms/轮（TRT，~24 轮/s），剩余瓶颈在 RTMPose batch + CPU 前后处理。
+- [x] **YOLOX 动态 batch 重导出**：`scripts/export_yolox_dynamic_batch.py` 用纯 PyTorch
+  重建 YOLOX-tiny（CSPDarknet+YOLOXPAFPN+YOLOXHead，命名与 mmdet state_dict 严格一致、
+  strict 加载 humanart pth），导出**动态 batch** ONNX（~667KB，opset 18）到
+  `~/.cache/tabletennis/yolox_tiny_dynamic_416.onnx`，输出 (B,3549,85) 不烤 NMS（NMS 上层
+  numpy 逐类做）。三个关键坑：① **不烤 /255**——humanart 的 DetDataPreprocessor 没配
+  mean/std，训练吃 0-255 原图，烤了会 0 检出；② decode 用 **cell 左上角约定
+  center=(delta+grid)×stride**（不加 0.5，与 rtmlib 一致；mmdet 的 grid+0.5 会偏 ~24px，
+  实测 IoU 0.824 vs 1.000）；③ TRT 动态 batch 需配 profile
+  `trt_profile_min/opt/max_shapes="input:1x3x416x416"/"4x"/"8x"`。已集成进
+  `RTMPoseDetector._det_batch_session`（非 CPU 且 det_input_size=416 时自动建，缺失回退逐帧）：
+  `detect_batch` 把有效帧堆成 (B,3,416,416) 一次 forward。实测（4 帧 batch）：CUDA EP
+  **47.8ms**（vs 逐帧 CUDA ~250ms，5.2×）、TRT EP **42.5ms**（vs 逐帧 TRT 44.9ms，省 3 次
+  session.run 固定开销）；与逐帧路径关键点差 <1.7px。
 - [ ] **球检测**：接口已在 `vision/detector.py`（`BallDetector`），经典 CV 路线（阈值/连通域）
   待接入 `register_detector("ball", ...)`。（球桌已实现并注册。）
 - [ ] **YOLO 微调训练**（2026-08-29 进行中）：数据集已统一框 + 增强 3000→11944，

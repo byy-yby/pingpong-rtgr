@@ -16,6 +16,7 @@
 | `pose_preview.py` | **RTMPose-l 姿态识别实时预览**：自动开相机 → 检测 → 骨架叠加。 |
 | `calibrate_intrinsics.py` | **相机内参标定 GUI**（PySide6, ChArUco）：四路预览 + 点击选中 + Enter 采集 + 计算并检验（RMS/主点/焦距判定）。 |
 | `calibrate_extrinsics.py` | **多相机外参标定 GUI**（PySide6，ChArUco）：四路预览 + Enter 四机同时拍照 + 检测/位姿 + 求外参保存。 |
+| `export_yolox_dynamic_batch.py` | 纯 PyTorch 重建 YOLOX-tiny 并从 mmdet 权重重导出**动态 batch** ONNX（4 相机一次 forward，`detect_batch` 用；带 `--verify` 自检）。 |
 
 ## 怎么用
 
@@ -33,6 +34,7 @@ python scripts/query_parameters.py --camera-id 0
 python scripts/calibrate_intrinsics.py                  # 内参标定 GUI
 python scripts/calibrate_extrinsics.py                  # 外参标定 GUI（ChArUco）
 python scripts/calibrate_extrinsics.py --generate-board board.png   # 只生成打印板
+python scripts/export_yolox_dynamic_batch.py --verify               # YOLOX 动态 batch 重导出
 ```
 
 `live_control.py` 键盘：`[p]` 姿态、`[b]` 球、`[t]` 球桌、`[q]`/`[ESC]` 退出；

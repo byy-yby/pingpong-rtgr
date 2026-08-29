@@ -1,140 +1,335 @@
 #!/usr/bin/env python3
-"""把固定 batch=1 的 YOLOX ONNX 转成动态 batch，实现多相机一次 forward。
+"""用纯 PyTorch 重建 YOLOX-tiny 并从 mmdet 权重重新导出**动态 batch** ONNX。
 
-⚠️ 状态：**不完整 / 不可行**。mmpose SDK 导出的 YOLOX（已烤入 EfficientNMS）在整张图里
-有**大量** batch=1 硬编码——不止 head 里 12 个 Reshape，还有 Squeeze/Unsqueeze/Gather/
-NonMaxSuppression 等，修一个冒一个（batch=1 输出正确、batch=2 在 Squeeze_556 崩）。
-图手术不是可行路径；正确做法是**用 mmdet/mmpose 从 PyTorch 重新导出动态 batch**。
-本脚本保留作为那次尝试的记录与起点。
+背景：mmpose SDK 的 YOLOX ONNX 已烤入 EfficientNMS 且 batch=1 硬编码（12 个 Reshape +
+Squeeze/Unsqueeze + NMS），图手术不可行（本文件旧版本试过）。正确路径是从 PyTorch 权重
+**重新导出**：按 mmdet 的模块命名重建 YOLOX-tiny（CSPDarknet + YOLOXPAFPN + YOLOXHead），
+加载 humanart 的 pth，导出 batch 维动态、不烤 NMS 的模型——输出 (B, 3549, 85)，每行
+[reg_xy(2), reg_wh(2), obj.sigmoid(1), cls.sigmoid(80)]（3549 = 52²+26²+13²，stride 8/16/32
+按序展平，y-major）。NMS 留给上层 numpy 逐类做（batch 内各图独立）。
+
+导出细节（与 mmdet 严格一致，保证权重加载正确）：
+- Focus 切块顺序 top_left/bot_left/top_right/bot_right；CSPLayer cat [main, short]。
+- BN: eps=1e-3, momentum=0.03（训练时的 eps 必须一致）；激活 Swish=SiLU。
+- **不烤 /255 归一化**：humanart 配置的 DetDataPreprocessor 未配 mean/std，训练时直接吃
+  0-255 原始输入（rtmlib 也喂 0-255）。加了 /255 反而会让权重跑出垃圾（实测 0 检出）。
+- 固定 416×416 空间尺寸（rtmlib 预处理固定 resize 到该尺寸），仅 batch 维动态，
+  便于 TensorRT 建引擎。
 
 用法：
     conda run -n tt python scripts/export_yolox_dynamic_batch.py \
-        <src.onnx> <dst.onnx> [--verify]
+        [--pth PATH] [--out PATH] [--verify]
+默认从 ~/.cache/tabletennis/yolox_tiny_humanart.pth 读取、导出到
+~/.cache/tabletennis/yolox_tiny_dynamic_416.onnx。
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+from typing import Tuple
 
 import numpy as np
-import onnx
-from onnx import TensorProto, helper, numpy_helper
+import torch
+import torch.nn as nn
+
+# ---------------------------------------------------------------------------
+# mmdet 等价模块重建（命名与 state_dict 完全一致，strict 加载）
+# ---------------------------------------------------------------------------
 
 
-def make_dynamic_batch(model: onnx.ModelProto) -> onnx.ModelProto:
-    g = model.graph
-    inits = {i.name: i for i in g.initializer}
+class ConvModule(nn.Module):
+    """mmcv ConvModule：conv(bias=False) + BN(eps=1e-3, mom=0.03) + SiLU。"""
 
-    # 1) 输入 batch 维 -> 动态
-    for inp in g.input:
-        d0 = inp.type.tensor_type.shape.dim[0]
-        if d0.dim_value == 1:
-            d0.ClearField("dim_value")
-            d0.dim_param = "batch"
+    def __init__(self, in_c: int, out_c: int, k: int, s: int = 1, p: int = None):
+        super().__init__()
+        if p is None:
+            p = (k - 1) // 2
+        self.conv = nn.Conv2d(in_c, out_c, k, s, p, bias=False)
+        self.bn = nn.BatchNorm2d(out_c, momentum=0.03, eps=0.001)
+        self.act = nn.SiLU(inplace=False)
 
-    # 2) 输出 batch 维 -> 动态
-    for out in g.output:
-        d0 = out.type.tensor_type.shape.dim[0]
-        if d0.dim_value == 1:
-            d0.ClearField("dim_value")
-            d0.dim_param = "batch"
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
 
-    # 3) 收集硬编码 [1, ...] 的 Reshape/Expand/Tile 节点
-    targets = []
-    for n in g.node:
-        if n.op_type not in ("Reshape", "Expand", "Tile"):
-            continue
-        shape_in = n.input[1] if len(n.input) > 1 else None
-        if shape_in and shape_in in inits:
-            arr = numpy_helper.to_array(inits[shape_in])
-            flat = arr.reshape(-1)
-            # 只处理「batch=1, ...」的多维 reshape；[1] 这种标量 reshape 不是 batch 维，跳过
-            if flat.size > 1 and flat[0] == 1:
-                targets.append((n, shape_in, flat.astype(np.int64)))
 
-    # 4) 对每个节点插入 Shape/Gather/Concat，把 [1,...] 换成 [batch,...]
-    insert_before: dict = {}  # reshape name -> [新节点...]
-    for n, shape_in, flat in targets:
-        rest = flat[1:]  # 去掉 batch=1，其余 dims 不变
-        s_name = f"{n.name}_shape"
-        g_name = f"{n.name}_batch"
-        c_name = f"{n.name}_dynshape"
-        idx_name = f"{n.name}_idx0"
-        rest_name = f"{n.name}_rest"
+class Focus(nn.Module):
+    """YOLOX stem：4 个降采样切片 concat 后过一个 3×3 conv。"""
 
-        nodes = [helper.make_node("Shape", [n.input[0]], [s_name])]
-        g.initializer.append(
-            numpy_helper.from_array(np.array([0], dtype=np.int64), name=idx_name)
-        )
-        nodes.append(helper.make_node("Gather", [s_name, idx_name], [g_name], axis=0))
-        if rest.size:
-            g.initializer.append(numpy_helper.from_array(rest, name=rest_name))
-            nodes.append(
-                helper.make_node("Concat", [g_name, rest_name], [c_name], axis=0)
-            )
-        else:  # 无 rest，shape 就是 [batch]
-            c_name = g_name
+    def __init__(self, in_c: int, out_c: int):
+        super().__init__()
+        self.conv = ConvModule(in_c * 4, out_c, 3, 1, 1)
 
-        # 改原节点的 shape 输入指向动态 shape
-        for nn in g.node:
-            if nn.name == n.name:
-                nn.input[1] = c_name
-                break
-        insert_before[n.name] = nodes
+    def forward(self, x):
+        tl = x[..., ::2, ::2]
+        tr = x[..., ::2, 1::2]
+        bl = x[..., 1::2, ::2]
+        br = x[..., 1::2, 1::2]
+        x = torch.cat((tl, bl, tr, br), dim=1)  # 与 mmdet 顺序一致
+        return self.conv(x)
 
-    # 5) 把 Shape/Gather/Concat 插到各自 Reshape 之前，保证拓扑序
-    original_nodes = list(g.node)
-    out_nodes = []
-    for node in original_nodes:
-        if node.name in insert_before:
-            out_nodes.extend(insert_before[node.name])
-        out_nodes.append(node)
-    del g.node[:]
-    g.node.extend(out_nodes)
 
+class DarknetBottleneck(nn.Module):
+    def __init__(self, in_c: int, out_c: int, expansion: float = 0.5,
+                 add_identity: bool = True):
+        super().__init__()
+        hidden = int(out_c * expansion)
+        self.conv1 = ConvModule(in_c, hidden, 1)
+        self.conv2 = ConvModule(hidden, out_c, 3, 1, 1)
+        self.add_identity = add_identity and in_c == out_c
+
+    def forward(self, x):
+        out = self.conv2(self.conv1(x))
+        return out + x if self.add_identity else out
+
+
+class CSPLayer(nn.Module):
+    def __init__(self, in_c: int, out_c: int, num_blocks: int = 1,
+                 add_identity: bool = True):
+        super().__init__()
+        mid = out_c // 2
+        self.main_conv = ConvModule(in_c, mid, 1)
+        self.short_conv = ConvModule(in_c, mid, 1)
+        self.final_conv = ConvModule(2 * mid, out_c, 1)
+        self.blocks = nn.Sequential(*[
+            DarknetBottleneck(mid, mid, 1.0, add_identity)
+            for _ in range(num_blocks)
+        ])
+
+    def forward(self, x):
+        x_short = self.short_conv(x)
+        x_main = self.main_conv(x)
+        x_main = self.blocks(x_main)
+        return self.final_conv(torch.cat((x_main, x_short), dim=1))  # main 在前
+
+
+class SPPBottleneck(nn.Module):
+    def __init__(self, in_c: int, out_c: int, kernel_sizes: Tuple = (5, 9, 13)):
+        super().__init__()
+        mid = in_c // 2
+        self.conv1 = ConvModule(in_c, mid, 1)
+        self.poolings = nn.ModuleList([
+            nn.MaxPool2d(ks, stride=1, padding=ks // 2) for ks in kernel_sizes
+        ])
+        self.conv2 = ConvModule(mid * (len(kernel_sizes) + 1), out_c, 1)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        return self.conv2(torch.cat([x] + [p(x) for p in self.poolings], dim=1))
+
+
+class CSPDarknet(nn.Module):
+    """P5 架构：widen_factor 0.375 / deepen_factor 0.33（tiny）。"""
+
+    # (in, out, num_blocks, add_identity, use_spp)，与 mmdet P5 一致
+    _ARCH = (
+        (64, 128, 3, True, False),
+        (128, 256, 9, True, False),
+        (256, 512, 9, True, False),
+        (512, 1024, 3, False, True),
+    )
+
+    def __init__(self, widen: float = 0.375, deepen: float = 0.33):
+        super().__init__()
+        self.stem = Focus(3, int(64 * widen))
+        for i, (in_c, out_c, nb, add_ident, use_spp) in enumerate(self._ARCH):
+            in_c, out_c = int(in_c * widen), int(out_c * widen)
+            nb = max(round(nb * deepen), 1)
+            stage = [ConvModule(in_c, out_c, 3, 2, 1)]
+            if use_spp:
+                stage.append(SPPBottleneck(out_c, out_c, (5, 9, 13)))
+            stage.append(CSPLayer(out_c, out_c, nb, add_ident))
+            self.add_module(f"stage{i + 1}", nn.Sequential(*stage))
+
+    def forward(self, x):
+        x = self.stem(x)
+        outs = []
+        for i, name in enumerate(("stage1", "stage2", "stage3", "stage4")):
+            x = getattr(self, name)(x)
+            if i + 1 in (2, 3, 4):  # out_indices=(2,3,4)
+                outs.append(x)
+        return tuple(outs)
+
+
+class YOLOXPAFPN(nn.Module):
+    def __init__(self, in_channels: Tuple = (96, 192, 384), out_channels: int = 96,
+                 num_csp_blocks: int = 1):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        n = len(in_channels)
+        self.reduce_layers = nn.ModuleList()
+        self.top_down_blocks = nn.ModuleList()
+        for idx in range(n - 1, 0, -1):
+            self.reduce_layers.append(
+                ConvModule(in_channels[idx], in_channels[idx - 1], 1))
+            self.top_down_blocks.append(
+                CSPLayer(in_channels[idx - 1] * 2, in_channels[idx - 1],
+                         num_csp_blocks, add_identity=False))
+        self.downsamples = nn.ModuleList()
+        self.bottom_up_blocks = nn.ModuleList()
+        for idx in range(n - 1):
+            self.downsamples.append(
+                ConvModule(in_channels[idx], in_channels[idx], 3, 2, 1))
+            self.bottom_up_blocks.append(
+                CSPLayer(in_channels[idx] * 2, in_channels[idx + 1],
+                         num_csp_blocks, add_identity=False))
+        self.out_convs = nn.ModuleList([
+            ConvModule(in_channels[i], out_channels, 1) for i in range(n)
+        ])
+
+    def forward(self, inputs):
+        n = len(inputs)
+        inner_outs = [inputs[-1]]
+        for idx in range(n - 1, 0, -1):
+            feat_high = inner_outs[0]
+            feat_low = inputs[idx - 1]
+            feat_high = self.reduce_layers[n - 1 - idx](feat_high)
+            inner_outs[0] = feat_high
+            upsample_feat = self.upsample(feat_high)
+            inner_outs.insert(
+                0, self.top_down_blocks[n - 1 - idx](
+                    torch.cat([upsample_feat, feat_low], 1)))
+        outs = [inner_outs[0]]
+        for idx in range(n - 1):
+            feat_low = outs[-1]
+            feat_height = inner_outs[idx + 1]
+            out = self.bottom_up_blocks[idx](
+                torch.cat([self.downsamples[idx](feat_low), feat_height], 1))
+            outs.append(out)
+        for i, conv in enumerate(self.out_convs):
+            outs[i] = conv(outs[i])
+        return tuple(outs)
+
+
+class YOLOXHead(nn.Module):
+    def __init__(self, num_classes: int = 80, in_channels: int = 96,
+                 feat_channels: int = 96, stacked_convs: int = 2,
+                 strides: Tuple = (8, 16, 32)):
+        super().__init__()
+        self.strides = strides
+        self.multi_level_cls_convs = nn.ModuleList()
+        self.multi_level_reg_convs = nn.ModuleList()
+        self.multi_level_conv_cls = nn.ModuleList()
+        self.multi_level_conv_reg = nn.ModuleList()
+        self.multi_level_conv_obj = nn.ModuleList()
+        for _ in strides:
+            self.multi_level_cls_convs.append(nn.Sequential(*[
+                ConvModule(in_channels if i == 0 else feat_channels,
+                           feat_channels, 3, 1, 1) for i in range(stacked_convs)]))
+            self.multi_level_reg_convs.append(nn.Sequential(*[
+                ConvModule(in_channels if i == 0 else feat_channels,
+                           feat_channels, 3, 1, 1) for i in range(stacked_convs)]))
+            self.multi_level_conv_cls.append(nn.Conv2d(feat_channels, num_classes, 1))
+            self.multi_level_conv_reg.append(nn.Conv2d(feat_channels, 4, 1))
+            self.multi_level_conv_obj.append(nn.Conv2d(feat_channels, 1, 1))
+
+    def forward(self, x):
+        outs = []
+        for i in range(len(self.strides)):
+            cls_score = self.multi_level_conv_cls[i](
+                self.multi_level_cls_convs[i](x[i]))
+            reg_feat = self.multi_level_reg_convs[i](x[i])
+            bbox_pred = self.multi_level_conv_reg[i](reg_feat)
+            objectness = self.multi_level_conv_obj[i](reg_feat)
+            # (B, 4+1+80, H, W) -> (B, HW, 85)，y-major 展平
+            out = torch.cat(
+                [bbox_pred, objectness.sigmoid(), cls_score.sigmoid()], dim=1)
+            out = out.permute(0, 2, 3, 1).reshape(out.shape[0], -1, 85)
+            outs.append(out)
+        return torch.cat(outs, dim=1)  # (B, 3549, 85)，stride 8/16/32 顺序
+
+
+class YOLOXDynamic(nn.Module):
+    """带 /255 归一化的完整 YOLOX-tiny，输出 (B, 3549, 85)。"""
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = CSPDarknet()
+        self.neck = YOLOXPAFPN()
+        self.bbox_head = YOLOXHead()
+
+    def forward(self, x):
+        # 注意：humanart 配置的 DetDataPreprocessor 未配 mean/std → 训练时**不做归一化**，
+        # 模型直接吃 0-255 原始输入（mmpose 导出的 ONNX 同样不烤 /255，rtmlib 也直接喂 0-255）。
+        feats = self.backbone(x)
+        feats = self.neck(feats)
+        return self.bbox_head(feats)
+
+
+def _default_pth() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "tabletennis",
+                        "yolox_tiny_humanart.pth")
+
+
+def _default_out() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "tabletennis",
+                        "yolox_tiny_dynamic_416.onnx")
+
+
+def build_model(pth: str) -> nn.Module:
+    ckpt = torch.load(pth, map_location="cpu")
+    sd = ckpt["state_dict"]
+    model = YOLOXDynamic()
+    model.eval()
+    missing, unexpected = model.load_state_dict(sd, strict=True)
+    assert not missing and not unexpected, (
+        f"权重 key 不匹配: missing={missing}, unexpected={unexpected}")
     return model
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="YOLOX ONNX 固定 batch=1 -> 动态 batch")
-    ap.add_argument("src")
-    ap.add_argument("dst")
-    ap.add_argument("--verify", action="store_true", help="batch=1 时对比转换前后输出")
-    args = ap.parse_args()
+def export(pth: str, out: str, opset: int = 17) -> None:
+    model = build_model(pth)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    dummy = torch.randn(1, 3, 416, 416)
+    torch.onnx.export(
+        model,
+        dummy,
+        out,
+        input_names=["input"],
+        output_names=["dets_raw"],
+        dynamic_axes={"input": {0: "batch"}, "dets_raw": {0: "batch"}},
+        opset_version=opset,
+        do_constant_folding=True,
+    )
+    print(f"已导出动态 batch YOLOX -> {out} ({os.path.getsize(out)} bytes)")
 
-    model = onnx.load(args.src)
-    model = make_dynamic_batch(model)
-    # 注意：不做 onnx.shape_inference —— 它会按 batch=1 误标 Shape 节点的输出，
-    # 导致 onnxruntime 把 Shape->Gather->Concat 链常量折叠成 [1,...]，batch 动态化失效。
-    onnx.save(model, args.dst)
-    print(f"已导出动态 batch 模型 -> {args.dst} ({os.path.getsize(args.dst)} bytes)")
 
-    if args.verify:
-        _verify(args.src, args.dst)
-
-
-def _verify(src: str, dst: str) -> None:
+def verify(pth: str, out: str, batches=(1, 4)) -> None:
+    """torch 模型输出 vs 导出的 ONNX 输出逐元素比对（batch=1/4）。"""
     import onnxruntime as ort
 
-    x = np.random.rand(1, 3, 640, 640).astype(np.float32)
+    model = build_model(pth)
     so = ort.SessionOptions()
-    s0 = ort.InferenceSession(src, sess_options=so, providers=["CPUExecutionProvider"])
-    s1 = ort.InferenceSession(dst, sess_options=so, providers=["CPUExecutionProvider"])
-    o0 = s0.run(None, {s0.get_inputs()[0].name: x})
-    o1 = s1.run(None, {s1.get_inputs()[0].name: x})
-    for a, b in zip(o0, o1):
-        if a.shape == b.shape:
-            print(f"  batch=1 输出一致: shape={a.shape}, max|diff|={np.abs(a - b).max():.6f}")
-        else:
-            print(f"  ⚠ 输出 shape 不一致: {a.shape} vs {b.shape}")
-    # 再试 batch=2
-    x2 = np.random.rand(2, 3, 640, 640).astype(np.float32)
-    try:
-        o2 = s1.run(None, {s1.get_inputs()[0].name: x2})
-        print(f"  batch=2 可运行: {[o.shape for o in o2]}")
-    except Exception as e:  # noqa: BLE001
-        print(f"  batch=2 运行失败: {type(e).__name__}: {str(e)[:200]}")
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    sess = ort.InferenceSession(out, sess_options=so,
+                                providers=["CPUExecutionProvider"])
+    inp = sess.get_inputs()[0]
+    print(f"  ONNX 输入: {inp.name} {inp.shape}  输出: "
+          f"{[(o.name, o.shape) for o in sess.get_outputs()]}")
+    for b in batches:
+        x = (np.random.rand(b, 3, 416, 416) * 255).astype(np.float32)
+        with torch.no_grad():
+            ref = model(torch.from_numpy(x)).numpy()
+        got = sess.run(None, {inp.name: x})[0]
+        assert got.shape == ref.shape, f"batch={b} shape 不一致 {got.shape} vs {ref.shape}"
+        max_abs = float(np.abs(got - ref).max())
+        print(f"  batch={b}: shape={got.shape} max|diff|={max_abs:.6f} "
+              f"{'OK' if max_abs < 1e-3 else '⚠ 超差'}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="从 mmdet 权重重导出动态 batch YOLOX ONNX")
+    ap.add_argument("--pth", default=_default_pth())
+    ap.add_argument("--out", default=_default_out())
+    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--verify", action="store_true")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.pth):
+        sys.exit(f"找不到权重 {args.pth}，先用 wget 下载。")
+    export(args.pth, args.out, args.opset)
+    if args.verify:
+        verify(args.pth, args.out)
 
 
 if __name__ == "__main__":

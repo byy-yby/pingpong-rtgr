@@ -8,7 +8,7 @@
 | 文件 | 职责 |
 |---|---|
 | `detector.py` | 检测器抽象接口 `Detector` / `PoseDetector` / `BallDetector` / `TableDetector` + 注册工厂 `register_detector` / `create_detector`。 |
-| `pose/rtmpose_pose.py` | **RTMPose** top-down 2D 姿态检测器（YOLOX 检测人 + RTMPose 关键点，默认 Halpe-26，onnxruntime）。 |
+| `pose/rtmpose_pose.py` | **RTMPose** top-down 2D 姿态检测器（YOLOX 检测人 + RTMPose 关键点，默认 Halpe-26，onnxruntime；多相机走动态 batch YOLOX 的 `detect_batch`）。 |
 | `skeleton.py` | 骨架定义（关键点名 + 骨骼连线），内置 COCO-17 与 Halpe-26。 |
 | `table/table_detector.py` | **球桌识别**：检测两个大 ArUco 标记（ID0/ID1）解「桌面→相机」位姿，失败回退已存外参，投影标准尺寸球桌。 |
 
@@ -36,10 +36,15 @@ for p in poses:
     print(p.keypoints.shape)     # (26, 3)  [x, y, confidence]，Halpe-26 顺序
 ```
 
+多相机批处理：`detect_batch(frames)` 把多帧的人框收集起来、RTMPose 一次 forward；
+检测侧走动态 batch YOLOX（`scripts/export_yolox_dynamic_batch.py` 导出的 ONNX，4 帧一次
+forward，numpy 逐类 NMS）。CUDA 下比逐帧快约 5×，TRT 下省掉 N-1 次 session.run 固定开销。
+导出文件缺失或检测输入不是 416×416 时自动回退逐帧。
+
 模型说明：姿态默认 **rtmpose-l-halpe26**（Halpe-26，256×192，26 点），人体检测默认
-**yolox-m**。不带 `-halpe26` 后缀的模型（如 `rtmpose-l`）输出 COCO-17。权重自动下载到
-`~/.cache/rtmlib/hub/checkpoints`。本机 GT 1030 太弱默认跑 CPU，换好 GPU 后 `device="cuda"`。
-黑白帧会复制成 3 通道再喂模型（RTMPose 训练在 RGB）。
+**yolox-tiny**。不带 `-halpe26` 后缀的模型（如 `rtmpose-l`）输出 COCO-17。权重自动下载到
+`~/.cache/rtmlib/hub/checkpoints`。本机 RTX 5080 + onnxruntime-gpu，`device="cuda"`、
+`backend="tensorrt"`（FP16 + 引擎缓存）走 GPU。黑白帧会复制成 3 通道再喂模型（RTMPose 训练在 RGB）。
 
 ## 还没做完
 

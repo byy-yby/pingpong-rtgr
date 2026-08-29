@@ -135,6 +135,115 @@ def _patch_yolox_for_trt(onnx_path: str) -> str:
     return out_path
 
 
+def _default_det_batch_onnx() -> str:
+    """动态 batch YOLOX ONNX 路径（scripts/export_yolox_dynamic_batch.py 导出）。"""
+    return os.path.join(os.path.expanduser("~"), ".cache", "tabletennis",
+                        "yolox_tiny_dynamic_416.onnx")
+
+
+def _nms(boxes: np.ndarray, scores: np.ndarray, nms_thr: float) -> List[int]:
+    """单类 NMS（numpy）。boxes: (N,4) xyxy。"""
+    x1, y1 = boxes[:, 0], boxes[:, 1]
+    x2, y2 = boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = scores.argsort()[::-1]
+    keep: List[int] = []
+    while order.size:
+        i = int(order[0])
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+        order = order[np.where(ovr <= nms_thr)[0] + 1]
+    return keep
+
+
+def _multiclass_nms(boxes: np.ndarray, scores: np.ndarray,
+                    nms_thr: float, score_thr: float) -> Optional[np.ndarray]:
+    """逐类 NMS，返回 (M,6) [x1,y1,x2,y2,score,cls] 或 None。与 rtmlib multiclass_nms 等价。"""
+    final = []
+    n = boxes.shape[0]
+    all_idx = np.arange(n)
+    for c in range(scores.shape[1]):
+        cs = scores[:, c]
+        m = cs > score_thr
+        if not m.any():
+            continue
+        keep = _nms(boxes[m], cs[m], nms_thr)
+        if keep:
+            final.append(np.concatenate([
+                boxes[m][keep], cs[m][keep, None],
+                np.full((len(keep), 1), c, np.float32)], 1))
+    return None if not final else np.concatenate(final, 0).astype(np.float32)
+
+
+def _yolox_decode_batch(preds: np.ndarray, ratios: List[float],
+                        score_thr: float = 0.3, nms_thr: float = 0.45) -> List[np.ndarray]:
+    """动态 batch YOLOX 输出 (B, 3549, 85) → 每帧 xyxy 框列表（原图坐标）。
+
+    decode 用 rtmlib 约定 **center=(delta + grid)×stride**（不加 0.5）——实测该 humanart
+    ONNX 的 decode 就是 cell 左上角约定，与 rtmlib ``YOLOX.postprocess`` 的 no-NMS 分支
+    完全一致（mmdet ``predict_by_feat`` 的 grid+0.5 会差约半格，框系统性偏大 ~24px）。
+    wh=exp(delta)×stride，obj×cls 逐类 NMS。3549 = 52²+26²+13²（stride 8/16/32 依序
+    y-major 展平）。score_thr=0.3 对齐原 ONNX（内置 EfficientNMS）＋ rtmlib 的过滤阈值。
+    """
+    centers, strides = [], []
+    for s in (8, 16, 32):
+        hs = ws = 416 // s
+        gy, gx = np.meshgrid(np.arange(hs), np.arange(ws), indexing="ij")
+        centers.append(np.stack([gx * s, gy * s], -1).reshape(-1, 2))
+        strides.append(np.full((hs * ws, 1), s, np.float32))
+    pc = np.concatenate(centers).astype(np.float32)
+    ps = np.concatenate(strides)
+    results = []
+    for b in range(len(preds)):
+        p = preds[b]
+        xy = p[:, :2] * ps + pc
+        wh = np.exp(p[:, 2:4]) * ps
+        boxes = np.concatenate([xy - wh / 2, xy + wh / 2], 1) / ratios[b]
+        scores = p[:, 4:5] * p[:, 5:]  # (N, 80) = obj × cls
+        dets = _multiclass_nms(boxes, scores, nms_thr, score_thr)
+        results.append([] if dets is None else dets[:, :4])
+    return results
+
+
+def _build_det_batch_session(onnx_path: str, backend: str,
+                             cache_dir: str) -> Optional[object]:
+    """为动态 batch YOLOX ONNX 建 onnxruntime 会话（CUDA EP；tensorrt 加 TRT EP+profile）。
+
+    找不到 ONNX 文件返回 None（调用方回退逐帧检测）。TRT 会话用动态 batch profile
+    （min=1 / opt=4 / max=8，匹配 4 相机实时场景），输入名固定 "input"（导出脚本指定）。
+    """
+    if not os.path.exists(onnx_path):
+        return None
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if backend == "tensorrt":
+        providers = [
+            ("TensorrtExecutionProvider", {
+                "device_id": 0,
+                "trt_fp16_enable": True,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": cache_dir,
+                "trt_profile_min_shapes": "input:1x3x416x416",
+                "trt_profile_opt_shapes": "input:4x3x416x416",
+                "trt_profile_max_shapes": "input:8x3x416x416",
+            }),
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+    else:
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
+
+
 class RTMPoseDetector(PoseDetector):
     """RTMPose top-down 2D 姿态检测器（YOLOX 检测 + RTMPose 关键点）。
 
@@ -238,6 +347,37 @@ class RTMPoseDetector(PoseDetector):
                     "请确认已装 onnxruntime-gpu 及匹配的 CUDA 运行库", actual
                 )
 
+        # 动态 batch YOLOX 会话：4 相机一次 forward（省掉 3 次 session.run 固定开销）。
+        # 仅当检测输入恰为 416×416（与导出的 ONNX 一致）且用 GPU 时启用；导出文件缺失
+        # 则回退逐帧检测（detect_batch 走原路径）。
+        self._det_batch_session = None
+        if device != "cpu" and tuple(det_input_size) == (416, 416):
+            batch_onnx = _default_det_batch_onnx()
+            if not os.path.exists(batch_onnx):
+                logger.warning(
+                    "未找到动态 batch YOLOX ONNX（%s），4 相机将逐帧检测；"
+                    "可运行 scripts/export_yolox_dynamic_batch.py 导出后提速",
+                    batch_onnx)
+            elif use_trt:
+                print("[TensorRT] 构建动态 batch YOLOX 引擎（约 30 秒）...", flush=True)
+                try:
+                    self._det_batch_session = _build_det_batch_session(
+                        batch_onnx, "tensorrt", _default_trt_cache_dir())
+                    # 预热触发引擎构建（batch=4 形状）
+                    self._det_batch_session.run(
+                        [self._det_batch_session.get_outputs()[0].name],
+                        {self._det_batch_session.get_inputs()[0].name:
+                         np.zeros((4, 3, 416, 416), np.float32)})
+                    print("[TensorRT] 动态 batch YOLOX 引擎完成 ✓", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "动态 batch YOLOX 走 TensorRT 失败（%s），回退 CUDA EP", exc)
+                    self._det_batch_session = _build_det_batch_session(
+                        batch_onnx, "onnxruntime", _default_trt_cache_dir())
+            else:
+                self._det_batch_session = _build_det_batch_session(
+                    batch_onnx, "onnxruntime", _default_trt_cache_dir())
+
     def detect(self, frame: Frame) -> List[Pose2D]:
         """对一帧做 top-down 2D 姿态检测。
 
@@ -289,23 +429,54 @@ class RTMPoseDetector(PoseDetector):
 
         多相机实时用：把 4 台相机的人框收集起来，RTMPose 一次 forward 处理所有
         裁剪（RTMPose ONNX 的 batch 维是动态的），相比逐人逐帧调用少掉大量
-        kernel 启动与传输开销。YOLOX 的 ONNX 是固定 batch=1（且已内置 NMS），
-        无法批，仍逐帧跑（多线程并行因 GIL 不生效，实测无收益）。
+        kernel 启动与传输开销。YOLOX 走 ``scripts/export_yolox_dynamic_batch.py``
+        重导出的动态 batch ONNX，4 帧一次 forward（省 session.run 固定开销，这是
+        多相机的主要耗时），numpy 解码 + 逐类 NMS；导出缺失或非 416 输入时回退
+        逐帧 rtmlib。
         """
         n = len(frames)
         results: List[List[Pose2D]] = [[] for _ in range(n)]
         if n == 0:
             return results
 
-        # 1) 逐帧 YOLOX 检测（模型固定 batch=1）
+        # 1) YOLOX 检测。有动态 batch 会话时把全部有效帧堆成 (B,3,416,416) 一次 forward
+        #    （省掉 N-1 次 session.run 固定开销，这是多相机的最大头），再 numpy 解码+NMS；
+        #    否则回退逐帧调用 rtmlib（模型固定 batch=1）。
         dets: List = []  # 每帧: (bgr 或 None, bboxes)
-        for frame in frames:
-            if frame.image is None or frame.image.size == 0:
-                dets.append((None, []))
-                continue
-            bgr = cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR) if frame.image.ndim == 2 else frame.image
-            bboxes = self._det_model(bgr)
-            dets.append((bgr, [] if bboxes is None or len(bboxes) == 0 else bboxes))
+        if self._det_batch_session is not None:
+            bgr_list, padded, ratios, valid = [], [], [], []
+            for frame in frames:
+                if frame.image is None or frame.image.size == 0:
+                    valid.append(False)
+                    continue
+                bgr = cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR) if frame.image.ndim == 2 else frame.image
+                bgr_list.append(bgr)
+                p, ratio = self._det_model.preprocess(bgr)  # letterbox 到 416，与原路径一致
+                padded.append(p)
+                ratios.append(ratio)
+                valid.append(True)
+            boxes_list: List = []
+            if padded:
+                batch = np.stack(padded).transpose(0, 3, 1, 2).astype(np.float32)  # (B,3,416,416)
+                sess = self._det_batch_session
+                out = sess.run([sess.get_outputs()[0].name],
+                               {sess.get_inputs()[0].name: batch})[0]  # (B,3549,85)
+                boxes_list = _yolox_decode_batch(out, ratios)
+            vi = 0
+            for fi in range(len(frames)):
+                if valid[fi]:
+                    dets.append((bgr_list[vi], boxes_list[vi]))
+                    vi += 1
+                else:
+                    dets.append((None, []))
+        else:
+            for frame in frames:
+                if frame.image is None or frame.image.size == 0:
+                    dets.append((None, []))
+                    continue
+                bgr = cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR) if frame.image.ndim == 2 else frame.image
+                bboxes = self._det_model(bgr)
+                dets.append((bgr, [] if bboxes is None or len(bboxes) == 0 else bboxes))
 
         # 2) 收集所有 (帧, 人) 的裁剪与 center/scale
         crops: List[np.ndarray] = []
@@ -352,3 +523,4 @@ class RTMPoseDetector(PoseDetector):
     def close(self) -> None:
         self._det_model = None
         self._pose_model = None
+        self._det_batch_session = None
