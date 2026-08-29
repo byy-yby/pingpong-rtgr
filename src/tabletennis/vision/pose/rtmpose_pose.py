@@ -89,6 +89,51 @@ def _trt_session(onnx_path: str, cache_dir: str, fp16: bool = True):
     return ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
 
 
+def _patch_yolox_for_trt(onnx_path: str) -> str:
+    """把 YOLOX ONNX 里预 NMS 的 TopK 的 K 降到 ≤3840（TensorRT 上限），返回可用模型路径。
+
+    mmpose SDK 导出的 YOLOX 烤入了 EfficientNMS，其预 NMS 的 ``TopK`` 用 K=5000，
+    超过 TensorRT ``ITopKLayer`` 的 3840 上限，导致 TRT 转换报
+    ``K exceeds the maximum value allowed (3840)``。这里把 K 改成 3000——对 1~4 人的
+    场景完全无损（真实目标都在 top 几百内），结果缓存到本地只 patch 一次。
+    模型若没有超限 TopK 则原样返回原路径。
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    out_path = os.path.join(
+        _default_trt_cache_dir(),
+        os.path.basename(onnx_path).replace(".onnx", "_topk3000.onnx"),
+    )
+    if os.path.exists(out_path):
+        return out_path
+
+    model = onnx.load(onnx_path)
+    inits = {i.name: i for i in model.graph.initializer}
+    changed = False
+    for node in model.graph.node:
+        if node.op_type != "TopK":
+            continue
+        for kname in node.input[1:]:  # TopK 的 K 输入（通常第二个）
+            init = inits.get(kname)
+            if init is None:
+                continue
+            arr = numpy_helper.to_array(init)
+            if arr.size == 1 and int(arr[0]) > 3840:
+                new = numpy_helper.from_array(
+                    np.array([3000], dtype=arr.dtype), name=init.name
+                )
+                model.graph.initializer.remove(init)
+                model.graph.initializer.append(new)
+                changed = True
+    if not changed:
+        return onnx_path
+    os.makedirs(_default_trt_cache_dir(), exist_ok=True)
+    onnx.save(model, out_path)
+    logger.info("YOLOX 预 NMS TopK 已 patch（K→3000）保存到 %s", out_path)
+    return out_path
+
+
 class RTMPoseDetector(PoseDetector):
     """RTMPose top-down 2D 姿态检测器（YOLOX 检测 + RTMPose 关键点）。
 
@@ -163,10 +208,14 @@ class RTMPoseDetector(PoseDetector):
         if use_trt:
             cache_dir = _default_trt_cache_dir()
             logger.info("TensorRT 引擎构建中（首次较慢，之后走缓存 %s）...", cache_dir)
-            # 逐模型尝试 TRT：某模型转换失败（如 YOLOX 烤入 NMS 的 TopK 超限）则回退 CUDA EP
+            # 逐模型尝试 TRT：YOLOX 需先 patch 掉预 NMS 的 TopK(5000→3000)，
+            # 某模型转换失败则回退 CUDA EP。
             for name, model in (("YOLOX", self._det_model), ("RTMPose", self._pose_model)):
                 try:
-                    model.session = _trt_session(model.onnx_model, cache_dir)
+                    onnx_path = model.onnx_model
+                    if name == "YOLOX":
+                        onnx_path = _patch_yolox_for_trt(onnx_path)
+                    model.session = _trt_session(onnx_path, cache_dir)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("%s 走 TensorRT 失败（%s），回退 CUDA EP", name, exc)
             # 预热触发 TRT engine 构建（含 FP16），避免首帧卡顿
