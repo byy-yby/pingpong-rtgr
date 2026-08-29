@@ -86,6 +86,25 @@ def _create_ball_detector() -> Any:
     return ClassicalBallDetector()
 
 
+def _create_ball_yolo_detector() -> Any:
+    """创建 YOLO 球检测器（onnxruntime；模型文件不存在则返回 None，调用方回退经典）。
+
+    模型路径优先取环境变量 ``BALL_ONNX``，否则用训练默认产物
+    ``runs/detect/ball/weights/best.onnx``。
+    """
+    import os
+
+    from ..core.config import project_root
+
+    path = os.environ.get("BALL_ONNX") or os.path.join(
+        project_root(), "runs", "detect", "ball", "weights", "best.onnx"
+    )
+    if not os.path.exists(path):
+        return None
+    from .ball.yolo_ball import YoloBallDetector
+    return YoloBallDetector(path)
+
+
 # 姿态检测已实现（RTMPose-l-halpe26，26 点，CPU 推理），注册到工厂，
 # live_control.py 按 'p' 即可启用。
 register_detector("pose", _create_pose_detector)
@@ -97,3 +116,7 @@ register_detector("table", _create_table_detector)
 # 球检测已实现（经典路线：背景减除 + 帧差 + 尺寸先验 + 亚像素质心），注册到工厂，
 # live_control.py / reconstruct_ball.py 按名字取。
 register_detector("ball", _create_ball_detector)
+
+# YOLO 球检测（onnxruntime，模型由 scripts/train_ball.py 训练导出），注册到工厂；
+# 模型不存在时工厂返回 None，调用方据此回退经典路线。
+register_detector("ball_yolo", _create_ball_yolo_detector)

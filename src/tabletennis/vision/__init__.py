@@ -2,7 +2,7 @@
 
 姿态检测（RTMPose-l，top-down）；球检测（``ball/``：经典无训练路线 + 亚像素精修）。
 """
-from .ball import ClassicalBallDetector, refine_ball_center
+from .ball import ClassicalBallDetector, YoloBallDetector, refine_ball_center
 from .detector import BallDetector, Detector, PoseDetector, TableDetector
 from .pose.rtmpose_pose import RTMPoseDetector
 
@@ -13,5 +13,6 @@ __all__ = [
     "TableDetector",
     "RTMPoseDetector",
     "ClassicalBallDetector",
+    "YoloBallDetector",
     "refine_ball_center",
 ]

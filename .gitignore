@@ -30,3 +30,8 @@ config/camera_settings.json
 *.bmp
 *.jpg
 *.png
+
+# 模型权重 / 训练产物
+*.pt
+*.onnx
+runs/

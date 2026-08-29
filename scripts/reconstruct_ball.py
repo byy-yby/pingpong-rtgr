@@ -51,6 +51,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-conf", type=float, default=0.3, help="球检测最低置信度")
     ap.add_argument("--radius-min", type=float, default=5.0, help="球半径像素下限")
     ap.add_argument("--radius-max", type=float, default=15.0, help="球半径像素上限")
+    ap.add_argument("--ball-model", default=None, help="YOLO ONNX 模型路径（提供则用 YOLO 代替经典检测）")
+    ap.add_argument("--imgsz", type=int, default=1280, help="YOLO 输入分辨率")
     return ap
 
 
@@ -80,13 +82,17 @@ class ReconstructBall:
         self.tracker = BallTracker()
         self.table = Table3D()
         self.viewer3d = None
-        # 每相机一个独立检测器（背景模型各不相同）
-        self.detectors: Dict[int, ClassicalBallDetector] = {
-            cid: ClassicalBallDetector(
-                radius_px=(args.radius_min, args.radius_max),
-            )
-            for cid in self.triangulator.cameras
-        }
+        # 检测器：--ball-model 给定则用 YOLO（无状态共享）；否则每相机一个经典检测器
+        self.detector = None
+        self.detectors: Dict[int, ClassicalBallDetector] = {}
+        if args.ball_model:
+            from tabletennis.vision.ball import YoloBallDetector
+            self.detector = YoloBallDetector(args.ball_model, imgsz=args.imgsz)
+        else:
+            self.detectors = {
+                cid: ClassicalBallDetector(radius_px=(args.radius_min, args.radius_max))
+                for cid in self.triangulator.cameras
+            }
 
     # ------------------------------------------------------------------
     def _project_trajectory(self, X3: np.ndarray, rng) -> Dict[int, Ball2D]:
@@ -118,6 +124,13 @@ class ReconstructBall:
     # ------------------------------------------------------------------
     def reconstruct_frame(self, balls_per_cam: Dict[int, Ball2D]):
         return triangulate_ball(balls_per_cam, self.triangulator, min_conf=self.args.min_conf)
+
+    def _detect(self, frame: Frame) -> List[Ball2D]:
+        """对单帧做球检测：YOLO（共享）或该相机的经典检测器。"""
+        if self.detector is not None:
+            return self.detector.detect(frame)
+        det = self.detectors.get(frame.camera_id)
+        return det.detect(frame) if det is not None else []
 
     def _start_viewer(self) -> None:
         """启动 Open3D 3D 场景（球桌 + 相机 + 球轨迹），--no-display 时跳过。"""
@@ -169,9 +182,7 @@ class ReconstructBall:
                     bundle = mgr.get_synchronized_bundle(block=True, timeout=1.0)
                     balls_per_cam: Dict[int, Ball2D] = {}
                     for cid, frame in bundle.frames.items():
-                        if cid not in self.detectors:
-                            continue
-                        dets = self.detectors[cid].detect(frame)
+                        dets = self._detect(frame)
                         if dets:
                             balls_per_cam[cid] = dets[0]  # 单球，取最高置信者
 
