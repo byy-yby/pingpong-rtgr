@@ -163,16 +163,17 @@ class RTMPoseDetector(PoseDetector):
         if use_trt:
             cache_dir = _default_trt_cache_dir()
             logger.info("TensorRT 引擎构建中（首次较慢，之后走缓存 %s）...", cache_dir)
-            self._det_model.session = _trt_session(self._det_model.onnx_model, cache_dir)
-            self._pose_model.session = _trt_session(self._pose_model.onnx_model, cache_dir)
+            # 逐模型尝试 TRT：某模型转换失败（如 YOLOX 烤入 NMS 的 TopK 超限）则回退 CUDA EP
+            for name, model in (("YOLOX", self._det_model), ("RTMPose", self._pose_model)):
+                try:
+                    model.session = _trt_session(model.onnx_model, cache_dir)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("%s 走 TensorRT 失败（%s），回退 CUDA EP", name, exc)
             # 预热触发 TRT engine 构建（含 FP16），避免首帧卡顿
             side = max(det_input_size)
             dummy = np.zeros((side, side, 3), dtype=np.uint8)
             self._det_model(dummy)
             self._pose_model(dummy, bboxes=[[0, 0, side, side]])
-            actual = self._det_model.session.get_providers()
-            if not actual or actual[0] != "TensorrtExecutionProvider":
-                logger.warning("TensorRT EP 未生效（实际 providers=%s），已回退 CUDA/CPU", actual)
 
         # 校验 CUDA 是否真正生效：onnxruntime 缺 CUDA 库时会静默回退 CPU
         # （get_available_providers 仍列出 CUDAExecutionProvider，但 session 实际用 CPU）。
