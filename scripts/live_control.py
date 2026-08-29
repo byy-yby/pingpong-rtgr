@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from typing import Dict, Optional
 
@@ -123,6 +124,9 @@ class LiveControl:
         self._last_balls: Dict[int, list] = {}
         self._ball3d = None            # 最近一帧 3D 球心（桌面系，米）
         self._ball_tracker = None      # 卡尔曼平滑（重建前才创建）
+        self._ball_ready = False       # 球模型+三角化器已就绪（后台线程置位）
+        self._ball_pending_viewer = False  # 模型就绪但 3D 窗口待主线程打开
+        self._ball_load_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -488,18 +492,46 @@ class LiveControl:
     # 球 2D 检测 + 3D 重建（按 B）
     # ------------------------------------------------------------------
     def _enable_ball_recon(self) -> None:
-        """按 B 开启球追踪：优先用训练导出的 YOLO 权重，回退经典；加载三角化器 + 3D 球层。"""
-        if self.detectors["ball"] is None:
+        """按 B 开启球追踪：UI 不阻塞，模型在后台线程加载。
+
+        模型创建（onnxruntime CUDA session ~1s）+ 首帧热启动（~6s）都较重，
+        若在主线程同步做会卡死窗口；改由 ``_ball_load_worker`` 后台加载，
+        就绪后置 ``_ball_ready`` / ``_ball_pending_viewer``，主循环再开 3D 窗口并开始重建。
+        """
+        if self.detectors["ball"] is not None:
+            self._ball_ready = True
+            print(f"[检测] 球: ON（{type(self.detectors['ball']).__name__} + DLT + Open3D）")
+            return
+        if self._ball_load_thread is not None and self._ball_load_thread.is_alive():
+            return  # 正在后台加载中
+        self._ball_ready = False
+        self._ball_load_thread = threading.Thread(
+            target=self._ball_load_worker, name="ball-loader", daemon=True)
+        self._ball_load_thread.start()
+        print("[检测] 球: 模型后台加载中（首次约几秒，窗口不卡）…")
+
+    def _ball_load_worker(self) -> None:
+        """后台线程：创建球检测器 + 热启动首帧 + 加载三角化器；就绪后置标志。"""
+        try:
             # YOLO（onnxruntime，无状态可跨相机共享）优先；ONNX 缺失回退经典
             self.detectors["ball"] = create_detector("ball_yolo") or create_detector("ball")
             if self.detectors["ball"] is None:
                 print("[检测] 球: ON（接口已定义，算法待实现）")
                 return
-        det_name = type(self.detectors["ball"]).__name__
+            det = self.detectors["ball"]
 
-        # 三角化器：与姿态共用一套标定，只加载一次
-        if self._triangulator is None:
-            try:
+            # 热启动：喂一帧真实帧，把 CUDA EP 首次推理的惰性初始化（实测 ~6s）
+            # 从主循环挪到后台；_latest 有帧就用，没有就合成一帧同尺寸占位。
+            probe = next((f for f in self._latest.values() if f is not None), None)
+            if probe is None:
+                probe = Frame(camera_id=0, serial="probe", frame_num=0,
+                              device_timestamp=0, host_timestamp=0,
+                              image=np.zeros((1080, 1440), np.uint8),
+                              pixel_format=0, width=1440, height=1080)
+            det.detect(probe)
+
+            # 三角化器：与姿态共用一套标定，只加载一次
+            if self._triangulator is None:
                 from tabletennis.reconstruction import (
                     MultiViewTriangulator,
                     load_camera_rig,
@@ -513,21 +545,20 @@ class LiveControl:
                     if self._table_detector is None:
                         self._table_detector = create_detector("table")
                     print(f"[检测] 球: 三角化器已加载 {len(self._triangulator.cameras)} 台相机")
-            except Exception as exc:  # noqa: BLE001
-                print(f"[检测] 球: 标定加载失败（{exc}），仅 2D 显示")
 
-        # 若 3D 场景已在跑但没球层（先按 T/P 开的窗口），重建窗口以带上球层
-        if (self._triangulator is not None
-                and self.viewer3d is not None and self.viewer3d.is_running()
-                and not self.viewer3d.has_ball_layer()):
-            self._close_viewer()
-        self._start_viewer()
-        print(f"[检测] 球: ON（{det_name} + DLT + Open3D）")
+            self._ball_ready = True
+            self._ball_pending_viewer = True  # 主循环检测到后从主线程开 3D 窗口
+            print(f"[检测] 球: ON（{type(det).__name__} + DLT + Open3D）")
+        except Exception as exc:  # noqa: BLE001
+            self._ball_ready = False
+            print(f"[检测] 球: 加载失败（{exc}）——按 B 关闭后再按 B 重试")
 
     def _disable_ball_recon(self) -> None:
         self._last_balls = {}
         self._ball3d = None
         self._ball_tracker = None
+        self._ball_ready = False
+        self._ball_pending_viewer = False
         if self.viewer3d is not None:
             self.viewer3d.set_ball(None)
         print("[检测] 球: OFF")
@@ -765,8 +796,16 @@ class LiveControl:
                 if self.enable["pose"] and self.detectors["pose"] is not None:
                     self._reconstruct_frame()
 
+                # 球模型后台加载完成：主线程开 3D 窗口（Open3D 需保持主线程创建/轮询）
+                if self._ball_pending_viewer:
+                    if (self.viewer3d is not None and self.viewer3d.is_running()
+                            and not self.viewer3d.has_ball_layer()):
+                        self._close_viewer()   # 先按 T/P 开的窗口没球层，重建带上
+                    self._start_viewer()
+                    self._ball_pending_viewer = False
+
                 # 3D 球重建（按 B 开启后每帧检测 + 三角化 + Open3D 球层）
-                if self.enable["ball"] and self.detectors["ball"] is not None:
+                if self.enable["ball"] and self._ball_ready:
                     self._reconstruct_ball_frame()
 
                 canvas = self._compose_canvas()
