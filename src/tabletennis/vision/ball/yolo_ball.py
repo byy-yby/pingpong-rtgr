@@ -74,6 +74,12 @@ class YoloBallDetector(BallDetector):
     ) -> None:
         import onnxruntime as ort
 
+        # GPU：先预加载 pip 装的 CUDA 运行库（onnxruntime 靠 dlopen 按 soname 找库；
+        # 不预加载会报 libcublasLt.so.12 not found 并静默回退 CPU）。与 rtmpose 一致。
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            from ..gpu_env import preload_nvidia_libs
+            preload_nvidia_libs()
+
         self.imgsz = int(imgsz)
         self.conf_thresh = float(conf_thresh)
         self.iou_thresh = float(iou_thresh)
