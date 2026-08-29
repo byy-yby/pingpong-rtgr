@@ -347,6 +347,10 @@ class SceneViewer3D:
     # ------------------------------------------------------------------
     # 实时球层
     # ------------------------------------------------------------------
+    def has_ball_layer(self) -> bool:
+        """球层是否已加入场景（上层据此判断已运行的 3D 窗口是否缺球层、需重建）。"""
+        return self._ball_sphere is not None
+
     def add_ball_layer(self, trail_len: int = 200) -> None:
         """预分配球几何（当前位置小球 + 轨迹 LineSet），须在 ``start()`` 前调用。"""
         o3d = _o3d()

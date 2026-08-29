@@ -119,6 +119,11 @@ class LiveControl:
         self._pose_tracker = None
         self._frame_idx = 0
 
+        # 3D 球重建（按 B）：各相机最近一帧球检测 + 3D 球心 + 卡尔曼平滑
+        self._last_balls: Dict[int, list] = {}
+        self._ball3d = None            # 最近一帧 3D 球心（桌面系，米）
+        self._ball_tracker = None      # 卡尔曼平滑（重建前才创建）
+
     # ------------------------------------------------------------------
     # 参数应用
     # ------------------------------------------------------------------
@@ -274,6 +279,14 @@ class LiveControl:
                 self._disable_pose_recon()
             return
 
+        # 球：2D 检测 + 3D DLT 三角化 + Open3D 渲染（按 B）
+        if kind == "ball":
+            if self.enable[kind]:
+                self._enable_ball_recon()
+            else:
+                self._disable_ball_recon()
+            return
+
         if self.enable[kind] and self.detectors[kind] is None:
             self.detectors[kind] = create_detector(kind)   # 首次开启才加载模型
             if self.detectors[kind] is None:
@@ -386,6 +399,7 @@ class LiveControl:
         self.viewer3d = SceneViewer3D()
         self.viewer3d.build_scene(self._table_detector.table, camera_poses, intrinsics)
         self.viewer3d.add_skeleton_layer(skeleton="halpe26", max_people=8)
+        self.viewer3d.add_ball_layer(trail_len=200)
         self.viewer3d.start()
         print("✓ 已生成 3D 场景窗口（Open3D，可鼠标旋转 / 缩放）。")
 
@@ -471,6 +485,93 @@ class LiveControl:
                       f"匹配 {len(people)} 人 | 有效关节 {n_valid}")
 
     # ------------------------------------------------------------------
+    # 球 2D 检测 + 3D 重建（按 B）
+    # ------------------------------------------------------------------
+    def _enable_ball_recon(self) -> None:
+        """按 B 开启球追踪：优先用训练导出的 YOLO 权重，回退经典；加载三角化器 + 3D 球层。"""
+        if self.detectors["ball"] is None:
+            # YOLO（onnxruntime，无状态可跨相机共享）优先；ONNX 缺失回退经典
+            self.detectors["ball"] = create_detector("ball_yolo") or create_detector("ball")
+            if self.detectors["ball"] is None:
+                print("[检测] 球: ON（接口已定义，算法待实现）")
+                return
+        det_name = type(self.detectors["ball"]).__name__
+
+        # 三角化器：与姿态共用一套标定，只加载一次
+        if self._triangulator is None:
+            try:
+                from tabletennis.reconstruction import (
+                    MultiViewTriangulator,
+                    load_camera_rig,
+                )
+                intrinsics, extrinsics = load_camera_rig()
+                if not extrinsics:
+                    print("[检测] 球: 未找到标定外参（table_extrinsics.yaml），仅 2D 显示")
+                else:
+                    self._triangulator = MultiViewTriangulator(intrinsics, extrinsics)
+                    self._table_poses = {cid: (e.R, e.t) for cid, e in extrinsics.items()}
+                    if self._table_detector is None:
+                        self._table_detector = create_detector("table")
+                    print(f"[检测] 球: 三角化器已加载 {len(self._triangulator.cameras)} 台相机")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[检测] 球: 标定加载失败（{exc}），仅 2D 显示")
+
+        # 若 3D 场景已在跑但没球层（先按 T/P 开的窗口），重建窗口以带上球层
+        if (self._triangulator is not None
+                and self.viewer3d is not None and self.viewer3d.is_running()
+                and not self.viewer3d.has_ball_layer()):
+            self._close_viewer()
+        self._start_viewer()
+        print(f"[检测] 球: ON（{det_name} + DLT + Open3D）")
+
+    def _disable_ball_recon(self) -> None:
+        self._last_balls = {}
+        self._ball3d = None
+        self._ball_tracker = None
+        if self.viewer3d is not None:
+            self.viewer3d.set_ball(None)
+        print("[检测] 球: OFF")
+
+    def _reconstruct_ball_frame(self) -> None:
+        """各相机球检测（每帧一次）→ 置信度加权 DLT 三角化 → 卡尔曼平滑 → Open3D 球层。"""
+        detector = self.detectors["ball"]
+        frames_items = [
+            (cid, f) for cid, f in sorted(self._latest.items()) if f is not None
+        ]
+        if not frames_items:
+            return
+
+        balls_per_cam: Dict[int, list] = {}
+        for cid, f in frames_items:
+            try:
+                balls_per_cam[cid] = detector.detect(f)
+            except Exception as exc:  # noqa: BLE001 —— 单路检测失败不影响其余相机
+                balls_per_cam[cid] = []
+        self._last_balls = balls_per_cam
+
+        if self._triangulator is None:
+            return
+        from tabletennis.reconstruction import triangulate_ball
+
+        single = {cid: balls[0] for cid, balls in balls_per_cam.items() if balls}
+        res = triangulate_ball(single, self._triangulator) if len(single) >= 2 else None
+        if res is not None:
+            X, conf, err, n_views, ang = res
+            if self._ball_tracker is None:
+                from tabletennis.reconstruction import BallTracker
+                self._ball_tracker = BallTracker()
+            X = self._ball_tracker.update(X, float(conf))
+            self._ball3d = X
+            if self.viewer3d is not None:
+                self.viewer3d.set_ball(X)
+        else:
+            if self._ball_tracker is not None:
+                self._ball_tracker.update(None, 0.0)   # 本帧无观测，内部 coast
+            self._ball3d = None
+            if self.viewer3d is not None:
+                self.viewer3d.set_ball(None)
+
+    # ------------------------------------------------------------------
     # 鼠标：拖拽滑块
     # ------------------------------------------------------------------
     def on_mouse(self, event, x, y, flags, param) -> None:
@@ -511,8 +612,9 @@ class LiveControl:
                 # 姿态由 _reconstruct_frame 批处理检测，这里只画缓存结果
                 for pose in self._last_poses.get(cid, []):
                     draw_pose(bgr, pose)
-            if self.enable["ball"] and self.detectors["ball"] is not None:
-                for ball in self.detectors["ball"].detect(frame):
+            if self.enable["ball"]:
+                # 球检测由 _reconstruct_ball_frame 每帧统一做，这里只画缓存结果
+                for ball in self._last_balls.get(cid, []):
                     draw_ball(bgr, ball)
             if self.enable["table"]:
                 self._annotate_table(bgr, cid)
@@ -662,6 +764,10 @@ class LiveControl:
                 # 3D 姿态重建（按 P 开启后每帧批处理检测 + 三角化 + Open3D 骨架）
                 if self.enable["pose"] and self.detectors["pose"] is not None:
                     self._reconstruct_frame()
+
+                # 3D 球重建（按 B 开启后每帧检测 + 三角化 + Open3D 球层）
+                if self.enable["ball"] and self.detectors["ball"] is not None:
+                    self._reconstruct_ball_frame()
 
                 canvas = self._compose_canvas()
                 cv2.imshow(MAIN_WIN, canvas)
