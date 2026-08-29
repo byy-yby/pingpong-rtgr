@@ -80,11 +80,20 @@ def _create_table_detector() -> Any:
     return TableDetector.load_default()
 
 
+def _create_ball_detector() -> Any:
+    """创建乒乓球检测器（经典路线：背景减除 + 帧差 + 尺寸先验 + 亚像素质心）。"""
+    from .ball.classical_ball import ClassicalBallDetector
+    return ClassicalBallDetector()
+
+
 # 姿态检测已实现（RTMPose-l-halpe26，26 点，CPU 推理），注册到工厂，
 # live_control.py 按 'p' 即可启用。
 register_detector("pose", _create_pose_detector)
 
 # 球桌检测已实现（四个大 ArUco 标记，跨相机三角化定桌面世界系 + 标准尺寸投影），
 # 注册到工厂，live_control.py 按 't' 识别球桌：四机视角画桌面边框 + 生成 Open3D 3D 场景。
-# 球检测（'ball'）算法待实现。
 register_detector("table", _create_table_detector)
+
+# 球检测已实现（经典路线：背景减除 + 帧差 + 尺寸先验 + 亚像素质心），注册到工厂，
+# live_control.py / reconstruct_ball.py 按名字取。
+register_detector("ball", _create_ball_detector)

@@ -4,6 +4,8 @@
 - :mod:`associate`：跨视角实例级球员匹配（几何锚点 + 并查集 + 一致性精化）。
 """
 from .associate import AssociationConfig, anchor_2d, match_people
+from .ball import triangulate_ball, undistort_ball_center
+from .track import BallTracker
 from .triangulate import (
     MultiViewTriangulator,
     load_camera_rig,
@@ -17,4 +19,7 @@ __all__ = [
     "AssociationConfig",
     "anchor_2d",
     "match_people",
+    "triangulate_ball",
+    "undistort_ball_center",
+    "BallTracker",
 ]
