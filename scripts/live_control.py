@@ -320,6 +320,7 @@ class LiveControl:
                     return
                 self._recon_extrinsics = extrinsics
                 self._triangulator = MultiViewTriangulator(intrinsics, extrinsics)
+                print(f"[检测] 姿态: 三角化器已加载 {len(self._triangulator.cameras)} 台相机")
                 # 用标定外参当桌面系相机位姿（与 table 检测 fallback 一致）
                 self._table_poses = {cid: (e.R, e.t) for cid, e in extrinsics.items()}
                 if self._table_detector is None:
@@ -358,6 +359,15 @@ class LiveControl:
             skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)
+            # 诊断日志：前 5 帧 + 每 60 帧打印一次，定位骨架不出现的环节
+            self._frame_idx += 1
+            if self._frame_idx <= 5 or self._frame_idx % 60 == 0:
+                n_det = {c: len(poses_per_cam.get(c, [])) for c in cids}
+                n_valid = sum(
+                    int(np.isfinite(s.keypoints).all(axis=1).sum()) for s in skeletons
+                )
+                print(f"[3D重建] 帧{self._frame_idx}: 各相机检测 {n_det} | "
+                      f"匹配 {len(people)} 人 | 有效关节 {n_valid}")
 
     # ------------------------------------------------------------------
     # 鼠标：拖拽滑块
