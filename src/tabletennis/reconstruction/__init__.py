@@ -5,6 +5,7 @@
 """
 from .associate import AssociationConfig, anchor_2d, match_people
 from .ball import triangulate_ball, undistort_ball_center
+from .pose_track import PoseTracker
 from .track import BallTracker
 from .triangulate import (
     MultiViewTriangulator,
@@ -22,4 +23,5 @@ __all__ = [
     "triangulate_ball",
     "undistort_ball_center",
     "BallTracker",
+    "PoseTracker",
 ]
