@@ -405,11 +405,13 @@ class SceneViewer3D:
         """把视角设成「建模软件风格」的默认 3/4 俯瞰：Z 轴竖直、从斜上方看球桌。
 
         世界系 = 桌面系（X 短边 / Y 长边 / Z 向上），所以 ``up=(0,0,1)`` 保证画面
-        竖直方向就是世界 Z（球桌腿垂直、桌面不歪）；``front`` 取 -X/-Y/-Z 对角线
-        （相机在 +X+Y+Z 角落）得到能同时看到桌面和两条边的舒服视角。R 键复位即回到此视角。
+        竖直方向就是世界 Z（球桌腿垂直、桌面不歪）。Open3D 的 ``set_front`` 传入的
+        是「从 lookat 指向相机」的方向，所以 ``front=[1,1,0.9]``（+Z 朝上）表示相机
+        位于 +X+Y+Z 斜上方、向下俯瞰球桌，得到能同时看到桌面和两条边的舒服视角。
+        R 键复位即回到此视角。
         """
         vc.set_lookat(self._lookat)
-        d = np.array([-1.0, -1.0, -0.9], dtype=np.float64)
+        d = np.array([1.0, 1.0, 0.9], dtype=np.float64)
         d = d / np.linalg.norm(d)
         vc.set_front(d)
         vc.set_up([0.0, 0.0, 1.0])
@@ -435,8 +437,8 @@ class SceneViewer3D:
         # 方向键用 GLFW 键码：上 265 / 下 264 / 左 263 / 右 262。
         bindings = {
             ord("R"): ("reset", 0.0, 0.0, 1.0),
-            ord("W"): ("pan", 0.0, -_PAN_STEP, 1.0),
-            ord("S"): ("pan", 0.0, _PAN_STEP, 1.0),
+            ord("W"): ("pan", 0.0, _PAN_STEP, 1.0),    # 上（translate +y = 向上）
+            ord("S"): ("pan", 0.0, -_PAN_STEP, 1.0),   # 下
             ord("A"): ("pan", _PAN_STEP, 0.0, 1.0),
             ord("D"): ("pan", -_PAN_STEP, 0.0, 1.0),
             265: ("rotate", 0.0, -_ROT_STEP, 1.0),   # 上
