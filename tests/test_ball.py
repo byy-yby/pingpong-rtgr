@@ -147,9 +147,9 @@ def test_tracker_uninitialized_returns_none():
 # ----------------------------------------------------------------------
 # classical detector
 # ----------------------------------------------------------------------
-def _frame(img, i):
+def _frame(img, i, cid=0):
     return Frame(
-        camera_id=0, serial="s", frame_num=i, device_timestamp=0,
+        camera_id=cid, serial="s", frame_num=i, device_timestamp=0,
         host_timestamp=0, image=img, pixel_format=17301505, width=img.shape[1], height=img.shape[0],
     )
 
@@ -170,3 +170,22 @@ def test_classical_detector_finds_moving_ball():
     assert abs(found.center[0] - 100.0) < 4.0
     assert abs(found.center[1] - 100.0) < 4.0
     assert found.confidence > 0.5
+
+
+def test_classical_detector_multicamera_isolated():
+    """单实例跨两相机复用：静止相机不应「看到」另一相机移动球的残影。"""
+    det = ClassicalBallDetector(radius_px=(5.0, 15.0))
+    bg = np.full((200, 200), 40, dtype=np.uint8)
+    found_cam0 = None
+    for i in range(6):
+        # 相机 0：有移动的亮球
+        img0 = bg.copy()
+        cv2.circle(img0, (100, 60 + i * 10), 6, 200, -1)
+        out0 = det.detect(_frame(img0, i, cid=0))
+        # 相机 1：完全静止、无球（背景与相机 0 相同，但须按相机隔离背景）
+        img1 = bg.copy()
+        out1 = det.detect(_frame(img1, i, cid=1))
+        assert out1 == [], "静止相机不应检出球（背景必须按 camera_id 隔离）"
+        if out0:
+            found_cam0 = out0[0]
+    assert found_cam0 is not None

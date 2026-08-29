@@ -16,7 +16,7 @@
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -29,7 +29,7 @@ __all__ = ["ClassicalBallDetector"]
 
 
 class ClassicalBallDetector(BallDetector):
-    """经典乒乓球检测器（有状态：跨帧维护背景与上一帧）。"""
+    """经典乒乓球检测器（有状态：按 camera_id 跨帧维护背景与上一帧，可跨相机复用）。"""
 
     def __init__(
         self,
@@ -55,8 +55,8 @@ class ClassicalBallDetector(BallDetector):
         self.min_area = min_area if min_area is not None else np.pi * self.radius_min ** 2
         self.max_area = max_area if max_area is not None else np.pi * self.radius_max ** 2
 
-        self._bg: Optional[np.ndarray] = None       # float32 运行均值背景
-        self._prev: Optional[np.ndarray] = None     # uint8 上一帧
+        self._bg: Dict[int, np.ndarray] = {}        # cam_id -> float32 运行均值背景
+        self._prev: Dict[int, np.ndarray] = {}      # cam_id -> uint8 上一帧
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     def detect(self, frame: Frame) -> List[Ball2D]:
@@ -66,20 +66,22 @@ class ClassicalBallDetector(BallDetector):
         if gray.dtype != np.uint8:
             gray = gray.astype(np.uint8)
 
-        # 首帧只做初始化，等待背景建立
-        if self._bg is None or self._bg.shape != gray.shape:
-            self._bg = gray.astype(np.float32)
-            self._prev = gray.copy()
+        cid = frame.camera_id
+        # 该相机首帧只做初始化，等待背景建立
+        bg = self._bg.get(cid)
+        if bg is None or bg.shape != gray.shape:
+            self._bg[cid] = gray.astype(np.float32)
+            self._prev[cid] = gray.copy()
             return []
 
-        cv2.accumulateWeighted(gray, self._bg, self.bg_alpha)
-        bg_img = self._bg.astype(np.uint8)
+        cv2.accumulateWeighted(gray, self._bg[cid], self.bg_alpha)
+        bg_img = self._bg[cid].astype(np.uint8)
 
         # 两路运动信号取并集：背景减除（静态背景下的新物体）+ 帧差（快球）
         fg = cv2.absdiff(gray, bg_img)
-        fd = cv2.absdiff(gray, self._prev)
+        fd = cv2.absdiff(gray, self._prev[cid])
         motion = ((fg > self.diff_thresh) | (fd > self.diff_thresh)).astype(np.uint8) * 255
-        self._prev = gray.copy()
+        self._prev[cid] = gray.copy()
 
         motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN, self._kernel)
 
@@ -111,6 +113,6 @@ class ClassicalBallDetector(BallDetector):
         return balls
 
     def reset(self) -> None:
-        """清空背景与上一帧，重新预热（换场景 / 相机挪动后调用）。"""
-        self._bg = None
-        self._prev = None
+        """清空各相机背景与上一帧，重新预热（换场景 / 相机挪动后调用）。"""
+        self._bg.clear()
+        self._prev.clear()
