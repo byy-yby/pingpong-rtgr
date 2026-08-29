@@ -84,6 +84,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--imgsz", type=int, default=1280, help="输入分辨率（小球需 ≥1280）")
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--patience", type=int, default=None,
+                    help="val mAP 早停耐心（None=ultralytics 默认不早停）")
     ap.add_argument("--device", default="0", help="0/1/2...=GPU，cpu=CPU")
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--no-export", action="store_true", help="只训练不导出 ONNX")
@@ -110,6 +112,7 @@ def main() -> None:
         batch=args.batch,
         device=args.device,
         single_cls=True,
+        patience=args.patience,
         project=os.path.join(project_root(), "runs", "detect"),
         name="ball",
     )
