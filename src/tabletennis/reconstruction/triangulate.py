@@ -212,6 +212,137 @@ class MultiViewTriangulator:
         conf = float(np.clip(mean_conf * geo / (1.0 + err / 8.0), 0.0, 1.0))
         return X, conf, err, len(active), angle
 
+    def triangulate_batch(
+        self,
+        uv: np.ndarray,
+        conf: np.ndarray,
+        min_conf: float = DEFAULT_MIN_CONF,
+        max_reproj_px: float = DEFAULT_MAX_REPROJ_PX,
+        min_angle_deg: float = DEFAULT_MIN_ANGLE_DEG,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """批量三角化多个点（向量化 DLT，姿态 / 球统一走这里）。
+
+        把 ``n_pts`` 个彼此独立的三角化问题打包成**一次**批量本征分解，替代逐点循环
+        里的 ``np.linalg.svd``，消除 Python / LAPACK 派发固定开销。数学上与
+        :meth:`triangulate_point` 完全等价（同一置信度加权 DLT + 外点剔除 + 交会角），
+        输出一致。
+
+        Args:
+            uv: 形状 ``(n_pts, n_cams, 2)`` 的无畸变像素坐标，第二维与
+                :attr:`cameras`（升序）对齐；缺失观测置 NaN。
+            conf: 形状 ``(n_pts, n_cams)`` 的置信度（缺失为 0）。
+            min_conf / max_reproj_px / min_angle_deg: 同 :meth:`triangulate_point`。
+
+        Returns:
+            ``(X, conf, err, n_views, angle)``，各形状 ``(n_pts, ...)``。失败点
+            （视角 < 2 / 数值退化 / 交会角过小）为 X=NaN、conf=0、err=NaN、
+            n_views=0、angle=0。
+        """
+        cam_ids = self.cameras
+        n_cams = len(cam_ids)
+        n_pts = uv.shape[0]
+        if uv.shape[1] != n_cams:
+            raise ValueError(
+                f"uv 第二维须等于相机数 {n_cams}（与 self.cameras 对齐），实际 {uv.shape[1]}"
+            )
+
+        valid = np.isfinite(uv).all(axis=2) & (conf >= min_conf)  # (n_pts, n_cams)
+        n_views = valid.sum(axis=1)
+        ok = n_views >= 2
+
+        X = np.full((n_pts, 3), np.nan, dtype=np.float64)
+        err = np.full(n_pts, np.nan, dtype=np.float64)
+        angle = np.zeros(n_pts, dtype=np.float64)
+        conf_out = np.zeros(n_pts, dtype=np.float64)
+
+        if not ok.any():
+            # 全部失败：n_views 置 0（与 triangulate_point 返回 None 时一致）
+            return X, conf_out, err, np.zeros(n_pts, dtype=np.int32), angle
+
+        # 预计算投影矩阵与光心堆叠（(n_cams, 3, 4) / (n_cams, 3)）
+        P_all = np.stack([self.P[cid] for cid in cam_ids])            # (n_cams, 3, 4)
+        centers_all = np.stack([self.centers[cid] for cid in cam_ids])  # (n_cams, 3)
+
+        # 1) 批量 DLT：A (n_pts, 2*n_cams, 4) → gram 4×4 最小特征向量（全向量化）
+        x = np.where(valid, uv[:, :, 0], 0.0)           # (n_pts, n_cams)
+        y = np.where(valid, uv[:, :, 1], 0.0)
+        w = np.where(valid, conf, 0.0)
+        # 每条 DLT 行：w*(x*P2 - P0) 与 w*(y*P2 - P1)，Pk 为投影矩阵第 k 行
+        row_x = w[:, :, None] * (x[:, :, None] * P_all[None, :, 2, :] - P_all[None, :, 0, :])
+        row_y = w[:, :, None] * (y[:, :, None] * P_all[None, :, 2, :] - P_all[None, :, 1, :])
+        A = np.stack([row_x, row_y], axis=2).reshape(n_pts, 2 * n_cams, 4)
+        G = A.transpose(0, 2, 1) @ A                      # (n_pts, 4, 4)
+        _, V = np.linalg.eigh(G)                          # 升序，最小特征值对应解
+        Xh = V[:, :, 0]
+        denom = Xh[:, 3]
+        good = np.abs(denom) > 1e-12
+        X[good] = Xh[good, :3] / denom[good, None]
+        X[~ok] = np.nan
+
+        # 2) 重投影误差（全向量化）
+        Xh_all = np.concatenate([X, np.ones((n_pts, 1))], axis=1)   # (n_pts, 4)
+        px = np.einsum("pd,ckd->pck", Xh_all, P_all)                 # (n_pts, n_cams, 3)
+        errs = np.hypot(px[:, :, 0] / px[:, :, 2] - uv[:, :, 0],
+                        px[:, :, 1] / px[:, :, 2] - uv[:, :, 1])
+        errs[~valid] = np.nan
+        # 只对 ok 点求均值/最差（ok 点至少 2 个有效视角，不会触发 all-NaN 告警）
+        err = np.full(n_pts, np.nan, dtype=np.float64)
+        worst = np.zeros(n_pts, dtype=np.float64)
+        err[ok] = np.nanmean(errs[ok], axis=1)
+        worst[ok] = np.nanmax(errs[ok], axis=1)
+
+        # 3) 外点剔除：极少数「视角 > 2 且最差视角误差超阈值」的点回退逐点路径，保证一致
+        redo = ok & (n_views > 2) & (worst > max_reproj_px)
+        redo_conf = np.zeros(n_pts, dtype=np.float64)
+        for i in np.where(redo)[0]:
+            pts = {cam_ids[c]: (float(uv[i, c, 0]), float(uv[i, c, 1]))
+                   for c in range(n_cams) if valid[i, c]}
+            cs = {cam_ids[c]: float(conf[i, c])
+                  for c in range(n_cams) if valid[i, c]}
+            r = self.triangulate_point(
+                pts, cs, min_conf=min_conf, max_reproj_px=max_reproj_px,
+                min_angle_deg=min_angle_deg,
+            )
+            if r is None:
+                X[i] = np.nan
+                err[i] = np.nan
+                n_views[i] = 0
+                angle[i] = 0.0
+            else:
+                X[i], redo_conf[i], err[i], n_views[i], angle[i] = r
+
+        # 4) 交会角（全向量化，一次性算所有视角对；redo 点已由逐点路径给出角度）
+        D = X[:, None, :] - centers_all[None, :, :]       # (n_pts, n_cams, 3)
+        iu, ju = np.triu_indices(n_cams, k=1)              # 上三角视角对 (a < b)
+        pair_valid = valid[:, iu] & valid[:, ju]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            unit = D / np.linalg.norm(D, axis=2)[..., None]
+            cos_upper = np.clip(
+                (unit @ unit.transpose(0, 2, 1))[:, iu, ju], -1.0, 1.0
+            )
+            ang_pair = np.degrees(np.arccos(cos_upper))
+        angle_mask = ok & ~redo
+        if angle_mask.any():
+            best = np.where(pair_valid[angle_mask], ang_pair[angle_mask], -np.inf)
+            angle[angle_mask] = np.max(best, axis=1)
+
+        # 5) 置信度 + 交会角退化剔除
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # mean_conf 只对有效视角取均值（与 triangulate_point 一致）
+            mean_conf = np.where(ok, (conf * valid).sum(axis=1) / np.maximum(n_views, 1), 0.0)
+            geo = 0.5 + 0.5 * np.clip(angle / 90.0, 0.0, 1.0)
+            vec_conf = np.clip(mean_conf * geo / (1.0 + err / 8.0), 0.0, 1.0)
+        conf_out = np.where(redo, redo_conf, vec_conf)
+
+        fail = ~ok | (angle < min_angle_deg)
+        X[fail] = np.nan
+        conf_out[fail] = 0.0
+        n_views[fail] = 0
+        err[fail] = np.nan
+        angle[fail] = 0.0
+
+        return X, conf_out, err, n_views.astype(np.int32), angle
+
     def triangulate_pose(
         self,
         observations: Dict[int, Pose2D],
@@ -224,7 +355,7 @@ class MultiViewTriangulator:
             observations: ``{cam_id: Pose2D}``，同一球员在各相机的匹配观测，
                 须同属一个骨架（halpe26 / coco17）。内部先对关键点去畸变。
             min_conf: 关键点可用性阈值。
-            **kwargs: 透传给 :meth:`triangulate_point`（外点 / 交会角阈值）。
+            **kwargs: 透传给 :meth:`triangulate_batch`（外点 / 交会角阈值）。
 
         Returns:
             :class:`Skeleton3D`，未三角化的关键点为 NaN、置信度 0、n_views 0。
@@ -244,31 +375,23 @@ class MultiViewTriangulator:
                 continue
             undist[cid] = undistort_keypoints(obs.keypoints, self.K[cid], self.dist[cid])
 
-        kp3 = np.full((n_joints, 3), np.nan, dtype=np.float64)
-        conf3 = np.zeros(n_joints, dtype=np.float64)
-        nviews = np.zeros(n_joints, dtype=np.int32)
-        rerr = np.full(n_joints, np.nan, dtype=np.float64)
-
-        for j in range(n_joints):
-            pts: Dict[int, Tuple[float, float]] = {}
-            cs: Dict[int, float] = {}
-            for cid, kps in undist.items():
-                if j >= len(kps):
-                    continue
-                kp = kps[j]
-                if not np.isfinite(kp[0]) or float(kp[2]) < min_conf:
-                    continue
-                pts[cid] = (float(kp[0]), float(kp[1]))
-                cs[cid] = float(kp[2])
-            res = self.triangulate_point(pts, cs, min_conf=min_conf, **kwargs)
-            if res is None:
+        # 打包成 (n_joints, n_cams, 2) / (n_joints, n_cams)，第二维与 self.cameras 对齐
+        cam_ids = self.cameras
+        n_cams = len(cam_ids)
+        uv = np.full((n_joints, n_cams, 2), np.nan, dtype=np.float64)
+        conf = np.zeros((n_joints, n_cams), dtype=np.float64)
+        for c, cid in enumerate(cam_ids):
+            kps = undist.get(cid)
+            if kps is None:
                 continue
-            X, c, e, nv, _ang = res
-            kp3[j] = X
-            conf3[j] = c
-            nviews[j] = nv
-            rerr[j] = e
+            m = min(len(kps), n_joints)
+            uv[:m, c, 0] = kps[:m, 0]
+            uv[:m, c, 1] = kps[:m, 1]
+            conf[:m, c] = kps[:m, 2]
 
+        kp3, conf3, rerr, nviews, _ang = self.triangulate_batch(
+            uv, conf, min_conf=min_conf, **kwargs
+        )
         return Skeleton3D(
             keypoints=kp3,
             confidence=conf3,
