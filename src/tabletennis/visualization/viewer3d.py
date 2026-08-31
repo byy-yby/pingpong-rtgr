@@ -144,14 +144,11 @@ class SceneViewer3D:
         self._latest_skeletons: List = []
         self._skeletons_dirty = False
 
-        # 实时球层：当前位置小球 + 轨迹 LineSet，跨线程传递最新 3D 球心
+        # 实时球层：当前位置小球（无轨迹），跨线程传递最新 3D 球心
         self._ball_lock = threading.Lock()
         self._ball_sphere = None
-        self._ball_trail = None
         self._latest_ball = None
         self._ball_dirty = False
-        self._ball_history: List = []        # 最近 N 个 3D 球心（轨迹）
-        self._ball_trail_len = 200
 
     # ------------------------------------------------------------------
     # 场景构建（主线程，start 前调用一次）
@@ -351,56 +348,37 @@ class SceneViewer3D:
         """球层是否已加入场景（上层据此判断已运行的 3D 窗口是否缺球层、需重建）。"""
         return self._ball_sphere is not None
 
-    def add_ball_layer(self, trail_len: int = 200) -> None:
-        """预分配球几何（当前位置小球 + 轨迹 LineSet），须在 ``start()`` 前调用。"""
+    def add_ball_layer(self, trail_len: int = 0) -> None:
+        """预分配球几何（当前位置小球，无轨迹），须在 ``start()`` 前调用。
+
+        ``trail_len`` 参数保留兼容（历史轨迹已废弃，恒为 0）。
+        """
         o3d = _o3d()
-        self._ball_trail_len = trail_len
         self._ball_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
         self._ball_sphere.paint_uniform_color([1.0, 0.30, 0.20])
-        self._ball_trail = o3d.geometry.LineSet()
         self._geometries.append(self._ball_sphere)
-        self._geometries.append(self._ball_trail)
 
     def set_ball(self, X) -> None:
         """线程安全写入最新 3D 球心（世界系=桌面系，米）；None 表示本帧无球。"""
         with self._ball_lock:
-            if X is None:
-                self._latest_ball = None
-            else:
-                self._latest_ball = np.asarray(X, dtype=np.float64).reshape(3)
-                self._ball_history.append(self._latest_ball.copy())
-                if len(self._ball_history) > self._ball_trail_len:
-                    self._ball_history = self._ball_history[-self._ball_trail_len:]
+            self._latest_ball = (
+                None if X is None else np.asarray(X, dtype=np.float64).reshape(3)
+            )
             self._ball_dirty = True
 
     def _update_ball_geometry(self, vis) -> None:
-        """渲染线程内调用：更新小球位置与轨迹。"""
-        o3d = _o3d()  # 惰性 import（模块级无 open3d 硬依赖）；渲染线程每次取
+        """渲染线程内调用：更新小球位置（无轨迹）。"""
         with self._ball_lock:
             if not self._ball_dirty:
                 return
             X = None if self._latest_ball is None else self._latest_ball.copy()
-            trail = list(self._ball_history)
             self._ball_dirty = False
 
-        if self._ball_sphere is None or self._ball_trail is None:
+        if self._ball_sphere is None or X is None:
             return
-        if X is not None:
-            cur = np.asarray(self._ball_sphere.get_center(), dtype=np.float64)
-            self._ball_sphere.translate(X - cur)
-            vis.update_geometry(self._ball_sphere)
-
-        pts = np.asarray(trail, dtype=np.float64).reshape(-1, 3)
-        n = len(pts)
-        if n >= 2:
-            lines = np.array([[i, i + 1] for i in range(n - 1)], dtype=np.int32).reshape(-1, 2)
-        else:
-            lines = np.zeros((0, 2), dtype=np.int32)
-        self._ball_trail.points = o3d.utility.Vector3dVector(pts)
-        self._ball_trail.lines = o3d.utility.Vector2iVector(lines)
-        color = np.tile(np.array([1.0, 0.30, 0.20]), (len(lines), 1))
-        self._ball_trail.colors = o3d.utility.Vector3dVector(color)
-        vis.update_geometry(self._ball_trail)
+        cur = np.asarray(self._ball_sphere.get_center(), dtype=np.float64)
+        self._ball_sphere.translate(X - cur)
+        vis.update_geometry(self._ball_sphere)
 
     # ------------------------------------------------------------------
     # 渲染线程
