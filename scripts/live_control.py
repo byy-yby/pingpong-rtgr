@@ -377,7 +377,7 @@ class LiveControl:
         self._close_viewer()
         print("[检测] 球桌: OFF")
 
-    def _annotate_table(self, bgr: np.ndarray, cid: int) -> None:
+    def _annotate_table(self, bgr: np.ndarray, cid: int, scale: float = 1.0) -> None:
         """把缓存外参下的标准尺寸球桌线框画到该相机画面。"""
         if self._table_detector is None:
             return
@@ -386,7 +386,7 @@ class LiveControl:
         if pose is None or K is None:
             return
         R, t = pose
-        draw_table_model(bgr, self._table_detector.table, R, t, K.K, K.dist)
+        draw_table_model(bgr, self._table_detector.table, R, t, K.K, K.dist, scale=scale)
 
     def _start_viewer(self) -> None:
         """启动（或复用）Open3D 3D 场景窗口。"""
@@ -407,7 +407,7 @@ class LiveControl:
         self.viewer3d = SceneViewer3D()
         self.viewer3d.build_scene(self._table_detector.table, camera_poses, intrinsics)
         self.viewer3d.add_skeleton_layer(skeleton="halpe26", max_people=8)
-        self.viewer3d.add_ball_layer(trail_len=200)
+        self.viewer3d.add_ball_layer()
         self.viewer3d.start()
         print("✓ 已生成 3D 场景窗口（Open3D，可鼠标旋转 / 缩放）。")
 
@@ -657,42 +657,49 @@ class LiveControl:
     # ------------------------------------------------------------------
     # 画面合成
     # ------------------------------------------------------------------
-    def _annotate(self, cid: int, frame: Optional[Frame]) -> np.ndarray:
-        if frame is None:
-            h, w = self._ref_size
-            gray = np.zeros((h, w), np.uint8)
-        else:
-            gray = frame.image
-            self._ref_size = gray.shape[:2]
-
+    def _annotate(self, cid: int, frame: Optional[Frame], gray: np.ndarray,
+                  scale: float) -> np.ndarray:
         bgr = gray_to_bgr(gray)
 
         if frame is not None:
             if self.enable["pose"]:
                 # 姿态由 _reconstruct_frame 批处理检测，这里只画缓存结果
                 for pose in self._last_poses.get(cid, []):
-                    draw_pose(bgr, pose)
+                    draw_pose(bgr, pose, scale=scale)
             if self.enable["ball"]:
                 # 球检测由 _reconstruct_ball_frame 每帧统一做，这里只画缓存结果
                 for ball in self._last_balls.get(cid, []):
-                    draw_ball(bgr, ball)
+                    draw_ball(bgr, ball, scale=scale)
             if self.enable["table"]:
-                self._annotate_table(bgr, cid)
+                self._annotate_table(bgr, cid, scale=scale)
 
         cv2.putText(bgr, f"cam{cid}", (8, 30), cv2.FONT_HERSHEY_SIMPLEX,
                     0.9, (255, 255, 255), 2, cv2.LINE_AA)
         return bgr
 
     def _compose_grid(self) -> np.ndarray:
-        images = [
-            self._annotate(cam.logical_id, self._latest.get(cam.logical_id))
-            for cam in self.mgr.cameras
-        ]
-        grid = tile_images(images, cols=GRID_COLS)
-        h, w = grid.shape[:2]
-        if w > self.max_width:
-            s = self.max_width / w
-            grid = cv2.resize(grid, (int(w * s), int(h * s)))
+        # 先降采样灰度再转 BGR + 平铺：避免「全分辨率 4×BGR + 平铺后再缩放」的浪费
+        # （这是主循环 20FPS 的主要开销）。叠加坐标按 scale 同步缩放。
+        ref_h, ref_w = self._ref_size
+        cols = GRID_COLS
+        s = min(1.0, self.max_width / (cols * ref_w))
+        tile_w = max(2, int(ref_w * s))
+        tile_h = max(2, int(ref_h * s))
+
+        images = []
+        for cam in self.mgr.cameras:
+            cid = cam.logical_id
+            frame = self._latest.get(cid)
+            if frame is None:
+                gray = np.zeros((ref_h, ref_w), np.uint8)
+            else:
+                gray = frame.image
+                self._ref_size = gray.shape[:2]
+            if s < 1.0:
+                gray = cv2.resize(gray, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+            images.append(self._annotate(cid, frame, gray, s))
+
+        grid = tile_images(images, cols=cols)
 
         # 录制状态指示（左上角红点 + 计数 / 倒计时）
         if self._recording:

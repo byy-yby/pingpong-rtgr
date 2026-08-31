@@ -40,8 +40,10 @@ def draw_pose(
     *,
     conf_threshold: float = _CONF_THRESHOLD,
     draw_bbox: bool = False,
+    scale: float = 1.0,
 ) -> np.ndarray:
-    """把单个 :class:`Pose2D` 画到 BGR 图像上（原地返回同一张图）。"""
+    """把单个 :class:`Pose2D` 画到 BGR 图像上（原地返回同一张图）。``scale`` 用于
+    在降采样后的图上按比例缩放关键点坐标。"""
     skeleton = get_skeleton(pose.skeleton)
     names = skeleton["names"]
     edges = skeleton["edges"]
@@ -54,8 +56,8 @@ def draw_pose(
             continue
         cv2.line(
             image,
-            (int(ka[0]), int(ka[1])),
-            (int(kb[0]), int(kb[1])),
+            (int(ka[0] * scale), int(ka[1] * scale)),
+            (int(kb[0] * scale), int(kb[1] * scale)),
             _EDGE_COLOR,
             2,
             cv2.LINE_AA,
@@ -67,11 +69,11 @@ def draw_pose(
         if c < conf_threshold:
             continue
         color = _KEYPOINT_COLORS[i % len(_KEYPOINT_COLORS)]
-        cv2.circle(image, (int(x), int(y)), 4, color, -1, cv2.LINE_AA)
+        cv2.circle(image, (int(x * scale), int(y * scale)), 4, color, -1, cv2.LINE_AA)
 
     # 检测框
     if draw_bbox and pose.bbox is not None:
-        x1, y1, x2, y2 = [int(v) for v in pose.bbox]
+        x1, y1, x2, y2 = [int(v * scale) for v in pose.bbox]
         cv2.rectangle(image, (x1, y1), (x2, y2), _EDGE_COLOR, 1)
         label = f"{pose.score:.2f}"
         cv2.putText(image, label, (x1, max(0, y1 - 4)),
@@ -125,12 +127,16 @@ def draw_ball(
     *,
     color=(0, 0, 255),
     conf_threshold: float = 0.3,
+    scale: float = 1.0,
 ) -> np.ndarray:
-    """把单个球检测结果（:class:`Ball2D`）画到 BGR 图像上（原地返回）。"""
+    """把单个球检测结果（:class:`Ball2D`）画到 BGR 图像上（原地返回）。
+
+    ``scale`` 用于在降采样后的图上按比例缩放球心坐标与半径。
+    """
     if ball.confidence < conf_threshold:
         return image
-    x, y = int(ball.center[0]), int(ball.center[1])
-    r = max(int(ball.radius), 1)
+    x, y = int(ball.center[0] * scale), int(ball.center[1] * scale)
+    r = max(int(ball.radius * scale), 1)
     cv2.circle(image, (x, y), r, color, 2, cv2.LINE_AA)
     return image
 
@@ -164,6 +170,7 @@ def draw_table_model(
     t: np.ndarray,
     K: np.ndarray,
     dist: np.ndarray,
+    scale: float = 1.0,
 ) -> np.ndarray:
     """把标准尺寸球桌（:class:`~tabletennis.core.types.Table3D`）的 3D 线框画到 BGR 图上。
 
@@ -200,7 +207,7 @@ def draw_table_model(
             continue
 
         proj, _ = cv2.projectPoints(np.vstack([a, b]), rvec, t.reshape(3, 1), K, dist)
-        proj = proj.reshape(-1, 2)
+        proj = proj.reshape(-1, 2) * scale
         m = len(a)
         for i in range(m):
             cv2.line(
