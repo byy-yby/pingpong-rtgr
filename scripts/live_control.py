@@ -119,6 +119,7 @@ class LiveControl:
         self._last_poses: Dict[int, list] = {}
         self._pose_tracker = None
         self._frame_idx = 0
+        self._pose_fps = 0.0        # 3D 姿态重建实时帧率（EMA，右上角叠加显示）
 
         # 3D 球重建（按 B）：各相机最近一帧球检测 + 3D 球心 + 卡尔曼平滑
         self._last_balls: Dict[int, list] = {}
@@ -447,12 +448,14 @@ class LiveControl:
 
     def _disable_pose_recon(self) -> None:
         self._last_poses = {}
+        self._pose_fps = 0.0
         print("[检测] 姿态: OFF")
 
     def _reconstruct_frame(self) -> None:
         """批处理检测所有相机 + 跨视角匹配 + 三角化，更新 Open3D 骨架与 2D 姿态。"""
         from tabletennis.reconstruction import match_people
 
+        t0 = time.perf_counter()
         detector = self.detectors["pose"]
         frames_items = [
             (cid, f) for cid, f in sorted(self._latest.items()) if f is not None
@@ -487,6 +490,12 @@ class LiveControl:
                 )
                 print(f"[3D重建] 帧{self._frame_idx}: 各相机检测 {n_det} | "
                       f"匹配 {len(people)} 人 | 有效关节 {n_valid}")
+
+        # 实时帧率（EMA）：本轮检测+三角化耗时换算成 FPS，供右上角叠加显示
+        dt = time.perf_counter() - t0
+        if dt > 0:
+            fps = 1.0 / dt
+            self._pose_fps = fps if self._pose_fps <= 0 else 0.9 * self._pose_fps + 0.1 * fps
 
     # ------------------------------------------------------------------
     # 球 2D 检测 + 3D 重建（按 B）
@@ -690,6 +699,13 @@ class LiveControl:
                         cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3, cv2.LINE_AA)
             cv2.putText(grid, "check signal generator / Line0", (20, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
+        # 3D 姿态重建实时帧率（右上角，按 P 开启后显示）
+        if self.enable["pose"] and self._pose_fps > 0:
+            fps_txt = f"3D {self._pose_fps:4.1f} FPS"
+            (tw, _th), _ = cv2.getTextSize(fps_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.putText(grid, fps_txt, (w - tw - 12, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 0), 2, cv2.LINE_AA)
         return grid
 
     def _draw_panel(self, w: int, y_offset: int = 0) -> np.ndarray:
