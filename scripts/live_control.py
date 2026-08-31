@@ -593,21 +593,37 @@ class LiveControl:
     def _ball_recon_loop(self) -> None:
         """后台球重建循环：独立线程以最高速率取帧 + 逐帧检测 + DLT，不随 2D 显示降速。
 
-        用 ``get_synchronized_bundle`` 取**同一触发周期**的四机帧（先清队列再各取下一帧），
-        每个触发周期只重建一次——避免逐相机取帧导致的「每触发做 4 次冗余检测 + 新旧帧混杂」，
-        并把相机出帧率（100Hz）真正变成重建速率。
+        逐相机非阻塞取帧（避免阻塞等待），取到即更新 ``self._latest`` 供主循环显示，
+        再调 :meth:`_reconstruct_ball_frame`。每 2 秒打印一次「重建速率 + 单次检测耗时」，
+        用于定位是检测慢还是取帧/冗余开销。
         """
+        n = 0
+        t0 = time.time()
+        detect_ms = 0.0
         while self._ball_recon_running:
-            bundle = self.mgr.get_synchronized_bundle(block=True, timeout=0.5)
-            if not bundle.frames:
-                time.sleep(0.002)
+            frames = self.mgr.get_latest_frames(block=False)
+            got = False
+            for cid, f in frames.items():
+                if f is not None:
+                    self._latest[cid] = f
+                    got = True
+            if not got:
+                time.sleep(0.001)
                 continue
-            for cid, f in bundle.frames.items():
-                self._latest[cid] = f
+            t = time.perf_counter()
             try:
                 self._reconstruct_ball_frame()
             except Exception:  # noqa: BLE001 —— 单帧异常不影响下一帧
                 pass
+            detect_ms += (time.perf_counter() - t) * 1000
+            n += 1
+            if time.time() - t0 >= 2.0:
+                rate = n / (time.time() - t0)
+                avg = detect_ms / max(n, 1)
+                print(f"[球诊断] 重建 {rate:.1f} Hz | 单次 detect_batch+DLT {avg:.1f} ms")
+                n = 0
+                t0 = time.time()
+                detect_ms = 0.0
 
     def _reconstruct_ball_frame(self) -> None:
         """各相机球检测（每帧一次）→ 置信度加权 DLT 三角化 → Open3D 球层（无卡尔曼）。"""
