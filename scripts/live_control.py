@@ -843,8 +843,13 @@ class LiveControl:
                 if self._window_closed():
                     break
 
-                # 取最新帧
-                latest = self.mgr.get_latest_frames(block=False)
+                # 取帧：外触发下按触发锁帧（清积压 + 阻塞等下一触发周期的同步帧），
+                # 稳定在触发频率、不重复处理同一帧；连续/软触发下自由运行。
+                if self.trigger_mode == "external":
+                    bundle = self.mgr.get_synchronized_bundle(block=True, timeout=1.0)
+                    latest = bundle.frames
+                else:
+                    latest = self.mgr.get_latest_frames(block=False)
                 for cid, f in latest.items():
                     if f is not None:
                         self._latest[cid] = f
