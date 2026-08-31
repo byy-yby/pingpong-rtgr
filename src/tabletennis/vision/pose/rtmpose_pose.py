@@ -141,14 +141,15 @@ def _default_det_batch_onnx() -> str:
                         "yolox_tiny_dynamic_416.onnx")
 
 
-def _default_person_onnx() -> str:
+def _default_person_onnx(imgsz: int = 416) -> str:
     """yolo11n 灰度人检测 ONNX 路径（scripts/export_yolo11_person.py 导出）。
 
-    可用环境变量 ``PERSON_ONNX`` 覆盖（换权重 / 不同路径时用）。
+    按输入尺寸分文件（h/w 固定进 ONNX，换 imgsz 需重新导出）。可用环境变量
+    ``PERSON_ONNX`` 覆盖（换权重 / 不同路径时用）。
     """
     return os.environ.get("PERSON_ONNX") or os.path.join(
         os.path.expanduser("~"), ".cache", "tabletennis",
-        "yolo11n_grayscale_person.onnx")
+        f"yolo11n_grayscale_person_{imgsz}.onnx")
 
 
 def _nms(boxes: np.ndarray, scores: np.ndarray, nms_thr: float) -> List[int]:
@@ -281,6 +282,7 @@ class RTMPoseDetector(PoseDetector):
         det: str = "yolo11n-gray",
         det_input_size: tuple = (416, 416),
         det_onnx: Optional[str] = None,
+        det_imgsz: int = 416,
         device: str = "cuda",
         backend: str = "onnxruntime",
         score_thr: float = 0.5,
@@ -320,7 +322,8 @@ class RTMPoseDetector(PoseDetector):
                               else ("cpu" if device == "cpu" else "cuda"))
             self._det_model = None
             self._det_person = Yolo11PersonDetector(
-                det_onnx or _default_person_onnx(), backend=person_backend)
+                det_onnx or _default_person_onnx(det_imgsz), imgsz=det_imgsz,
+                conf_thresh=score_thr, backend=person_backend)
         else:
             self._det_model = YOLOX(
                 YOLOX_MODEL_URLS.get(det, det),
@@ -338,6 +341,11 @@ class RTMPoseDetector(PoseDetector):
             device=device,
             to_openpose=to_openpose,
         )
+        # 预计算 float32 归一化参数（复用 rtmlib 的 mean/std）：rtmlib 每次 preprocess
+        # 都做 `(uint8 - float_mean)/float_std`，numpy 会把 uint8 提升成 float64，
+        # 实测归一化占 RTMPose 预处理 ~60% 耗时；这里固定成 float32 就地算。
+        self._pose_mean = np.asarray(self._pose_model.mean, dtype=np.float32)
+        self._pose_std = np.asarray(self._pose_model.std, dtype=np.float32)
 
         if use_trt:
             cache_dir = _default_trt_cache_dir()
@@ -411,6 +419,24 @@ class RTMPoseDetector(PoseDetector):
             else:
                 self._det_batch_session = _build_det_batch_session(
                     batch_onnx, "onnxruntime", _default_trt_cache_dir())
+
+    def _preprocess_pose(self, bgr: np.ndarray, bbox) -> tuple:
+        """RTMPose 预处理（与 rtmlib 完全等价，但归一化用 float32 就地算）。
+
+        复用 rtmlib 的 ``bbox_xyxy2cs`` / ``top_down_affine``（中心/尺度/仿射 warp
+        逻辑一致），仅把归一化从 ``(uint8 - mean)/std``（numpy 提升成 float64）改成
+        float32，省掉 float64 中间量与后续 stack 时的 dtype 转换。
+        返回 ``(normalized_img_float32, center, adjusted_scale)``，语义同 rtmlib。
+        """
+        from rtmlib.tools.pose_estimation.pre_processings import (
+            bbox_xyxy2cs, top_down_affine)
+        center, scale = bbox_xyxy2cs(np.asarray(bbox), padding=1.25)
+        img, adj_scale = top_down_affine(
+            self._pose_model.model_input_size, scale, center, bgr)
+        img = np.asarray(img, dtype=np.float32)
+        img -= self._pose_mean
+        img /= self._pose_std
+        return img, center, adj_scale
 
     def detect(self, frame: Frame) -> List[Pose2D]:
         """对一帧做 top-down 2D 姿态检测。
@@ -529,7 +555,7 @@ class RTMPoseDetector(PoseDetector):
             if bgr is None:
                 continue
             for pi, bbox in enumerate(bboxes):
-                img, center, scale = self._pose_model.preprocess(bgr, bbox)
+                img, center, scale = self._preprocess_pose(bgr, bbox)
                 crops.append(img)
                 meta.append((fi, pi, center, scale))
 

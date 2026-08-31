@@ -468,14 +468,18 @@ class LiveControl:
             return
         cids = [c for c, _ in frames_items]
         frames = [f for _, f in frames_items]
+        t_det0 = time.perf_counter()
         try:
             poses_list = detector.detect_batch(frames)
         except AttributeError:  # 检测器无批处理接口则逐帧回退
             poses_list = [detector.detect(f) for f in frames]
+        t_detect = time.perf_counter() - t_det0
         poses_per_cam = dict(zip(cids, poses_list))
         self._last_poses = poses_per_cam
 
+        t_recon = 0.0
         if self._triangulator is not None:
+            t_r0 = time.perf_counter()
             people = match_people(poses_per_cam, self._triangulator)
             skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
             # 硬编码身份：按球桌长边(Y)两侧分 ID（Y 中点 2.74/2=1.37m），绝对稳定
@@ -485,6 +489,7 @@ class LiveControl:
             skeletons = self._pose_tracker.update(skeletons)
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)
+            t_recon = time.perf_counter() - t_r0
             # 诊断日志：前 5 帧 + 每 60 帧打印一次，定位骨架不出现的环节
             self._frame_idx += 1
             if self._frame_idx <= 5 or self._frame_idx % 60 == 0:
@@ -492,8 +497,9 @@ class LiveControl:
                 n_valid = sum(
                     int(np.isfinite(s.keypoints).all(axis=1).sum()) for s in skeletons
                 )
-                print(f"[3D重建] 帧{self._frame_idx}: 各相机检测 {n_det} | "
-                      f"匹配 {len(people)} 人 | 有效关节 {n_valid}")
+                print(f"[3D重建] 帧{self._frame_idx}: 检测 {n_det} | "
+                      f"匹配 {len(people)} 人 | 有效关节 {n_valid} | "
+                      f"检测 {t_detect*1000:.1f}ms + 重建 {t_recon*1000:.2f}ms")
 
         # 实时帧率（EMA）：本轮检测+三角化耗时换算成 FPS，供右上角叠加显示
         dt = time.perf_counter() - t0
