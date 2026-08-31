@@ -887,13 +887,16 @@ class LiveControl:
                     break
 
                 # 球开启后由独立线程负责取帧 + 重建（跑满检测速率，不随 2D 显示降速）；
-                # 未开启时主循环取帧。
+                # 未开启时主循环取帧：外触发下锁帧到触发频率，连续/软触发下自由运行。
                 if self.enable["ball"] and self._ball_ready:
                     self._start_ball_recon_thread()
                 else:
                     self._stop_ball_recon_thread()
-                    # 取最新帧
-                    latest = self.mgr.get_latest_frames(block=False)
+                    if self.trigger_mode == "external":
+                        bundle = self.mgr.get_synchronized_bundle(block=True, timeout=1.0)
+                        latest = bundle.frames
+                    else:
+                        latest = self.mgr.get_latest_frames(block=False)
                     for cid, f in latest.items():
                         if f is not None:
                             self._latest[cid] = f
