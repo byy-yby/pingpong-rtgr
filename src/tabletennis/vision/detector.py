@@ -90,22 +90,29 @@ def _create_ball_detector() -> Any:
 
 
 def _create_ball_yolo_detector() -> Any:
-    """创建 YOLO 球检测器（onnxruntime；模型文件不存在则返回 None，调用方回退经典）。
+    """创建 YOLO 球检测器（onnxruntime + TensorRT FP16 + 4 相机 batch）。
 
-    模型路径优先取环境变量 ``BALL_ONNX``，否则用训练默认产物
-    ``runs/detect/ball/weights/best.onnx``。
+    优先用 1 通道灰度模型 ``yolo11n-grayscale``（train_gray 训练产物，输入 (B,1,H,W)），
+    不存在则回退旧的 3 通道模型 ``yolov8n``；两者都走同一个 ``YoloBallDetector``
+    （按 ONNX 输入通道数自动适配）。路径可用环境变量覆盖：
+    ``BALL_GRAY_ONNX``（灰度）/ ``BALL_ONNX``（旧 3 通道）。
     """
     import os
 
     from ..core.config import project_root
 
-    path = os.environ.get("BALL_ONNX") or os.path.join(
-        project_root(), "runs", "detect", "ball", "weights", "best.onnx"
-    )
-    if not os.path.exists(path):
-        return None
-    from .ball.yolo_ball import YoloBallDetector
-    return YoloBallDetector(path)
+    root = project_root()
+    candidates = [
+        os.environ.get("BALL_GRAY_ONNX"),
+        os.path.join(root, "runs", "detect", "ball_gray", "weights", "best.onnx"),
+        os.environ.get("BALL_ONNX"),
+        os.path.join(root, "runs", "detect", "ball", "weights", "best.onnx"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            from .ball.yolo_ball import YoloBallDetector
+            return YoloBallDetector(path)
+    return None
 
 
 # 姿态检测已实现（RTMPose-l-halpe26，26 点，CPU 推理），注册到工厂，

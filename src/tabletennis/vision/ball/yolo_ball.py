@@ -67,6 +67,22 @@ _TRT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "tabletennis", 
 _SCALE = 1.0 / 255.0  # uint8 → [0,1] float
 
 
+def _read_onnx_input(model_path: str) -> Tuple[str, list]:
+    """读 ONNX 第一个输入的 ``(name, dims)``；dims 里 int=固定、str=动态。
+
+    用于在创建 session **之前**确定输入通道数（1=灰度 / 3=彩色）与 batch 是否动态，
+    从而给 TensorRT 配正确的动态 batch profile。
+    """
+    import onnx
+
+    m = onnx.load(model_path)
+    inp = m.graph.input[0]
+    dims = []
+    for d in inp.type.tensor_type.shape.dim:
+        dims.append(d.dim_value if d.dim_value else d.dim_param)
+    return inp.name, dims
+
+
 class YoloBallDetector(BallDetector):
     """ONNX YOLO 球检测器（无状态，可跨相机复用）。
 
@@ -103,6 +119,13 @@ class YoloBallDetector(BallDetector):
         self.refine_enabled = bool(refine)
         self.backend = backend
 
+        # 创建 session 之前读输入 meta：通道数（1=灰度 / 3=彩色）与 batch 是否动态。
+        self.input_name, in_dims = _read_onnx_input(model_path)
+        self._channels = (
+            int(in_dims[1]) if len(in_dims) >= 2 and isinstance(in_dims[1], int) else 3
+        )
+        self._batch_supported = isinstance(in_dims[0], str)  # 动态 batch（如 'batch'）
+
         available = ort.get_available_providers()
         use_trt = (
             "TensorrtExecutionProvider" in available
@@ -120,13 +143,22 @@ class YoloBallDetector(BallDetector):
             os.makedirs(self.engine_cache_path, exist_ok=True)
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            trt_opts = {
+                "device_id": 0,
+                "trt_fp16_enable": True,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": self.engine_cache_path,
+            }
+            # 动态 batch 需配 profile（min/opt/max batch，H/W 固定到 imgsz）；灰度与彩色通用。
+            if self._batch_supported:
+                c, sz = self._channels, self.imgsz
+                trt_opts.update({
+                    "trt_profile_min_shapes": f"{self.input_name}:1x{c}x{sz}x{sz}",
+                    "trt_profile_opt_shapes": f"{self.input_name}:4x{c}x{sz}x{sz}",
+                    "trt_profile_max_shapes": f"{self.input_name}:8x{c}x{sz}x{sz}",
+                })
             providers = [
-                ("TensorrtExecutionProvider", {
-                    "device_id": 0,
-                    "trt_fp16_enable": True,
-                    "trt_engine_cache_enable": True,
-                    "trt_engine_cache_path": self.engine_cache_path,
-                }),
+                ("TensorrtExecutionProvider", trt_opts),
                 "CUDAExecutionProvider",
                 "CPUExecutionProvider",
             ]
@@ -141,27 +173,27 @@ class YoloBallDetector(BallDetector):
             )
             self.session = ort.InferenceSession(model_path, providers=providers)
 
-        in_shape = self.session.get_inputs()[0].shape
-        self.input_name = self.session.get_inputs()[0].name
-        self._batch_axis = in_shape[0] if len(in_shape) == 4 else None
-        self._batch_supported = isinstance(self._batch_axis, str)  # 动态 batch（如 'batch'）
         self.actual_provider = self.session.get_providers()[0]  # 供上层打印实际后端
 
-        # 预处理 buffer 复用：避免每帧 4 次 1280x1280 的临时数组分配（实测 ~27ms → ~5ms）
-        self._inp = np.empty((1, 3, self.imgsz, self.imgsz), dtype=np.float32)
-        self._inp_batch = np.empty((4, 3, self.imgsz, self.imgsz), dtype=np.float32)
+        # 预处理 buffer 复用：避免每帧 4 次 1280x1280 的临时数组分配（实测 ~27ms → ~5ms）。
+        # 通道数随模型自适应：灰度模型 (B,1,H,W)，彩色模型 (B,3,H,W)。
+        self._inp = np.empty((1, self._channels, self.imgsz, self.imgsz), dtype=np.float32)
+        self._inp_batch = np.empty((4, self._channels, self.imgsz, self.imgsz), dtype=np.float32)
 
     # -- 预处理 / 后处理（buffer 复用，GPU 不再是瓶颈时才轮到 TRT 生效） --
 
     def _fill_input(self, gray: np.ndarray, dst: np.ndarray) -> Tuple[int, int, float, float, float]:
-        """letterbox + 归一化直接写入 dst（(3,H,W) float32），返回 (H, W, r, dw, dh)。"""
+        """letterbox + 归一化直接写入 dst（(C,H,W) float32），返回 (H, W, r, dw, dh)。
+
+        灰度模型 C=1 只写通道 0；彩色模型 C=3 复制三份（无需 cvtColor，直接广播）。
+        """
         if gray.ndim == 3:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         H, W = gray.shape[:2]
         lb, (r, dw, dh) = _letterbox(gray, (self.imgsz, self.imgsz))
         np.multiply(lb, _SCALE, out=dst[0])  # uint8 → float32，单遍、无中间数组
-        dst[1] = dst[0]
-        dst[2] = dst[0]
+        for c in range(1, self._channels):
+            dst[c] = dst[0]
         return H, W, r, dw, dh
 
     def _postprocess(self, det: np.ndarray, gray: np.ndarray, camera_id: int,
