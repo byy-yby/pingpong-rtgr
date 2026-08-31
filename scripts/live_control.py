@@ -573,14 +573,19 @@ class LiveControl:
         if not frames_items:
             return
 
-        # 顺序逐路 detect（batch-1 引擎形状固定，相机丢帧也不会触发 TRT 引擎重建；
-        # 实测 batch-4 与顺序 4 路同速 ~75ms，batch 无收益，故不用 detect_batch）。
-        balls_per_cam: Dict[int, list] = {}
-        for cid, f in frames_items:
-            try:
-                balls_per_cam[cid] = detector.detect(f)
-            except Exception as exc:  # noqa: BLE001 —— 单路检测失败不影响其余相机
-                balls_per_cam[cid] = []
+        # 4 相机 batch 一次推理（灰度模型 1 通道更轻，batch 省 3 次 session.run 固定开销；
+        # 模型 batch 非动态 / 经典检测器无批处理接口时自动回退逐帧）。
+        frames = [f for _, f in frames_items]
+        try:
+            balls_list = detector.detect_batch(frames)
+        except Exception as exc:  # noqa: BLE001 —— 批处理失败回退逐帧
+            balls_list = []
+            for f in frames:
+                try:
+                    balls_list.append(detector.detect(f))
+                except Exception as exc2:  # noqa: BLE001 —— 单路失败不影响其余相机
+                    balls_list.append([])
+        balls_per_cam = {cid: balls_list[i] for i, (cid, _f) in enumerate(frames_items)}
         self._last_balls = balls_per_cam
 
         if self._triangulator is None:
