@@ -704,7 +704,10 @@ class LiveControl:
         if self.enable["pose"] and self._pose_fps > 0:
             fps_txt = f"3D {self._pose_fps:4.1f} FPS"
             (tw, _th), _ = cv2.getTextSize(fps_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.putText(grid, fps_txt, (w - tw - 12, 30), cv2.FONT_HERSHEY_SIMPLEX,
+            # 注意用 resize 后的实际宽度：上面的 w 是缩放前的（网格 2880→max_width 1920），
+            # 沿用旧 w 会把文字画到画布右缘之外而被裁剪
+            gw = grid.shape[1]
+            cv2.putText(grid, fps_txt, (gw - tw - 12, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.7, (0, 255, 0), 2, cv2.LINE_AA)
         return grid
 
