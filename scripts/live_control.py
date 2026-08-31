@@ -520,8 +520,8 @@ class LiveControl:
                 return
             det = self.detectors["ball"]
 
-            # 热启动：喂一帧真实帧，把 CUDA EP 首次推理的惰性初始化（实测 ~6s）
-            # 从主循环挪到后台；_latest 有帧就用，没有就合成一帧同尺寸占位。
+            # 热启动：喂一帧，把首次推理的惰性初始化（TRT 首建 batch-1 引擎
+            # ~30-60s / CUDA EP 首次 ~6s）从主循环挪到后台线程。
             probe = next((f for f in self._latest.values() if f is not None), None)
             if probe is None:
                 probe = Frame(camera_id=0, serial="probe", frame_num=0,
@@ -548,7 +548,8 @@ class LiveControl:
 
             self._ball_ready = True
             self._ball_pending_viewer = True  # 主循环检测到后从主线程开 3D 窗口
-            print(f"[检测] 球: ON（{type(det).__name__} + DLT + Open3D）")
+            ep = getattr(det, "actual_provider", type(det).__name__)
+            print(f"[检测] 球: ON（{type(det).__name__} @ {ep} + DLT + Open3D）")
         except Exception as exc:  # noqa: BLE001
             self._ball_ready = False
             print(f"[检测] 球: 加载失败（{exc}）——按 B 关闭后再按 B 重试")
@@ -572,6 +573,8 @@ class LiveControl:
         if not frames_items:
             return
 
+        # 顺序逐路 detect（batch-1 引擎形状固定，相机丢帧也不会触发 TRT 引擎重建；
+        # 实测 batch-4 与顺序 4 路同速 ~75ms，batch 无收益，故不用 detect_batch）。
         balls_per_cam: Dict[int, list] = {}
         for cid, f in frames_items:
             try:

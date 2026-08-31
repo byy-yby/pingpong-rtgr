@@ -4,11 +4,39 @@
 - `classical_ball.py`：`ClassicalBallDetector` —— 背景减除 + 帧差 + 尺寸先验的经典路线，无模型，`register_detector("ball")`。
 - `yolo_ball.py`：`YoloBallDetector` —— onnxruntime 推理训练导出的 `best.onnx`（单类 ball，输出 `(1,5,N)`），bbox 后接 `refine_ball_center` 精修，`register_detector("ball_yolo")`。无 torch 依赖，跨相机复用。
 
+## YoloBallDetector 后端（backend 参数）
+
+- `"auto"`（默认）：有 TensorRT 则走 **TRT FP16**，否则 CUDA，再否则 CPU。
+- `"tensorrt"` / `"cuda"` / `"cpu"`：固定后端。
+- TRT 引擎缓存到 `~/.cache/tabletennis/trt_engines/<onnx 内容哈希>/`（首次构建 ~18-60s，
+  之后复用；构建失败自动回退 CUDA）。按 onnx 内容哈希分目录，换权重必然换目录 → 必然重建。
+
+实测性能（RTX 5080，1440×1080→1280×1280，单路）：
+
+| 项 | 耗时 |
+|---|---|
+| CUDA 推理（FP32） | ~26.9 ms |
+| TRT 推理（FP16） | ~8.8 ms |
+| 预处理（原：4 次临时数组分配） | ~27 ms |
+| 预处理（现：预分配 buffer 复用） | ~8.4 ms |
+| **单路 detect 合计（TRT + 优化预处理）** | **~18.5 ms**（4 路顺序 ≈75ms → ~13 FPS） |
+
+**关键教训：这活儿 CPU 预处理和 GPU 各占一半。** 只换 TRT 不动预处理，速度不变
+（CPU 瓶颈）；只优化预处理不动 TRT 也只快一半。两个都要做。
+
 ## 坑（务必记住）
 
-**provider 列表不能传 `ort.get_available_providers()` 全量**。本机装了 `tensorrt-cu12-libs`，
-`TensorrtExecutionProvider` 会在可用列表里，全量传会让 `InferenceSession` 初始化先去建 TRT 引擎
-（实测 **~52s**），live_control 主线程按 b 会直接卡死。必须显式
-`["CUDAExecutionProvider", "CPUExecutionProvider"]`（无 CUDA 时退 `["CPUExecutionProvider"]`）。
-显式 CUDA 后 session 创建 ~1s；CUDA EP 首次推理还有进程级惰性初始化（实测 ~1-6s），
-live_control 里已用后台线程加载 + 热启动吸收，勿再同步阻塞主循环。
+1. **provider 列表不能传 `ort.get_available_providers()` 全量**。本机装了
+   `tensorrt-cu12-libs`，全量传会让 CUDA 时也先去建 TRT 引擎（实测 ~52s 阻塞主线程）。
+   必须显式限定，或显式 TRT（见上）。
+2. **`dynamic=True` 导出的 onnx 必须把 h/w 固化成静态**，否则 TRT EP **静默回退 CUDA**
+   （不建引擎、不报错、白跑）。用 `scripts/fix_onnx_dynamic.py` 处理成「仅 batch 动态」。
+3. **live_control 主线程不能同步建引擎 / 首跑热启动**（~55s）——模型创建 + 首帧
+   热启动已挪到后台线程（`_ball_load_worker`）。
+4. **batch 推理（`detect_batch`）在 4 路时无收益**（TRT batch-4 ≈30ms ≈ 4×batch-1，几乎
+   线性），且相机丢帧会触发 batch-3 引擎重建卡死。live_control 热路径用顺序 `detect`，
+   `detect_batch` 仅作 API 保留。
+5. **TRT 引擎缓存 key 只按图结构、不含权重**——换 `best.onnx` 权重不换缓存会**静默复用
+   旧引擎**，跑的还是旧模型（实测旧引擎 conf 0.71 vs 新权重 0.88，无任何报错）。已按
+   onnx 内容哈希分目录缓存根治：换权重 → 换目录 → 必重建。验证：同一份 onnx 的 TRT 与
+   CUDA 结果应在容差内一致（中心 <0.6px、置信 <0.05，FP16 亚像素噪声）。

@@ -375,6 +375,7 @@ class SceneViewer3D:
 
     def _update_ball_geometry(self, vis) -> None:
         """渲染线程内调用：更新小球位置与轨迹。"""
+        o3d = _o3d()  # 惰性 import（模块级无 open3d 硬依赖）；渲染线程每次取
         with self._ball_lock:
             if not self._ball_dirty:
                 return
