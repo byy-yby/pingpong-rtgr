@@ -593,19 +593,17 @@ class LiveControl:
     def _ball_recon_loop(self) -> None:
         """后台球重建循环：独立线程以最高速率取帧 + 逐帧检测 + DLT，不随 2D 显示降速。
 
-        帧获取在此线程做（球开启时主循环不再取帧，避免抢队列），取到后更新
-        ``self._latest`` 供主循环显示，再调 :meth:`_reconstruct_ball_frame` 重建 3D 球。
+        用 ``get_synchronized_bundle`` 取**同一触发周期**的四机帧（先清队列再各取下一帧），
+        每个触发周期只重建一次——避免逐相机取帧导致的「每触发做 4 次冗余检测 + 新旧帧混杂」，
+        并把相机出帧率（100Hz）真正变成重建速率。
         """
         while self._ball_recon_running:
-            frames = self.mgr.get_latest_frames(block=False)
-            got = False
-            for cid, f in frames.items():
-                if f is not None:
-                    self._latest[cid] = f
-                    got = True
-            if not got:
+            bundle = self.mgr.get_synchronized_bundle(block=True, timeout=0.5)
+            if not bundle.frames:
                 time.sleep(0.002)
                 continue
+            for cid, f in bundle.frames.items():
+                self._latest[cid] = f
             try:
                 self._reconstruct_ball_frame()
             except Exception:  # noqa: BLE001 —— 单帧异常不影响下一帧
