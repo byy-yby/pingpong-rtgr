@@ -120,10 +120,9 @@ class LiveControl:
         self._pose_tracker = None
         self._frame_idx = 0
 
-        # 3D 球重建（按 B）：各相机最近一帧球检测 + 3D 球心 + 卡尔曼平滑
+        # 3D 球重建（按 B）：各相机最近一帧球检测 + 3D 球心（逐帧 DLT，无卡尔曼）
         self._last_balls: Dict[int, list] = {}
         self._ball3d = None            # 最近一帧 3D 球心（桌面系，米）
-        self._ball_tracker = None      # 卡尔曼平滑（重建前才创建）
         self._ball_ready = False       # 球模型+三角化器已就绪（后台线程置位）
         self._ball_pending_viewer = False  # 模型就绪但 3D 窗口待主线程打开
         self._ball_load_thread: Optional[threading.Thread] = None
@@ -131,6 +130,9 @@ class LiveControl:
         self._ball_fps: Optional[float] = None
         self._ball_fps_t: Optional[float] = None
         self._ball_diag_t: Optional[float] = None   # 三角化失败诊断限频
+        # 球重建独立线程（跑满检测速率，不随 2D 显示降速）
+        self._ball_recon_running = False
+        self._ball_recon_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -188,8 +190,9 @@ class LiveControl:
                 max_idx = max(max_idx, int(base[1:]))
         return max_idx + 1
 
-    def _tick_record(self, latest: Dict[int, Frame]) -> None:
+    def _tick_record(self) -> None:
         """每帧驱动录制状态机：倒计时（预热背景）→ 录制（存图 + 预标注）。"""
+        latest = self._latest
         if self._record_countdown_until <= 0 and not self._recording:
             return
 
@@ -559,17 +562,57 @@ class LiveControl:
             print(f"[检测] 球: 加载失败（{exc}）——按 B 关闭后再按 B 重试")
 
     def _disable_ball_recon(self) -> None:
+        self._stop_ball_recon_thread()
         self._last_balls = {}
         self._ball3d = None
-        self._ball_tracker = None
         self._ball_ready = False
         self._ball_pending_viewer = False
         if self.viewer3d is not None:
             self.viewer3d.set_ball(None)
         print("[检测] 球: OFF")
 
+    # ------------------------------------------------------------------
+    # 球重建独立线程（跑满检测速率，不随 2D 显示降速）
+    # ------------------------------------------------------------------
+    def _start_ball_recon_thread(self) -> None:
+        """启动（幂等）后台球重建线程。"""
+        if self._ball_recon_thread is not None and self._ball_recon_thread.is_alive():
+            return
+        self._ball_recon_running = True
+        self._ball_recon_thread = threading.Thread(
+            target=self._ball_recon_loop, name="ball-recon", daemon=True)
+        self._ball_recon_thread.start()
+
+    def _stop_ball_recon_thread(self) -> None:
+        """停止后台球重建线程（幂等）。"""
+        self._ball_recon_running = False
+        if self._ball_recon_thread is not None:
+            self._ball_recon_thread.join(timeout=1.0)
+            self._ball_recon_thread = None
+
+    def _ball_recon_loop(self) -> None:
+        """后台球重建循环：独立线程以最高速率取帧 + 逐帧检测 + DLT，不随 2D 显示降速。
+
+        帧获取在此线程做（球开启时主循环不再取帧，避免抢队列），取到后更新
+        ``self._latest`` 供主循环显示，再调 :meth:`_reconstruct_ball_frame` 重建 3D 球。
+        """
+        while self._ball_recon_running:
+            frames = self.mgr.get_latest_frames(block=False)
+            got = False
+            for cid, f in frames.items():
+                if f is not None:
+                    self._latest[cid] = f
+                    got = True
+            if not got:
+                time.sleep(0.002)
+                continue
+            try:
+                self._reconstruct_ball_frame()
+            except Exception:  # noqa: BLE001 —— 单帧异常不影响下一帧
+                pass
+
     def _reconstruct_ball_frame(self) -> None:
-        """各相机球检测（每帧一次）→ 置信度加权 DLT 三角化 → 卡尔曼平滑 → Open3D 球层。"""
+        """各相机球检测（每帧一次）→ 置信度加权 DLT 三角化 → Open3D 球层（无卡尔曼）。"""
         detector = self.detectors["ball"]
         frames_items = [
             (cid, f) for cid, f in sorted(self._latest.items()) if f is not None
@@ -612,16 +655,11 @@ class LiveControl:
         res = triangulate_ball(single, self._triangulator, min_conf=0.15) if len(single) >= 2 else None
         if res is not None:
             X, conf, err, n_views, ang = res
-            if self._ball_tracker is None:
-                from tabletennis.reconstruction import BallTracker
-                self._ball_tracker = BallTracker()
-            X = self._ball_tracker.update(X, float(conf), dt=_dt)
+            # 逐帧直接用 DLT 结果（无卡尔曼预测），每一帧 3D 都来自视觉系统
             self._ball3d = X
             if self.viewer3d is not None:
                 self.viewer3d.set_ball(X)
         else:
-            if self._ball_tracker is not None:
-                self._ball_tracker.update(None, 0.0, dt=_dt)   # 本帧无观测，内部 coast
             self._ball3d = None
             if self.viewer3d is not None:
                 self.viewer3d.set_ball(None)
@@ -825,16 +863,22 @@ class LiveControl:
                 if self._window_closed():
                     break
 
-                # 取最新帧
-                latest = self.mgr.get_latest_frames(block=False)
-                for cid, f in latest.items():
-                    if f is not None:
-                        self._latest[cid] = f
-                        if self.trigger_error:
-                            self.trigger_error = False
-                            print("✓ 触发信号已恢复，开始出图。")
+                # 球开启后由独立线程负责取帧 + 重建（跑满检测速率，不随 2D 显示降速）；
+                # 未开启时主循环取帧。
+                if self.enable["ball"] and self._ball_ready:
+                    self._start_ball_recon_thread()
+                else:
+                    self._stop_ball_recon_thread()
+                    # 取最新帧
+                    latest = self.mgr.get_latest_frames(block=False)
+                    for cid, f in latest.items():
+                        if f is not None:
+                            self._latest[cid] = f
+                            if self.trigger_error:
+                                self.trigger_error = False
+                                print("✓ 触发信号已恢复，开始出图。")
 
-                self._tick_record(latest)
+                self._tick_record()
 
                 # 3D 姿态重建（按 P 开启后每帧批处理检测 + 三角化 + Open3D 骨架）
                 if self.enable["pose"] and self.detectors["pose"] is not None:
@@ -848,9 +892,7 @@ class LiveControl:
                     self._start_viewer()
                     self._ball_pending_viewer = False
 
-                # 3D 球重建（按 B 开启后每帧检测 + 三角化 + Open3D 球层）
-                if self.enable["ball"] and self._ball_ready:
-                    self._reconstruct_ball_frame()
+                # （3D 球重建已由后台线程 _ball_recon_loop 负责，这里不再调用）
 
                 canvas = self._compose_canvas()
                 cv2.imshow(MAIN_WIN, canvas)
@@ -860,6 +902,7 @@ class LiveControl:
                     break
                 self.handle_key(key)
         finally:
+            self._stop_ball_recon_thread()
             self._close_viewer()
             cv2.destroyAllWindows()
 
