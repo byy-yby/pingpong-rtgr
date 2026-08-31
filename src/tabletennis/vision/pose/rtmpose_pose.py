@@ -141,6 +141,16 @@ def _default_det_batch_onnx() -> str:
                         "yolox_tiny_dynamic_416.onnx")
 
 
+def _default_person_onnx() -> str:
+    """yolo11n 灰度人检测 ONNX 路径（scripts/export_yolo11_person.py 导出）。
+
+    可用环境变量 ``PERSON_ONNX`` 覆盖（换权重 / 不同路径时用）。
+    """
+    return os.environ.get("PERSON_ONNX") or os.path.join(
+        os.path.expanduser("~"), ".cache", "tabletennis",
+        "yolo11n_grayscale_person.onnx")
+
+
 def _nms(boxes: np.ndarray, scores: np.ndarray, nms_thr: float) -> List[int]:
     """单类 NMS（numpy）。boxes: (N,4) xyxy。"""
     x1, y1 = boxes[:, 0], boxes[:, 1]
@@ -253,7 +263,8 @@ class RTMPoseDetector(PoseDetector):
             "rtmpose-s"/"rtmpose-s-halpe26"/"rtmpose-x"/"rtmpose-x-halpe26"，
             或本地 onnx 路径 / 下载 URL。
         input_size: 姿态模型输入尺寸 (H, W)，默认 (192, 256)（对应 256×192）。
-        det: 人体检测器标识（"yolox-tiny"/"yolox-m"/"yolox-x"）或本地/URL。默认 tiny（快）。
+        det: 人体检测器标识，默认 "yolo11n-gray"（灰度原生 yolo11n，1ch）；
+            也可用 "yolox-tiny"/"yolox-m"/"yolox-x"（rtmlib humanart）或本地/URL。
         det_input_size: 检测器输入尺寸 (H, W)，默认 (416, 416)（须与 yolox-tiny 匹配）。
         device: "cpu" 或 "cuda"。GT 1030 建议 cpu，换好 GPU 后改 cuda。
         backend: 推理后端，默认 "onnxruntime"；"tensorrt" 走 TensorrtExecutionProvider
@@ -267,8 +278,9 @@ class RTMPoseDetector(PoseDetector):
         self,
         model: str = "rtmpose-l-halpe26",
         input_size: tuple = (192, 256),
-        det: str = "yolox-tiny",
+        det: str = "yolo11n-gray",
         det_input_size: tuple = (416, 416),
+        det_onnx: Optional[str] = None,
         device: str = "cuda",
         backend: str = "onnxruntime",
         score_thr: float = 0.5,
@@ -299,14 +311,26 @@ class RTMPoseDetector(PoseDetector):
         use_trt = backend == "tensorrt"
         rtmlib_backend = "onnxruntime" if use_trt else backend
 
-        self._det_model = YOLOX(
-            YOLOX_MODEL_URLS.get(det, det),
-            model_input_size=det_input_size,
-            backend=rtmlib_backend,
-            device=device,
-            score_thr=score_thr,
-            nms_thr=nms_thr,
-        )
+        self._use_yolo11_det = det == "yolo11n-gray"
+        if self._use_yolo11_det:
+            # 灰度原生 yolo11n 人检测（1ch + TRT FP16 + batch），替换 rtmlib YOLOX：
+            # 省掉 gray→3ch 复制与 CPU 上 80 类逐类 NMS。
+            from .yolo11_person import Yolo11PersonDetector
+            person_backend = ("tensorrt" if use_trt
+                              else ("cpu" if device == "cpu" else "cuda"))
+            self._det_model = None
+            self._det_person = Yolo11PersonDetector(
+                det_onnx or _default_person_onnx(), backend=person_backend)
+        else:
+            self._det_model = YOLOX(
+                YOLOX_MODEL_URLS.get(det, det),
+                model_input_size=det_input_size,
+                backend=rtmlib_backend,
+                device=device,
+                score_thr=score_thr,
+                nms_thr=nms_thr,
+            )
+            self._det_person = None
         self._pose_model = RTMPose(
             RTMPOSE_MODEL_URLS.get(model, model),
             model_input_size=input_size,
@@ -318,9 +342,12 @@ class RTMPoseDetector(PoseDetector):
         if use_trt:
             cache_dir = _default_trt_cache_dir()
             print("[TensorRT] 首次构建引擎（约 30~40 秒，之后走缓存秒开），请稍候...", flush=True)
-            # 逐模型尝试 TRT：YOLOX 需先 patch 掉预 NMS 的 TopK(5000→3000)，
-            # 某模型转换失败则回退 CUDA EP。
-            for name, model in (("YOLOX", self._det_model), ("RTMPose", self._pose_model)):
+            # 逐模型尝试 TRT：YOLOX 需先 patch 掉预 NMS 的 TopK(5000→3000)；
+            # yolo11n 人检测器自带 TRT（backend="tensorrt"），无需此处 session 替换。
+            trt_models = [("RTMPose", self._pose_model)]
+            if not self._use_yolo11_det:
+                trt_models.insert(0, ("YOLOX", self._det_model))
+            for name, model in trt_models:
                 print(f"[TensorRT] 构建 {name} 引擎...", flush=True)
                 try:
                     onnx_path = model.onnx_model
@@ -332,15 +359,22 @@ class RTMPoseDetector(PoseDetector):
             # 预热触发 TRT engine 构建（含 FP16），避免首帧卡顿
             side = max(det_input_size)
             dummy = np.zeros((side, side, 3), dtype=np.uint8)
-            self._det_model(dummy)
-            print("[TensorRT] YOLOX 引擎完成，构建 RTMPose 引擎（约 30 秒）...", flush=True)
+            if self._use_yolo11_det:
+                # 人检测器首次 forward 触发其 TRT 引擎构建（1ch 灰度）
+                self._det_person.detect(Frame(
+                    camera_id=0, serial="warmup", frame_num=0, device_timestamp=0,
+                    host_timestamp=0, image=np.zeros((side, side), np.uint8),
+                    pixel_format=17301505, width=side, height=side))
+            else:
+                self._det_model(dummy)
             self._pose_model(dummy, bboxes=[[0, 0, side, side]])
             print("[TensorRT] 全部引擎构建完成 ✓", flush=True)
 
         # 校验 CUDA 是否真正生效：onnxruntime 缺 CUDA 库时会静默回退 CPU
         # （get_available_providers 仍列出 CUDAExecutionProvider，但 session 实际用 CPU）。
         elif device == "cuda":
-            actual = self._det_model.session.get_providers()
+            probe = self._pose_model if self._use_yolo11_det else self._det_model
+            actual = probe.session.get_providers()
             if not actual or actual[0] != "CUDAExecutionProvider":
                 logger.warning(
                     "CUDA EP 加载失败（实际 providers=%s），已在 CPU 上推理；"
@@ -349,9 +383,9 @@ class RTMPoseDetector(PoseDetector):
 
         # 动态 batch YOLOX 会话：4 相机一次 forward（省掉 3 次 session.run 固定开销）。
         # 仅当检测输入恰为 416×416（与导出的 ONNX 一致）且用 GPU 时启用；导出文件缺失
-        # 则回退逐帧检测（detect_batch 走原路径）。
+        # 则回退逐帧检测（detect_batch 走原路径）。yolo11n 人检测走自己的 detect_batch。
         self._det_batch_session = None
-        if device != "cpu" and tuple(det_input_size) == (416, 416):
+        if not self._use_yolo11_det and device != "cpu" and tuple(det_input_size) == (416, 416):
             batch_onnx = _default_det_batch_onnx()
             if not os.path.exists(batch_onnx):
                 logger.warning(
@@ -393,7 +427,10 @@ class RTMPoseDetector(PoseDetector):
             bgr = frame.image
 
         # 1) 检测人（返回 xyxy 框，已按 score_thr/nms 过滤）
-        bboxes = self._det_model(bgr)
+        if self._use_yolo11_det:
+            bboxes = self._det_person.detect(frame)
+        else:
+            bboxes = self._det_model(bgr)
         if bboxes is None or len(bboxes) == 0:
             return []
 
@@ -439,11 +476,18 @@ class RTMPoseDetector(PoseDetector):
         if n == 0:
             return results
 
-        # 1) YOLOX 检测。有动态 batch 会话时把全部有效帧堆成 (B,3,416,416) 一次 forward
-        #    （省掉 N-1 次 session.run 固定开销，这是多相机的最大头），再 numpy 解码+NMS；
-        #    否则回退逐帧调用 rtmlib（模型固定 batch=1）。
+        # 1) 检测人。yolo11n 灰度走自己的 detect_batch（1ch，4 帧一次 forward）；否则走
+        #    YOLOX 动态 batch 会话（4 帧一次 forward + numpy 解码/NMS）或逐帧 rtmlib。
         dets: List = []  # 每帧: (bgr 或 None, bboxes)
-        if self._det_batch_session is not None:
+        if self._use_yolo11_det:
+            boxes_list = self._det_person.detect_batch(frames)  # List[np.ndarray (M,4)]
+            for frame, boxes in zip(frames, boxes_list):
+                if frame.image is None or frame.image.size == 0:
+                    dets.append((None, []))
+                    continue
+                bgr = cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR) if frame.image.ndim == 2 else frame.image
+                dets.append((bgr, boxes))
+        elif self._det_batch_session is not None:
             bgr_list, padded, ratios, valid = [], [], [], []
             for frame in frames:
                 if frame.image is None or frame.image.size == 0:
@@ -522,5 +566,6 @@ class RTMPoseDetector(PoseDetector):
 
     def close(self) -> None:
         self._det_model = None
+        self._det_person = None
         self._pose_model = None
         self._det_batch_session = None

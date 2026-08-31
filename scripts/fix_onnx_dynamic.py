@@ -28,6 +28,7 @@ def main() -> None:
     ap.add_argument("src", help="ultralytics dynamic=True 导出的 onnx")
     ap.add_argument("dst", help="输出 onnx（仅 batch 动态）")
     ap.add_argument("--imgsz", type=int, default=1280, help="固定输入 H/W")
+    ap.add_argument("--ch", type=int, default=3, help="输入通道数（灰度模型用 1）")
     args = ap.parse_args()
 
     m = onnx.load(args.src)
@@ -35,7 +36,7 @@ def main() -> None:
 
     inp = m.graph.input[0]
     tt = inp.type.tensor_type
-    fixed = {1: 3, 2: args.imgsz, 3: args.imgsz}
+    fixed = {1: args.ch, 2: args.imgsz, 3: args.imgsz}
     for i, dim in enumerate(tt.shape.dim):
         if i == 0:
             dim.ClearField("dim_value")
