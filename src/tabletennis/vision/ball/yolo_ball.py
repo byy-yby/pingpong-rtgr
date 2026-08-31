@@ -110,8 +110,8 @@ class YoloBallDetector(BallDetector):
     def __init__(
         self,
         model_path: str,
-        imgsz: int = 960,
-        conf_thresh: float = 0.25,
+        imgsz: int = 1280,
+        conf_thresh: float = 0.2,
         iou_thresh: float = 0.45,
         refine: bool = True,
         backend: str = "auto",
