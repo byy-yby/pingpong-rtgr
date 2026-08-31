@@ -213,9 +213,14 @@ SetIntValueEx("LineDebouncerTime", 50)             # us，防误触发
   ① 换 RTMO（one-stage，砍掉 YOLOX+逐人 RTMPose）；② YOLOX 重新导出成动态 batch 以批处理。
 - [ ] **球检测**：接口已在 `vision/detector.py`（`BallDetector`），经典 CV 路线（阈值/连通域）
   待接入 `register_detector("ball", ...)`。（球桌已实现并注册。）
-- [ ] **YOLO 微调训练**（2026-08-29 进行中）：数据集已统一框 + 增强 3000→11944，
-  用 `scripts/train_ball.py`（yolov8n.pt 预训练迁移，imgsz 1280，single_cls，--patience 早停）
-  训练单类 ball。torch 栈见「torch 训练栈」节。训练完重导 ONNX 时：用
+- [x] **YOLO 微调训练**（2026-08-31 完成）：`scripts/train_ball.py`（yolov8n.pt 预训练迁移，
+  imgsz 1280，single_cls，100 epochs，patience 早停）训练单类 ball。最终 mAP50 **0.961**、
+  mAP50-95 **0.849**；真实标注图抽检 76/76 检出、球心中位误差 0.2px、0 误检。最终
+  `best.pt` 训练后自动导出静态 batch-1 `best.onnx`（`train_ball.py` 收尾，无需
+  `dynamic=True`），已部署到主仓库 `runs/detect/ball/weights/best.onnx`（live_control 加载点）。
+  坑：**onnxruntime TRT 引擎缓存 key 只按图结构、不含权重**——换 onnx 权重必须换缓存，
+  `yolo_ball.py` 已按 onnx 内容哈希分目录（`~/.cache/tabletennis/trt_engines/<hash>/`）根治，
+  详见 `vision/ball/README.md` 第 5 条。torch 栈见「torch 训练栈」节。训练完重导 ONNX 时：用
   `dynamic=True` 导出后必须跑 `scripts/fix_onnx_dynamic.py` 把 h/w 固化成静态（否则
   TRT EP 静默回退 CUDA），并复制到主仓库 `runs/detect/ball/weights/best.onnx`；
   TRT 引擎缓存会自动重建（后台线程，不卡 UI）。

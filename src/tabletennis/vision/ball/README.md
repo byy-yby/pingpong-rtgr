@@ -8,7 +8,8 @@
 
 - `"auto"`（默认）：有 TensorRT 则走 **TRT FP16**，否则 CUDA，再否则 CPU。
 - `"tensorrt"` / `"cuda"` / `"cpu"`：固定后端。
-- TRT 引擎缓存到 `~/.cache/tabletennis/trt_engines`（首次构建 ~30-60s，之后复用；构建失败自动回退 CUDA）。
+- TRT 引擎缓存到 `~/.cache/tabletennis/trt_engines/<onnx 内容哈希>/`（首次构建 ~18-60s，
+  之后复用；构建失败自动回退 CUDA）。按 onnx 内容哈希分目录，换权重必然换目录 → 必然重建。
 
 实测性能（RTX 5080，1440×1080→1280×1280，单路）：
 
@@ -35,3 +36,7 @@
 4. **batch 推理（`detect_batch`）在 4 路时无收益**（TRT batch-4 ≈30ms ≈ 4×batch-1，几乎
    线性），且相机丢帧会触发 batch-3 引擎重建卡死。live_control 热路径用顺序 `detect`，
    `detect_batch` 仅作 API 保留。
+5. **TRT 引擎缓存 key 只按图结构、不含权重**——换 `best.onnx` 权重不换缓存会**静默复用
+   旧引擎**，跑的还是旧模型（实测旧引擎 conf 0.71 vs 新权重 0.88，无任何报错）。已按
+   onnx 内容哈希分目录缓存根治：换权重 → 换目录 → 必重建。验证：同一份 onnx 的 TRT 与
+   CUDA 结果应在容差内一致（中心 <0.6px、置信 <0.05，FP16 亚像素噪声）。

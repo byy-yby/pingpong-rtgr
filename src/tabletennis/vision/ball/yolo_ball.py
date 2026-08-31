@@ -8,6 +8,7 @@ torch），bbox 后用 :func:`refine_ball_center` 精修出亚像素球心。
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import List, Optional, Tuple
 
@@ -111,7 +112,12 @@ class YoloBallDetector(BallDetector):
         if use_trt:
             # 显式 TRT EP（FP16 + engine 缓存，与 rtmpose 的 _trt_session 一致）。
             # 首次构建引擎较慢，之后从缓存加载；构建失败 onnxruntime 自动回退 CUDA。
-            os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
+            # 关键：缓存目录按 onnx 内容哈希分档。实测 onnxruntime 的 TRT 引擎缓存 key
+            # 只按图结构（不含权重）算——换权重不换 key 会静默复用旧引擎（推理白跑旧模型）。
+            # 按内容哈希分目录后，换权重必然换目录 → 必然重建，杜绝跨权重复用。
+            onnx_hash = hashlib.md5(open(model_path, "rb").read()).hexdigest()[:16]
+            self.engine_cache_path = os.path.join(_TRT_CACHE_DIR, onnx_hash)
+            os.makedirs(self.engine_cache_path, exist_ok=True)
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             providers = [
@@ -119,7 +125,7 @@ class YoloBallDetector(BallDetector):
                     "device_id": 0,
                     "trt_fp16_enable": True,
                     "trt_engine_cache_enable": True,
-                    "trt_engine_cache_path": _TRT_CACHE_DIR,
+                    "trt_engine_cache_path": self.engine_cache_path,
                 }),
                 "CUDAExecutionProvider",
                 "CPUExecutionProvider",
