@@ -47,7 +47,7 @@ class Yolo11PersonDetector:
     def __init__(
         self,
         onnx_path: str,
-        imgsz: int = 640,
+        imgsz: int = 416,
         conf_thresh: float = 0.35,
         iou_thresh: float = 0.45,
         roi: Optional[Tuple[int, int, int, int]] = None,
