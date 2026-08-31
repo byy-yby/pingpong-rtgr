@@ -127,6 +127,10 @@ class LiveControl:
         self._ball_ready = False       # 球模型+三角化器已就绪（后台线程置位）
         self._ball_pending_viewer = False  # 模型就绪但 3D 窗口待主线程打开
         self._ball_load_thread: Optional[threading.Thread] = None
+        # 球重建实际帧率（EMA 平滑，用于画面右上角显示）
+        self._ball_fps: Optional[float] = None
+        self._ball_fps_t: Optional[float] = None
+        self._ball_diag_t: Optional[float] = None   # 三角化失败诊断限频
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -573,6 +577,15 @@ class LiveControl:
         if not frames_items:
             return
 
+        # 球重建实际帧率（EMA 平滑，显示在画面右上角）
+        _now = time.time()
+        if self._ball_fps_t is not None:
+            _dt = _now - self._ball_fps_t
+            if _dt > 0:
+                _inst = 1.0 / _dt
+                self._ball_fps = _inst if self._ball_fps is None else 0.9 * self._ball_fps + 0.1 * _inst
+        self._ball_fps_t = _now
+
         # 4 相机 batch 一次推理（灰度模型 1 通道更轻，batch 省 3 次 session.run 固定开销；
         # 模型 batch 非动态 / 经典检测器无批处理接口时自动回退逐帧）。
         frames = [f for _, f in frames_items]
@@ -593,7 +606,10 @@ class LiveControl:
         from tabletennis.reconstruction import triangulate_ball
 
         single = {cid: balls[0] for cid, balls in balls_per_cam.items() if balls}
-        res = triangulate_ball(single, self._triangulator) if len(single) >= 2 else None
+        # min_conf 降到 0.15：检测器 conf_thresh=0.25，三角化若用默认 0.3 会把
+        # conf 0.25~0.3 的球（2D 已显示）滤掉 → 3D 不渲染。降到低于检测器阈值，
+        # 由几何校验（重投影误差/交会角）兜底。
+        res = triangulate_ball(single, self._triangulator, min_conf=0.15) if len(single) >= 2 else None
         if res is not None:
             X, conf, err, n_views, ang = res
             if self._ball_tracker is None:
@@ -609,6 +625,11 @@ class LiveControl:
             self._ball3d = None
             if self.viewer3d is not None:
                 self.viewer3d.set_ball(None)
+            # 诊断：检测到球但三角化失败（限频 1s，定位 3D 不显示原因）
+            if single and (self._ball_diag_t is None or time.time() - self._ball_diag_t >= 1.0):
+                self._ball_diag_t = time.time()
+                confs = {cid: f"{b[0].confidence:.2f}" for cid, b in balls_per_cam.items() if b}
+                print(f"[球诊断] {len(single)} 视角检出 conf={confs}，三角化失败（视角不足/交会角过小）")
 
     # ------------------------------------------------------------------
     # 鼠标：拖拽滑块
@@ -683,6 +704,14 @@ class LiveControl:
             cv2.circle(grid, (16, 16), 9, (0, 165, 255), -1)
             cv2.putText(grid, f"{n}", (32, 22), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (0, 165, 255), 2, cv2.LINE_AA)
+
+        # 球重建实际帧率（右上角，按 B 开启后显示）
+        if self.enable["ball"] and self._ball_fps is not None:
+            txt = f"BALL {self._ball_fps:4.0f} FPS"
+            gw = grid.shape[1]
+            (tw, _th), _baseline = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+            cv2.putText(grid, txt, (gw - tw - 12, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (0, 255, 0), 2, cv2.LINE_AA)
 
         # 触发信号报错叠加在画面上
         if self.trigger_error:

@@ -64,7 +64,7 @@ def _nms(xyxy: np.ndarray, confs: np.ndarray, iou_thresh: float) -> List[int]:
 
 
 _TRT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "tabletennis", "trt_engines")
-_SCALE = 1.0 / 255.0  # uint8 → [0,1] float
+_SCALE = np.float32(1.0 / 255.0)  # uint8 → [0,1] float（float32 避免走 float64 中间态，归一化快 ~2×）
 
 
 def _read_onnx_input(model_path: str) -> Tuple[str, list]:
@@ -83,6 +83,17 @@ def _read_onnx_input(model_path: str) -> Tuple[str, list]:
     return inp.name, dims
 
 
+def _rect_hw(imgsz: int, src_w: int, src_h: int, stride: int = 32) -> Tuple[int, int]:
+    """矩形输入尺寸 ``(H, W)``：长边缩放到 imgsz、短边按原图比例，向上对齐 stride 32。
+
+    相机固定 1440×1080（4:3），imgsz 作用于长边（宽 1440）。返回的 H/W 都是 32 的
+    倍数，letterbox 只需极小补边（替代正方形的大块 padding，省 ~25% 计算量）。
+    """
+    w = ((imgsz + stride - 1) // stride) * stride
+    h = ((int(round(src_h * imgsz / src_w)) + stride - 1) // stride) * stride
+    return h, w
+
+
 class YoloBallDetector(BallDetector):
     """ONNX YOLO 球检测器（无状态，可跨相机复用）。
 
@@ -99,11 +110,13 @@ class YoloBallDetector(BallDetector):
     def __init__(
         self,
         model_path: str,
-        imgsz: int = 1280,
+        imgsz: int = 960,
         conf_thresh: float = 0.25,
         iou_thresh: float = 0.45,
         refine: bool = True,
         backend: str = "auto",
+        rect: bool = True,
+        src_size: Tuple[int, int] = (1440, 1080),
     ) -> None:
         import onnxruntime as ort
 
@@ -118,6 +131,12 @@ class YoloBallDetector(BallDetector):
         self.iou_thresh = float(iou_thresh)
         self.refine_enabled = bool(refine)
         self.backend = backend
+        # 矩形输入（去 padding）：长边缩放到 imgsz、短边按原图 4:3 比例对齐 stride。
+        # rect=False 时回退正方形 imgsz×imgsz（旧行为）。
+        if rect:
+            self._rect_h, self._rect_w = _rect_hw(self.imgsz, src_size[0], src_size[1])
+        else:
+            self._rect_h = self._rect_w = self.imgsz
 
         # 创建 session 之前读输入 meta：通道数（1=灰度 / 3=彩色）与 batch 是否动态。
         self.input_name, in_dims = _read_onnx_input(model_path)
@@ -135,11 +154,12 @@ class YoloBallDetector(BallDetector):
         if use_trt:
             # 显式 TRT EP（FP16 + engine 缓存，与 rtmpose 的 _trt_session 一致）。
             # 首次构建引擎较慢，之后从缓存加载；构建失败 onnxruntime 自动回退 CUDA。
-            # 关键：缓存目录按 onnx 内容哈希分档。实测 onnxruntime 的 TRT 引擎缓存 key
-            # 只按图结构（不含权重）算——换权重不换 key 会静默复用旧引擎（推理白跑旧模型）。
-            # 按内容哈希分目录后，换权重必然换目录 → 必然重建，杜绝跨权重复用。
+            # 关键：缓存目录按 onnx 内容哈希 + 输入形状分档。onnxruntime 的 TRT 引擎缓存
+            # key 只按图结构（不含权重、不含 profile 形状）算——换权重 / 换输入分辨率
+            # 不换 key 会静默复用旧引擎。把内容哈希 + 形状标签都并入目录名，杜绝复用。
             onnx_hash = hashlib.md5(open(model_path, "rb").read()).hexdigest()[:16]
-            self.engine_cache_path = os.path.join(_TRT_CACHE_DIR, onnx_hash)
+            shape_tag = f"{self._channels}x{self._rect_h}x{self._rect_w}"
+            self.engine_cache_path = os.path.join(_TRT_CACHE_DIR, f"{onnx_hash}_{shape_tag}")
             os.makedirs(self.engine_cache_path, exist_ok=True)
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -149,13 +169,13 @@ class YoloBallDetector(BallDetector):
                 "trt_engine_cache_enable": True,
                 "trt_engine_cache_path": self.engine_cache_path,
             }
-            # 动态 batch 需配 profile（min/opt/max batch，H/W 固定到 imgsz）；灰度与彩色通用。
+            # 动态 batch 需配 profile（min/opt/max batch，H/W 固定到矩形输入尺寸）。
             if self._batch_supported:
-                c, sz = self._channels, self.imgsz
+                c, hh, ww = self._channels, self._rect_h, self._rect_w
                 trt_opts.update({
-                    "trt_profile_min_shapes": f"{self.input_name}:1x{c}x{sz}x{sz}",
-                    "trt_profile_opt_shapes": f"{self.input_name}:4x{c}x{sz}x{sz}",
-                    "trt_profile_max_shapes": f"{self.input_name}:8x{c}x{sz}x{sz}",
+                    "trt_profile_min_shapes": f"{self.input_name}:1x{c}x{hh}x{ww}",
+                    "trt_profile_opt_shapes": f"{self.input_name}:4x{c}x{hh}x{ww}",
+                    "trt_profile_max_shapes": f"{self.input_name}:8x{c}x{hh}x{ww}",
                 })
             providers = [
                 ("TensorrtExecutionProvider", trt_opts),
@@ -175,10 +195,10 @@ class YoloBallDetector(BallDetector):
 
         self.actual_provider = self.session.get_providers()[0]  # 供上层打印实际后端
 
-        # 预处理 buffer 复用：避免每帧 4 次 1280x1280 的临时数组分配（实测 ~27ms → ~5ms）。
-        # 通道数随模型自适应：灰度模型 (B,1,H,W)，彩色模型 (B,3,H,W)。
-        self._inp = np.empty((1, self._channels, self.imgsz, self.imgsz), dtype=np.float32)
-        self._inp_batch = np.empty((4, self._channels, self.imgsz, self.imgsz), dtype=np.float32)
+        # 预处理 buffer 复用：避免每帧临时大数组分配。通道数随模型自适应
+        # （灰度 (B,1,H,W) / 彩色 (B,3,H,W)），H/W 为矩形输入尺寸。
+        self._inp = np.empty((1, self._channels, self._rect_h, self._rect_w), dtype=np.float32)
+        self._inp_batch = np.empty((4, self._channels, self._rect_h, self._rect_w), dtype=np.float32)
 
     # -- 预处理 / 后处理（buffer 复用，GPU 不再是瓶颈时才轮到 TRT 生效） --
 
@@ -190,7 +210,7 @@ class YoloBallDetector(BallDetector):
         if gray.ndim == 3:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         H, W = gray.shape[:2]
-        lb, (r, dw, dh) = _letterbox(gray, (self.imgsz, self.imgsz))
+        lb, (r, dw, dh) = _letterbox(gray, (self._rect_h, self._rect_w))
         np.multiply(lb, _SCALE, out=dst[0])  # uint8 → float32，单遍、无中间数组
         for c in range(1, self._channels):
             dst[c] = dst[0]
