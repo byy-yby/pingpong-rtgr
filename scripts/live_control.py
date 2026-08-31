@@ -577,13 +577,13 @@ class LiveControl:
         if not frames_items:
             return
 
-        # 球重建实际帧率（EMA 平滑，显示在画面右上角）
+        # 球重建实际帧率 + 帧间隔（EMA 平滑；帧间隔喂卡尔曼 dt，否则默认 0.01 假设
+        # 100FPS，与实际 20~50FPS 不符 → 预测落后 + 快速球被门限误判为外点而冻结）
         _now = time.time()
-        if self._ball_fps_t is not None:
-            _dt = _now - self._ball_fps_t
-            if _dt > 0:
-                _inst = 1.0 / _dt
-                self._ball_fps = _inst if self._ball_fps is None else 0.9 * self._ball_fps + 0.1 * _inst
+        _dt = (_now - self._ball_fps_t) if self._ball_fps_t is not None else None
+        if _dt is not None and _dt > 0:
+            _inst = 1.0 / _dt
+            self._ball_fps = _inst if self._ball_fps is None else 0.9 * self._ball_fps + 0.1 * _inst
         self._ball_fps_t = _now
 
         # 4 相机 batch 一次推理（灰度模型 1 通道更轻，batch 省 3 次 session.run 固定开销；
@@ -615,13 +615,13 @@ class LiveControl:
             if self._ball_tracker is None:
                 from tabletennis.reconstruction import BallTracker
                 self._ball_tracker = BallTracker()
-            X = self._ball_tracker.update(X, float(conf))
+            X = self._ball_tracker.update(X, float(conf), dt=_dt)
             self._ball3d = X
             if self.viewer3d is not None:
                 self.viewer3d.set_ball(X)
         else:
             if self._ball_tracker is not None:
-                self._ball_tracker.update(None, 0.0)   # 本帧无观测，内部 coast
+                self._ball_tracker.update(None, 0.0, dt=_dt)   # 本帧无观测，内部 coast
             self._ball3d = None
             if self.viewer3d is not None:
                 self.viewer3d.set_ball(None)
