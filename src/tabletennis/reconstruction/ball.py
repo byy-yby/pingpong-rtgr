@@ -48,30 +48,40 @@ def triangulate_ball(
 ) -> Optional[Tuple[np.ndarray, float, float, int, float]]:
     """把多视角球检测三角化成 3D 球心。
 
+    与姿态三角化共用 :meth:`MultiViewTriangulator.triangulate_batch`（同一个批量
+    DLT 核心）：把各视角球心去畸变后打包成 ``(1, n_cams, 2)`` 单点批量，一次求解。
+
     Args:
         balls: ``{cam_id: Ball2D}``，各视角检测到的球（同一触发时刻）。
         triangulator: 已用内外参初始化的三角化器。
         min_conf: 球检测置信度下限，低于此的视角不参与。
-        **kwargs: 透传 :meth:`triangulate_point`（外点 / 交会角阈值）。
+        **kwargs: 透传 :meth:`MultiViewTriangulator.triangulate_batch`（外点 / 交会角阈值）。
 
     Returns:
         ``(X, conf, reproj_err, n_views, angle_deg)``，与 ``triangulate_point``
         一致；视角 < 2 或全部失败返回 None。
     """
-    points: Dict[int, Tuple[float, float]] = {}
-    confs: Dict[int, float] = {}
-    for cid, ball in balls.items():
-        if cid not in triangulator.P:
+    cam_ids = triangulator.cameras
+    n_cams = len(cam_ids)
+    uv = np.full((1, n_cams, 2), np.nan, dtype=np.float64)
+    conf = np.zeros((1, n_cams), dtype=np.float64)
+    for c, cid in enumerate(cam_ids):
+        ball = balls.get(cid)
+        if ball is None:
             continue
-        c = float(ball.confidence)
-        if c < min_conf:
+        cf = float(ball.confidence)
+        if cf < min_conf:
             continue
-        uv = undistort_ball_center(ball, triangulator.K[cid], triangulator.dist[cid])
-        if uv is None:
+        p = undistort_ball_center(ball, triangulator.K[cid], triangulator.dist[cid])
+        if p is None:
             continue
-        points[cid] = uv
-        confs[cid] = c
+        uv[0, c, 0] = p[0]
+        uv[0, c, 1] = p[1]
+        conf[0, c] = cf
 
-    if len(points) < 2:
+    X, conf3, err, nviews, angle = triangulator.triangulate_batch(
+        uv, conf, min_conf=min_conf, **kwargs
+    )
+    if nviews[0] < 2:
         return None
-    return triangulator.triangulate_point(points, confs, min_conf=min_conf, **kwargs)
+    return (X[0], float(conf3[0]), float(err[0]), int(nviews[0]), float(angle[0]))
