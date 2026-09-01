@@ -2,122 +2,129 @@
 
 本文件供 Claude Code 阅读，记录项目结构、SDK 用法、踩坑与约定。README.md 是给人看的，这里记开发时需要的硬事实。
 
-## 项目现状
+## 项目现状（截至 2026-09-01，已全链路跑通）
 
-- **已完成**：
-  - 相机控制模块（`src/tabletennis/camera/`）——开关、外部/软件触发、图像参数、
-    多机管理，脚本 `list_cameras` / `grab_preview` / `grab_sync` / `query_parameters`、测试、文档。
-  - 交互式控制 `scripts/live_control.py`——四机 2×2 平铺 + trackbar 调曝光/增益/伽马 +
-    键盘切检测开关 + 外部触发信号自检。
-  - 视觉模块 `vision/`——**RTMPose-l-halpe26 2D 姿态（26 点）已实现**；球只有抽象接口。
-  - 可视化模块 `visualization/`——2D 骨架叠加（`overlay2d.py`）+ Open3D 3D 场景
-    （`viewer3d.py`：相机视锥 + 标准尺寸球桌）。
-  - 相机内参标定——`src/tabletennis/calibration/`（棋盘格张正友标定）+ `scripts/calibrate_intrinsics.py`
-    （PySide6 GUI），已并入本包。
-  - 多相机外参标定——`src/tabletennis/calibration/extrinsics.py`（ChArUco 板，
-    `compute_relative_extrinsics` 求相机间相对外参，世界系=参考相机）+ `scripts/calibrate_extrinsics.py`
-    （PySide6 GUI：四路预览 + Enter 拍不同板位姿 + C 求相对外参 + Open3D 相机位置；T 桌面定原点 + 3D 球桌）。
-  - 球桌识别 + 场景可视化——`vision/table/`（两个大 ArUco 标记定桌面世界系）+
-    `live_control.py` 按 T：四机视角画桌面边框 + 生成 Open3D 3D 场景（相机 + 标准尺寸球桌）。
-  - 人体姿态 2D→3D 重建——`reconstruction/`（`triangulate.py` 置信度加权多视角 DLT +
-    去畸变/交会角质量；`associate.py` 跨视角实例匹配；`load_camera_rig` 读标定）+ 3D 骨架
-    实时渲染（`viewer3d.py` 新增 `add_skeleton_layer` / `set_skeletons`）+ 入口
-    `scripts/reconstruct_pose.py`（`--synthetic` 无硬件自检）。世界系用
-    `data/extrinsics/table_extrinsics.yaml`（桌面系，与 3D 场景一致）。
-- **未开始**：球检测、球 3D 轨迹重建、严格按时间戳对齐的通用组帧（`pipeline`）。
-  `pipeline` 目录尚未建；`reconstruction` 已建（姿态部分完成）。
+- **相机控制** `src/tabletennis/camera/` —— 开关、外部/软件触发、图像参数、多机管理。
+  脚本 `list_cameras` / `grab_preview` / `grab_sync` / `query_parameters`。
+- **交互式控制** `scripts/live_control.py` —— 四机 2×2 平铺 + trackbar 调参 + 检测开关 + 外部触发自检。
+- **姿态 2D** `vision/pose/rtmpose_pose.py` —— RTMPose-l-halpe26（26 点），top-down。
+  **人检测默认换 `yolo11n-gray`**（1ch 灰度原生），见「人检测」节。
+- **球检测** `vision/ball/` —— 三条路线都实现：经典 CV、YOLO（yolov8n）、灰度 yolo11n（1ch）。
+- **球 3D 重建** `reconstruction/ball.py` + `scripts/reconstruct_ball.py` + live_control 按 b —— 三角化 + 红球渲染。
+- **姿态 2D→3D 重建** `reconstruction/triangulate.py`（置信度加权多视角 DLT，已向量化）+ `associate.py`（跨视角匹配）+ `pose_track.py`（PoseTracker 身份跟踪）。
+- **相机标定** 内参（棋盘格张正友）+ 外参（ChArUco 板 `compute_relative_extrinsics`）+ 桌面定原点（4 大 ArUco 标记）。
+- **球桌识别 + 场景可视化** `vision/table/` + `viewer3d.py`（相机视锥 + 球桌 + 骨架 + 球图层）。
+- **TensorRT 全链路部署** 姿态 YOLOX + RTMPose 已上 TRT FP16，球 YOLO 也上 TRT。
+- **性能优化报告** `docs/optimization_report.md`（球+姿态 profiling 与加速方案，权威数字在此）。
+
+无 `pipeline/` 包——项目走**脚本式编排**（`scripts/reconstruct_pose.py` / `reconstruct_ball.py` 里各自一个 `Reconstruct*` 类），不另建 pipeline 包。分层：`core` → `camera` / `vision` / `calibration` / `reconstruction` / `visualization`，下层不依赖上层。
+
+## 视觉 / 重建子系统（本项目的核心）
+
+### 球检测：三条路线
+
+注册在 `vision/detector.py`：`register_detector("ball", ...)`（经典）、`register_detector("ball_yolo", ...)`（YOLO）。
+
+1. **经典路线** `vision/ball/classical_ball.py::ClassicalBallDetector`
+   —— 运行均值背景减除 + 相邻帧差取并集 → 尺寸先验（半径 5~15px，面积 78~707px²）滤候选
+   → `refine_ball_center` 亚像素质心。无模型权重、纯 numpy+cv2、CPU 可跑、零标注。
+   有状态（跨帧维护背景），`_bg/_prev` 按 `camera_id` 分 dict，单实例可跨 4 相机复用（曾因不按相机分背景导致串扰）。局限：先验弱，手指/拍边/反光/阴影易误检。
+2. **YOLO 路线** `vision/ball/yolo_ball.py::YoloBallDetector`
+   —— onnxruntime 加载训练导出的单类 `best.onnx`（输出 `(1,5,N)`），bbox 后接 `refine_ball_center` 亚像素精修。
+   backend 默认 `"auto"`→TRT FP16，`"tensorrt"/"cuda"/"cpu"` 可选，预分配 buffer 复用。
+   无 torch 运行时依赖（onnxruntime 即可）。
+3. **灰度 yolo11n（1ch）路线** `scripts/train_ball_gray.py` 训练
+   —— yolo11n-grayscale 1 通道单类微调，**通道自适应**（`yolo_ball.py` 按 ONNX 输入通道数 1ch/3ch 自动适配，1ch 不再复制成 3 通道，输入 tensor 18.75MB→6.27MB）。
+
+**权重与缓存**：
+- yolov8n@1280（3ch）：`runs/detect/ball/weights/best.onnx`（12.8MB），mAP50 **0.961** / mAP50-95 **0.849**；真图抽检 76/76 检出、球心中位误差 0.2px、0 误检。
+- 灰度 yolo11n 1ch：`runs/detect/ball_gray/weights/best.onnx`，mAP50 **0.9677** / mAP50-95 **0.8538**（略优）。
+- 训练权重 `best.pt` 在各 `runs/detect/*/weights/` 下；`*.pt`/`*.onnx`/`runs/` 均 gitignored，需重训/重导。
+- TRT 引擎缓存 `~/.cache/tabletennis/trt_engines/<onnx内容哈希>/`（按 onnx 内容哈希分目录，换权重/换输入形状必重建，杜绝静默复用旧引擎）。
+
+**推理配置现状**：imgsz **1280 矩形**（长边 1280、短边按 4:3 → 1280×960，去 padding），conf 阈值 **0.2**。
+960 矩形（~145FPS）因小球缩到 8~16px（YOLO 最小尺度 stride=8）会间歇性单相机漏检致三角化失败，已回退 1280（球 10.7~21px，~90FPS）。要兼得速度需重训 960（`train_ball_gray.py` 改 imgsz=960）。
+
+**部署链路**（live_control 按 b）：后台线程 `_ball_load_worker` 建 session（TRT 引擎缓存命中秒开）+ 首帧热启动 → 逐相机**顺序** detect（4 路 ~75ms≈13FPS；`detect_batch` 4 相机批处理与顺序持平且相机丢帧会触发新形状引擎重建 ~55s，故热路径用顺序）→ `triangulate_ball` DLT → `viewer3d` 红球。`BALL_ONNX` 环境变量可覆盖模型路径。
+
+**数据/训练管线**：live_control 按 r 录制（或 `capture_ball.py`，存 PNG + 可选经典检测预标注）→ `label_ball.py` 拖框标注 → `normalize_ball_boxes.py` 手绘框统一为正方形（refine 精修球心+半径、边长 2.4×r）→ `augment_ball.py` 增强（3000→12000，几何+光度）→ `train_ball.py` 训练（yolov8n）/`train_ball_gray.py`（yolo11n 1ch）→ `fix_onnx_dynamic.py` 修 h/w → 部署。
+
+### 球重建线程（`_ball_recon_loop`）
+
+`live_control.py` 球开启时：独立后台线程 `_ball_recon_loop` 负责「逐相机**非阻塞**取帧 → detect_batch → DLT 三角化 → 更新 `self._latest`」，主循环只读它做 2D 显示 + 姿态重建 + 交互。**无卡尔曼**（逐帧纯 DLT，用户要求；早前的卡尔曼曾因 dt 写死 0.01 假设 100FPS 导致快速球被 0.5m 门限误判冻结）。球 3D 更新 ~140Hz（受相机 100Hz 出帧约束）。三角化 `min_conf=0.15`（曾 0.3 与检测器 conf 0.25 不匹配导致 conf 0.25~0.3 的球 2D 有 3D 被滤）。球轨迹 LineSet 已移除（200 点淹没 2cm 小球），只留红球。`[球诊断]` 每 2 秒打印重建速率与单次 detect_batch+DLT 耗时。
+
+> ⚠️ 曾试 `get_synchronized_bundle`（清队列+阻塞取下一帧）反而引入 ~10ms 开销致 <50Hz，已回退逐相机非阻塞取帧。
+
+### 人检测：yolo11n 灰度（默认）
+
+`vision/pose/rtmpose_pose.py` 的 `RTMPoseDetector` 默认 `det="yolo11n-gray"`（`vision/pose/yolo11_person.py::Yolo11PersonDetector`），替换 rtmlib YOLOX(humanart)：
+- **1ch 灰度原生**（第一层卷积 1→16，COCO-80 person=类0，2.62M 参数），消除 gray→3ch 复制与 domain gap；TRT FP16 + 4 相机 batch。实测人检测 **12.8→6.7ms/轮**。
+- 三处提速：① `conf_thresh` 0.35→**0.5**（对齐旧 YOLOX，0.35 太松致 RTMPose 裁剪数翻倍）；② RTMPose 预处理归一化 float64→**float32 就地算**（省 ~1ms）；③ 人检测 imgsz **640→416**（人够大，检测段 5.1→2.5ms）。
+- ONNX 在 `~/.cache/tabletennis/yolo11n_grayscale_person_416.onnx`（`scripts/export_yolo11_person.py` 从 `data/weights/gray/yolo11n-grayscale.pt` 导出，`fix_onnx_dynamic.py --ch 1` 修 h/w；gitignored 需重导）。`det="yolox-tiny"` 分支保留作回退。
+- 真实含人帧 `detect_batch`(4 相机) 优化后 ~10.0ms + 重建 1ms ≈ **~90fps**。
+
+### 三角化：已向量化
+
+`reconstruction/triangulate.py::MultiViewTriangulator`：
+- `triangulate_batch`（姿态/球统一走它）——26 关节堆成 `(26,8,4)` 一次性 4×4 gram `np.linalg.eigh` 最小特征向量（等价 DLT 最小奇异解），重投影/交会角/置信度全向量化。姿态 **6.5→0.43ms/人（~12×）**，球 0.33ms（单点无回归）。
+- 最差视角重投影 >12px 时逐点回退到 `triangulate_point`（保证与旧输出一致，坐标差 1e-12mm 级）。
+- `mean_conf` 曾用 `conf.sum()` 把遮挡相机置信度也算进去 → 改只对有效视角取均值（差分测试抓到的真 bug）。
+- 单球无需跨视角匹配（每相机最多 0/1 检测，直接 `{cam_id: Ball2D}` 喂三角化）；`associate.py::match_people` 只用于多人姿态。
+
+### 可视化 `viewer3d.py`（Open3D）
+
+- 默认视角：`up=(0,0,1)`（Z 竖直）、`set_front(front=[1,1,0.9])`——**`set_front` 传的是「从 lookat 指向相机」的方向**，`[1,1,0.9]`（+Z 朝上）= 相机在 +X+Y+Z 斜上方俯瞰球桌（此前 `[-1,-1,-0.9]` 会让相机跑到桌面下方仰视）。R 复位即回此视角。
+- 键盘：`VisualizerWithKeyCallback` + **W/A/S/D 平移、方向键旋转、+/− 缩放、R 复位**。**translate 的 +y 才是「向上」**（W=`translate(0,+step)`、S=`translate(0,-step)`，曾写反）。
+- 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）。
+- 每个方法里自己 `o3d = _o3d()` 惰性 import（`_update_ball_geometry` 曾漏写致渲染线程 NameError 窗口退出）；Open3D 窗口必须在主线程开，后台线程只加载模型。
 
 ## 标定工具的归属（易混）
 
 标定在本包内，分两层（都复用 `camera/mv_import/`，只吃灰度图）：
 
-- **内参** `src/tabletennis/calibration/intrinsics.py`：棋盘角点 + 张正友标定，产出 `CameraIntrinsics`；
-  GUI `scripts/calibrate_intrinsics.py`（四路预览 + 点击选中 + Enter 采集）。普通棋盘格
-  8×12 内角 / 30mm/格，见 `config/calibration.yaml`。
-- **外参** `src/tabletennis/calibration/extrinsics.py`：ChArUco 检测 + solvePnP 求「板→相机」位姿，
-  `compute_relative_extrinsics` 由多组板位姿求相机间相对外参（世界系=参考相机），产出 `CameraExtrinsics`；
-  GUI `scripts/calibrate_extrinsics.py`（四路预览 + Enter 拍不同板位姿 + C 求相对外参 + Open3D 相机位置；
-  T 桌面定原点 + Open3D 球桌 + 四路画桌面边框/球网）。外参与桌面定位**完全分开**。
-  参数见 `config/extrinsics.yaml`（含 `reference_camera`）。
-
-早前曾有独立的 `/home/yby/camera_calibration/` 桌面工具与 ChArUco 占位，现已统一到本包。
+- **内参** `src/tabletennis/calibration/intrinsics.py`：棋盘角点 + 张正友标定，产出 `CameraIntrinsics`；GUI `scripts/calibrate_intrinsics.py`。普通棋盘格 8×12 内角 / 30mm/格，见 `config/calibration.yaml`。
+- **外参** `src/tabletennis/calibration/extrinsics.py`：ChArUco 检测 + solvePnP 求「板→相机」位姿，`compute_relative_extrinsics` 由多组板位姿求相机间相对外参（世界系=参考相机），产出 `CameraExtrinsics`；GUI `scripts/calibrate_extrinsics.py`（Enter 拍板位姿 / C 求相对外参 / **T 桌面定原点**）。
+- **桌面定位与外参完全分开**：桌面用 **4 个不同 ID 大标记**（ID0/1/2/3，18cm 黑块 + 2cm 白边）放四角，`build_table_frame_from_corners` **只用角点位置**（不依赖标记朝向），`fuse_marker_poses` 三角化射线求交消除单标记弱深度。`localize_table_bundle` 为标定脚本与 live_control 共用的单一实现，按 T/t 都写 `table_extrinsics.yaml`（世界系=桌面，X 短边/Y 长边/Z 向上）。
 
 ### ChArUco 外参的坑（OpenCV 5.0）
 
-- 本机 OpenCV 是 **5.0.0**，旧 aruco API（`detectMarkers` / `interpolateCornersCharuco` /
-  `estimatePoseCharucoBoard`）**已移除**，只能走 `CharucoBoard` + `CharucoDetector`：
-  `detectBoard` → `matchImagePoints` → `solvePnP`（`extrinsics.py` 已封装）。
-- 标定板 13x9 有 **58 个标记**，字典必须 ≥58（`DICT_*_50` 只有 50 个不够，`create_board` 会报错）。
-- `square_length_m` / `marker_length_m` / `dictionary` / `legacy_pattern` 必须与实际打印板一致；
-  `--generate-board` 可生成与配置一致的板，重新打印保证匹配。
-- 球桌定原点（`scripts/calibrate_extrinsics.py` 的 `T` 键）：两个大 ArUco 标记（如
-  `DICT_5X5_50` 的 ID0/ID1）平放对角线两角，`extrinsics.build_table_frame` 用两标记
-  平均法向/平均 X 轴构造桌面系（原点=标记0左上角，**X 沿短边、Y 沿长边、Z 向上**，
-  即标记 X 轴做桌面 Y、桌面 X 用 Y×Z 导出），写 `table_extrinsics.yaml`。
-  `--generate-markers` 生成带朝向标注的大标记图。
-- **单标记 pose 别用 `SOLVEPNP_IPPE_SQUARE`**：它要求对象点以标记**中心**为原点
-  （`[-L/2,L/2,0]...`）；本包 `estimate_marker_pose` 用**角点原点**对象点，配 `SOLVEPNP_IPPE`
-  （平面 4 点、自动消歧）。用错 IPPE_SQUARE 会得到 z≈0 的错误位姿。
-- **桌面大标记 vs 标定板字典冲突**：桌面标记用 `DICT_5X5_50` 的 ID0/ID1，标定板用
-  `DICT_5X5_250`——前者是后者的**子集**，两者 0/1 号图案完全相同。标定板若放在桌上，
-  `detect_markers(DICT_5X5_50)` 会把板上的 0/1 号格子误当成桌面标记。已用**几何校验**
-  兜底：两个大标记必须相距≈桌面对角线（`expected_marker_distance_m`，默认 3.136m，
-  容差 `marker_distance_tol_m`=0.5m），不符即拒绝（`TableDetector` 与
-  `calibrate_extrinsics.py` 的 `_register_table` 都已加）。彻底解法是重打一套与板
-  字典不重叠的桌面标记（如 `DICT_6X6_*`）。
+- 本机 OpenCV **5.0.0**，旧 aruco API 已移除，只能 `CharucoBoard` + `CharucoDetector`：`detectBoard` → `matchImagePoints` → `solvePnP`。
+- 标定板 13x9 有 **58 个标记**，字典必须 ≥58（`DICT_*_50` 不够会报错）。
+- `marker_length_m` **不影响检测**（只影响物理尺度换算）；决定检测成败的是 `dictionary` / `legacy_pattern` / `squares_x/y`。`legacy_pattern: true` 用于 OpenCV <4.6 生成的板。
+- `calibrateCamera` 要求物点/像点 **float32**（Point3f/Point2f），传 float64 报错。
+- **单标记 pose 别用 `SOLVEPNP_IPPE_SQUARE`**（要求对象点以标记中心为原点）；本包用**角点原点**对象点配 `SOLVEPNP_IPPE`。用错得到 z≈0 错误位姿。
+- **桌面「上」要取反**：`estimate_marker_pose` 对象点「角点原点 + Y 向下」→ 标记 Z=X×Y 指向标记内部，平放时朝下，`build_table_frame` 必须取反 Z（否则球网朝下、桌腿朝上）。
+- **大标记需要白边（quiet zone）**：黑方块四周必须被白包围否则检测不到；`white_border_m` 让原点落在白边外角（`t` 往标记 -X/-Y 各退白边宽）。
+- **桌面大标记 vs 标定板字典冲突**：桌面标记 `DICT_5X5_50` 的 ID0-3 是标定板 `DICT_5X5_250` 的**子集**，图案逐像素相同 → 桌角大标记会污染 `detectBoard`，致 Enter 找不到板 / 外参旋转错（相机平面被「掰斜 60°」）。已用**几何校验**兜底（两标记相距≈桌面对角线 3.136m，容差 0.5m），标外参时盖住大标记；彻底解法重打 `DICT_6X6_*`。且错误结果会被按 T **写进 `table_extrinsics.yaml` 持久化**（「重新打开位置不变」不是缓存，是读同一个写错的 yaml）。
+- **单标记弱深度**：8.4cm 标记在 3m 外 ~50px，深度误差放大 ~6%（十几厘米）系统偏差 → 桌面原点错，需三角化射线求交（每标记 ≥2 台相机看到才准）。
 
 ## 硬件 / 环境事实
 
-- 相机：4 × 海康 **MV-CS016-10UM**，USB3，**黑白**（Mono），1.6MP 面阵。
-  `lsusb` 显示 `2bdf:0001 Hikrobot`。
-- SDK：海康 **MVS V4.8.0**，装于 `/opt/MVS`。
-  - `.so`：`/opt/MVS/lib/64/libMvCameraControl.so`（软链 → `.so.4.8.0.3`）。
-  - Python 绑定源码：`/opt/MVS/Samples/64/Python/MvImport/`（已 vendor 进 `camera/mv_import/`）。
-  - Python 开发指南：`/opt/MVS/doc/工业相机Linux SDK开发指南V4.8.0（Python）/html`。
-- 关键环境变量（shell profile 已配好）：
-  - `MVCAM_COMMON_RUNENV=/opt/MVS/lib` —— **决定 .so 加载路径**，缺失会 TypeError。
-  - `LD_LIBRARY_PATH=/opt/MVS/lib/64:/opt/MVS/lib/32:...`
-  - `MVCAM_SDK_PATH=/opt/MVS`
-- Python：base 是 **3.14.6**（miniconda）。太新，open3d/torch/mediapipe 可能缺 wheels，
-  **务必用 Python 3.11 环境**（见 `environment.yml`，conda env 名 `tt`）。
-- GPU：已换 **RTX 5080**（Blackwell sm_120，驱动 580 / CUDA 13.0，16GB）。姿态估计已部署
-  GPU：onnxruntime-gpu 1.26（**最后一个支持 CUDA 12 的版本**，1.27 起切 CUDA 13）+ pip 的
-  `nvidia-*-cu12` 运行库（CUDA 12.9 / cuDNN 9.25）。`device` 默认 `cuda`，`backend` 支持
-  `tensorrt`（TensorrtExecutionProvider FP16，需 TensorRT 10.x 运行库，装
-  `tensorrt-cu12-libs==10.14.1.48`，其 wheel **3.96GB**、安装时从 pypi.nvidia.com 现下）。
-  **CUDA 13 的 nvidia pip wheel 尚未发布**（PyPI 上是 0.0.0a0 占位），所以别用 cu13。
-  实测：YOLOX TRT 11.3→2.26ms、RTMPose TRT 3.9→1.08ms、单相机 detect 端到端 14.6→8.0ms。
-  **坑**：mmpose SDK 的 YOLOX 烤入 EfficientNMS，预 NMS TopK K=5000 超 TensorRT 上限 3840，
-  走 TRT 会报 `K exceeds the maximum value allowed (3840)`，`_patch_yolox_for_trt` 把 K 改 3000
-  解决。详见 `vision/gpu_env.py` 与 `vision/pose/rtmpose_pose.py`。
-- **torch 训练栈（RTX 5080 用 CUDA 12.8）**：Blackwell sm_120 没有 cu121/cu124 的 wheel，
-  必须 `torch==2.11.0+cu128` + `torchvision==0.26.0+cu128`（cp311，2026-08 实测可用）。
-  网络是国内环境：**download.pytorch.org 被墙**（直连 ~247B/s），本地代理对国内镜像反而
-  拖慢，装包前必须 `export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= all_proxy= ALL_PROXY=`
-  清空代理。torch/torchvision 走阿里云 wheel 目录（扁平目录**不是**合法 simple-index，要用
-  `--find-links https://mirrors.aliyun.com/pytorch-wheels/cu128/`），其余依赖走
-  `--index-url https://mirrors.aliyun.com/pypi/simple`（完整 pypi 镜像）。tuna/阿里云对
-  >90MB 大文件偶发断连，小包可靠。
-  **省流量技巧**：环境里已有 onnxruntime-gpu 的 `nvidia-*-cu12` 运行库（cudnn 9.25/cublas
-  12.9 比 torch pin 的新版但 ABI 兼容），可 `--no-deps` 只装 torch+torchvision，再用 `ldd`
-  枚举 `torch/lib/libtorch_cuda.so` 缺的库逐个补：
-  - `libcusparseLt.so.0`→`nvidia-cusparselt-cu12==0.7.1`
-  - `libnccl.so.2`→`nvidia-nccl-cu12==2.28.9`、`libnvshmem_host.so.3`→`nvidia-nvshmem-cu12==3.4.5`、
-    `libcupti.so.12`→`nvidia-cuda-cupti-cu12`
-  - `libcufile.so.0`→**`nvidia-cufile-cu12`**（torch 的 `cuda-toolkit[cufile]` extra 映射到它，
-    不是 `nvidia-cuda-cufile-cu12` 也不是 `cuda-cufile-12-8`，后两者在 PyPI 上是 404）
-  triton（torch 的硬依赖，188MB）装不上也不影响普通训练，只有 `torch.compile` 才需要。
-  **磁盘告急**：多次装大 wheel 会把 `~/.cache/pip` 撑爆（曾到 7.1G，触发 Errno 28 磁盘满），
-  先 `pip cache purge`。训练脚本 `scripts/train_ball.py` 已加 `--patience` 早停。
+- 相机：4 × 海康 **MV-CS016-10UM**，USB3，**黑白**（Mono8），Sony IMX273 全局快门 1.6MP，1440×1080。最大 **249.1fps @ Mono8**，单帧 1.483MiB，单台满速 ~369MiB/s ≈ **3.1Gbps（一个 USB3 口）**。`lsusb` 显示 `2bdf:0001 Hikrobot`。
+- **触发同步**：信号发生器接相机 6-pin I/O **Line0**，实测出帧率 **100Hz**，四机同步误差 **~1µs 量级**（cam1/cam2 亚微秒；**cam3（SN DB1719717）最差** std 0.57~0.96µs、band 最大 3.2µs）。
+- **时间戳（重要，SDK 文档撒谎）**：
+  - `nHostTimeStamp` 实测是**毫秒级**（Unix epoch ms，分辨率 1ms），不是文档写的 µs；µs 级同步测量要用 `CLOCK_MONOTONIC` 在 `GetImageBuffer` 返回时自己打点。
+  - 设备时间戳是**原始 tick，约 10ns/tick（100MHz 计数器）**，跨相机绝对大小不可比（各机基准偏移 ~1.49s/0.79s/2.28s），只能比扣除基准后的 jitter/std。
+  - `nTriggerIndex` 恒为 0（未实现）；`TimestampReset` 节点不存在（报 `0x80000109` = `MV_E_GC_NODE_NOT_FOUND`）。
+  - **硬触发跨脉冲抓帧伪误差**：串行抓 4 台 ~255ms 会让各机抓到不同脉冲，主机到达差被混入 ±10ms 整周期；唯一可靠法是对实测周期**取模对齐**剥掉整周期假误差。
+  - 错误码：`0x80000203` = `MV_E_ACCESS_DENIED`（MVS 客户端独占相机时）；`0x80000109` = 节点不存在。
+- **USB3 拓扑（关键）**：4 相机满速 ~12.4Gbps。芯片组控制器聚合 ~800-900MiB/s 且 PCIe 3.0×4 与 SATA/网卡共享，只能稳妥挂 2 台。**推荐 2+2 分开插**（2 台 CPU 直连 + 2 台芯片组）；后置口：`SS`=芯片组 5G、`VR Ready SS`=CPU 直连 5G、`SS 10`(白框)=CPU 直连 10G、Flash BIOS 旁=USB2.0（**别插相机**）。USB2 口会把相机拖到 ~25fps 且整组同步掉速。4 台重复复位（`usb reset` 10-20 分钟成组）是 USB 链路不稳信号，指向带宽争抢或 12V 供电波动。
+- SDK：海康 **MVS V4.8.0**，装于 `/opt/MVS`。`.so` 在 `/opt/MVS/lib/64/libMvCameraControl.so`；Python 绑定 vendor 进 `camera/mv_import/`。关键环境变量 `MVCAM_COMMON_RUNENV=/opt/MVS/lib`（缺了 TypeError）、`LD_LIBRARY_PATH`、`MVCAM_SDK_PATH`。
+- Python：base **3.14.6** 太新，**务必用 conda 3.11 环境 `tt`**（`/home/yby/miniconda3/envs/tt/bin/python`）。
+- **相机参数持久化**：`config/camera_settings.json`（gitignored）保存曝光/增益/伽马，`core/config.py` 提供 `load/save/resolve_camera_settings`，优先级 **命令行 > 设置文件 > 默认（5000us/0dB/1.0）**。所有开相机脚本都从它读；**引入后 `cameras.yaml` 的 exposure/gain 段已成死代码**（只剩 trigger/pixel_format 有效）。
+- GPU：**RTX 5080**（Blackwell sm_120，16GB，驱动 580/CUDA 13.0）。onnxruntime-gpu **1.26**（最后一个支持 CUDA 12 的版本，1.27 起切 CUDA 13）+ `nvidia-*-cu12` 运行库（CUDA 12.9/cuDNN 9.25）。`device` 默认 cuda，`backend` 支持 `tensorrt`（TensorrtExecutionProvider FP16，需 TensorRT 10.x，装 `tensorrt-cu12-libs==10.14.1.48`）。**CUDA 13 的 nvidia pip wheel 未发布**（PyPI 是 0.0.0a0 占位）。实测：YOLOX TRT 11.3→2.26ms、RTMPose TRT 3.9→1.08ms、单相机 detect 端到端 14.6→8.0ms。
+  - **坑**：mmpose YOLOX 烤入 EfficientNMS，预 NMS TopK K=5000 超 TRT 上限 3840 → `_patch_yolox_for_trt` 改 3000。
+  - **坑**：TRT 引擎构建首次 30~60s（动态 batch 曾到 103s），进度提示要用 **print 而非 logger.info**（默认 logging 级别 WARNING 吞掉提示，用户误以为卡死）；缓存命中后 session 秒开。
+  - **坑**：onnxruntime provider 传 `get_available_providers()` 全量会静默走 TRT EP 建引擎 ~52s 卡主线程——要显式限定 provider + 模型创建/首帧热启动挪后台线程。
+  - **坑**：RTMPose 的 `_trt_session` 若未配动态 batch profile（`trt_profile_min/opt/max_shapes` 1/4/8）+ 预热只喂 batch=1 → 人数 1→2 时 batch 4→8 触发 TRT 引擎重建 30~40s 卡死。
+- **torch 训练栈（RTX 5080 用 CUDA 12.8）**：`torch==2.11.0+cu128` + `torchvision==0.26.0+cu128`。网络是国内环境：download.pytorch.org 被墙；装包前 `export http_proxy= https_proxy= ... all_proxy=` 清空代理（本机 SOCKS 127.0.0.1:7897 会让 huggingface_hub 崩溃）。torch 走 `--find-links https://mirrors.aliyun.com/pytorch-wheels/cu128/`（扁平目录不是 simple-index），其余 `--index-url` 阿里云 pypi。缺库用 `ldd libtorch_cuda.so` 枚举补齐（libcusparseLt/nccl/nvshmem/cupti/cufile，其中 cufile 正确包名是 `nvidia-cufile-cu12`）。triton 装不上不影响普通训练。**磁盘告急**：大 wheel 撑爆 `~/.cache/pip`（曾 7.1G 触发 Errno 28），先 `pip cache purge`。
+- 网络/数据集备选：公开乒乓球数据集（Roboflow `yolov8bigdataset`、Kaggle `ketzoomer/table-tennis-ball-position-detection-dataset`、HF `weslien/topspin-opentt-ball-subset`——HF 是 parquet 后端不能直接 clone 图、且 CC BY-NC-SA 非商用）；本机 SOCKS 代理对 httpx 崩溃，最终用户用自己录的数据。
 
 ## SDK 用法（已踩平的关键点）
 
 ### import 机制（`camera/sdk.py` 里集中处理）
-1. MVS 绑定在 import 时执行 `check_sys_and_update_dll()`，用
-   `os.getenv('MVCAM_COMMON_RUNENV') + "/64/libMvCameraControl.so"` 拼路径，
-   所以 **import 之前必须 setdefault 该变量**（sdk.py 已做）。
-2. `MvCameraControl_class.py` 内部是 `from PixelType_header import *` 这种
-   **绝对 import**，所以 **mv_import 目录必须先加进 sys.path**（sdk.py 已做）。
+1. MVS 绑定在 import 时执行 `check_sys_and_update_dll()`，用 `os.getenv('MVCAM_COMMON_RUNENV') + "/64/libMvCameraControl.so"` 拼路径，**import 前必须 setdefault 该变量**（sdk.py 已做）。
+2. `MvCameraControl_class.py` 内部是绝对 import，**mv_import 目录必须先加进 sys.path**（sdk.py 已做）。
 3. 其它模块一律 `from .sdk import ...`，不要直接碰 `mv_import`。
 
 ### 生命周期（顺序不能乱）
@@ -131,113 +138,75 @@ MvCamera.MV_CC_Finalize()
 ```
 
 ### 抓帧：用轮询，不用回调
-- 每相机一个线程 `MV_CC_GetImageBuffer(stFrame, timeout_ms)`（timeout 用 1000）。
-- 成功（ret==0）且 `stFrame.pBufAddr` 非空时：`ctypes.string_at(pBufAddr, nFrameLen)`
-  拷成 bytes → `np.frombuffer` → `.copy()`（**必须 copy**，SDK Free 后会复用缓冲）。
-- 有界队列 `queue.Queue(maxsize≈10)`，满则丢最旧（`camera.py::_put`）。
-- 回调式（`RegisterImageCallBackEx`）在 Python 里受 GIL 影响大，不推荐多机实时用。
+- 每相机一个线程 `MV_CC_GetImageBuffer(stFrame, timeout_ms=1000)`。
+- 成功且 `pBufAddr` 非空：`ctypes.string_at(pBufAddr, nFrameLen)` → `np.frombuffer` → `.copy()`（**必须 copy**，SDK Free 后复用缓冲）。
+- 有界队列 `queue.Queue(maxsize≈10)`，满则丢最旧。回调式受 GIL 影响大，不推荐多机实时用。
+- `--no-display` 下别在循环里 `drain()` 追生产速度清队列（会 688% CPU）；有界队列本来丢最旧帧。
 
 ### 触发（信号发生器，`camera/trigger.py`）
-外部触发接相机 **Line0**，标准 GenICam 节点串：
-```python
-SetEnumValueByString("TriggerMode", "On")
-SetEnumValueByString("TriggerSource", "Line0")     # 低延迟可换 Line2
-SetEnumValueByString("TriggerActivation", "RisingEdge")
-SetFloatValue("TriggerDelay", 0.0)
-SetBoolValue("TriggerCacheEnable", False)          # 关闭触发缓存，防攒帧
-SetEnumValueByString("LineSelector", "Line0")
-SetIntValueEx("LineDebouncerTime", 50)             # us，防误触发
-```
-- 软件触发调试：`TriggerSource=Software` + `SetCommandValue("TriggerSoftware")`。
-- 连续采集：`TriggerMode=Off`。
+外部触发接 **Line0**，标准 GenICam 节点串：`TriggerMode=On` / `TriggerSource=Line0` / `TriggerActivation=RisingEdge` / `TriggerDelay=0` / `TriggerCacheEnable=False` / `LineSelector=Line0` + `LineDebouncerTime=50`(us)。软件触发调试：`TriggerSource=Software` + `SetCommandValue("TriggerSoftware")`。连续采集：`TriggerMode=Off`。
 
-### 图像参数句柄（曝光/亮度/曝光补偿，`camera/parameter.py`）
-所有参数是 GenICam 节点，字符串 key + `MV_CC_Set/Get{Float,Int,Enum,Bool}Value`：
-
-| 参数 | 节点 | 类型 | 备注 |
-|---|---|---|---|
-| 曝光时间 | `ExposureTime` | Float(us) | 先关 `ExposureAuto` |
-| 自动曝光 | `ExposureAuto` | Enum(Off/Once/Continuous) | 手动前设为 Off |
-| 增益 | `Gain` | Float(dB) | 先关 `GainAuto` |
-| 自动增益 | `GainAuto` | Enum | |
-| 黑电平 | `BlackLevel` | Float | "曝光补偿"的暗部偏移 |
-| 伽马 | `Gamma` | Float | |
-| 亮度 | `Brightness` | Integer | **部分机型无此节点** |
-| 对比度 | `Contrast` | Float | |
-| 帧率 | `AcquisitionFrameRate` / `ResultingFrameRate` | Float(Hz) | 后者只读 |
-| 像素格式 | `PixelFormat` | Enum | 黑白固定 `Mono8` |
-
-- **黑白相机没有白平衡/饱和度**；调亮度 = 曝光 + 增益 + 黑电平 + 伽马。
-- **实测 MV-CS016-10UM**（2026-08-25 验证）：**没有 `BlackLevel` / `Brightness` / `Contrast` 节点**
-  （读回均为 None）；实际可调只有 `ExposureTime`(15μs~10s)、`Gain`(0~17dB)、`Gamma`(0~4)。
-  调亮度就用这三者；最高帧率 ~165Hz @1440×1080。
-- Get 返回的 `MVCC_FLOATVALUE{fCurValue,fMax,fMin}` / `MVCC_INTVALUE{nCurValue,nMax,nMin,nInc}`
-  自带范围，`parameter.py` 已封装成 `get_*_range()`。
-- 设置枚举用 `SetEnumValueByString`（比传 int 可读）；SDK 绑定方法内部已做
-  `strKey.encode('ascii')` / `byref(stValue)` / `c_float()` 等转换，**调用方直接传 Python 值**即可。
+### 图像参数句柄（`camera/parameter.py`）
+所有参数是 GenICam 节点，字符串 key + `MV_CC_Set/Get{Float,Int,Enum,Bool}Value`。**实测 MV-CS016-10UM 没有 `BlackLevel`/`Brightness`/`Contrast` 节点**（读回 None），实际可调只有 `ExposureTime`(15µs~10s)、`Gain`(0~17dB)、`Gamma`(0~4)。黑白相机无白平衡/饱和度；调亮度=曝光+增益+伽马。Get 返回 `MVCC_FLOATVALUE{fCurValue,fMax,fMin}` 自带范围。枚举用 `SetEnumValueByString`。
 
 ### 像素 / 帧结构
-- 黑白相机用 `Mono8`（值 `17301505`），帧缓冲 = H×W 字节。
-- `MV_FRAME_OUT.pBufAddr` + `stFrameInfo`（`MV_FRAME_OUT_INFO_EX`）含：
-  `nWidth/nHeight/nFrameNum/nDevTimeStampHigh/nDevTimeStampLow/nHostTimeStamp/nFrameLen/enPixelType`。
-- 设备时间戳 = `(nDevTimeStampHigh << 32) | nDevTimeStampLow`，用于四机同步判断。
+- 黑白用 `Mono8`（值 17301505），帧缓冲 = H×W 字节。
+- `MV_FRAME_OUT.pBufAddr` + `stFrameInfo`（`MV_FRAME_OUT_INFO_EX`）含 `nWidth/nHeight/nFrameNum/nDevTimeStampHigh/nDevTimeStampLow/nHostTimeStamp/nFrameLen/enPixelType`。设备时间戳 = `(nDevTimeStampHigh << 32) | nDevTimeStampLow`（10ns/tick，见上）。
 
 ## 约定
 
-- 分层：`core`（数据类型）→ `camera` / `vision` / `calibration` / `reconstruction` /
-  `visualization` → `pipeline`（编排）。下层不依赖上层，跨层共享类型放 `core/types.py`。
+- 分层：`core` → `camera` / `vision` / `calibration` / `reconstruction` / `visualization`。下层不依赖上层，跨层共享类型放 `core/types.py`。无 `pipeline/` 包，脚本式编排。
 - 脚本用 `sys.path.insert(0, "<project>/src")` 引导 import；测试用 `tests/conftest.py`。
-- 相机模块所有对 SDK 的 import 都收敛在 `camera/sdk.py`。
-- 视觉检测器走**注册工厂**：`vision/detector.py` 里的 `register_detector(kind, factory)` /
-  `create_detector(kind)`。上层（`live_control.py`）按名字取，未注册时 `create_detector`
-  返回 `None`，调用方据此提示「接口已定义、算法待实现」。新算法实现后只需 `register_detector`
-  一行，脚本无需改。当前已注册 `pose`（RTMPose-l-halpe26，26 点）与 `table`
-  （球桌识别，`TableDetector.load_default()` 自动加载标定数据），`ball` 待注册。
-- 每个模块目录都有 `README.md`（作用 / 用法 / 未完成），改完模块记得同步更新它。
+- 相机模块所有对 SDK 的 import 收敛在 `camera/sdk.py`。
+- 视觉检测器走**注册工厂**：`vision/detector.py` 的 `register_detector(kind, factory)` / `create_detector(kind)`。已注册 `pose`（RTMPose-l-halpe26 + yolo11n-gray 人检测）、`table`（`TableDetector.load_default()` 自动加载标定）、`ball`（经典）、`ball_yolo`（YOLO）。未注册返回 None，调用方提示「接口已定义、算法待实现」。
+- 每个模块目录都有 `README.md`（作用/用法/未完成），改完模块同步更新。
 
 ## 踩坑记录 / TODO
 
-- [ ] **Python 3.14 太新**：装 open3d/mediapipe 前先建 3.11 环境。
-- [ ] **udev 权限**：若 `list_cameras.py` 枚举为 0，大概率是 USB 设备无访问权限，
-  需装海康 udev 规则（`/opt/MVS/driver`）或 `sudo chmod`，见验证章节。
-- [ ] **四机同步**：`get_latest_bundle` 仍只取各机最新帧；外参标定已改用
-  `get_synchronized_bundle`（清队列 + 各取下一帧 = 同一触发周期）。通用的按
-  `device_timestamp` 最近邻配对仍待 pipeline 阶段。
-- [ ] **USB3 带宽**：4 × 1.6MP 高帧率同时出图可能撞带宽墙，必要时降帧率或
-  用 `TriggerDelay` 错峰。
-- [ ] **单通道喂模型**：本机是黑白 Mono8，RTMPose 训练在 RGB 上，`rtmpose_pose.py` 里把灰度
-  复制成 3 通道再送模型（存在 domain gap，靠固定短曝光 + 补光缓解）。
-- [x] **RTMPose 性能**：已上 TensorRT——YOLOX 11.3→2.26ms、RTMPose 3.9→1.08ms、单相机
-  detect 端到端 14.6→8.0ms（GPU 不再瓶颈，剩余是 CPU 预处理/NMS 开销）。YOLOX 因烤入
-  NMS 的 TopK-5000 走 TRT 需先 patch 成 3000（`_patch_yolox_for_trt`）。要再提速：
-  ① 换 RTMO（one-stage，砍掉 YOLOX+逐人 RTMPose）；② 已做：YOLOX 动态 batch 重导出（下条）。
-  4 机 `detect_batch` 目前 ~42ms/轮（TRT，~24 轮/s），剩余瓶颈在 RTMPose batch + CPU 前后处理。
-- [x] **YOLOX 动态 batch 重导出**：`scripts/export_yolox_dynamic_batch.py` 用纯 PyTorch
-  重建 YOLOX-tiny（CSPDarknet+YOLOXPAFPN+YOLOXHead，命名与 mmdet state_dict 严格一致、
-  strict 加载 humanart pth），导出**动态 batch** ONNX（~667KB，opset 18）到
-  `~/.cache/tabletennis/yolox_tiny_dynamic_416.onnx`，输出 (B,3549,85) 不烤 NMS（NMS 上层
-  numpy 逐类做）。三个关键坑：① **不烤 /255**——humanart 的 DetDataPreprocessor 没配
-  mean/std，训练吃 0-255 原图，烤了会 0 检出；② decode 用 **cell 左上角约定
-  center=(delta+grid)×stride**（不加 0.5，与 rtmlib 一致；mmdet 的 grid+0.5 会偏 ~24px，
-  实测 IoU 0.824 vs 1.000）；③ TRT 动态 batch 需配 profile
-  `trt_profile_min/opt/max_shapes="input:1x3x416x416"/"4x"/"8x"`。已集成进
-  `RTMPoseDetector._det_batch_session`（非 CPU 且 det_input_size=416 时自动建，缺失回退逐帧）：
-  `detect_batch` 把有效帧堆成 (B,3,416,416) 一次 forward。实测（4 帧 batch）：CUDA EP
-  **47.8ms**（vs 逐帧 CUDA ~250ms，5.2×）、TRT EP **42.5ms**（vs 逐帧 TRT 44.9ms，省 3 次
-  session.run 固定开销）；与逐帧路径关键点差 <1.7px。
-- [ ] **球检测**：接口已在 `vision/detector.py`（`BallDetector`），经典 CV 路线（阈值/连通域）
-  待接入 `register_detector("ball", ...)`。（球桌已实现并注册。）
-- [x] **YOLO 微调训练**（2026-08-31 完成）：`scripts/train_ball.py`（yolov8n.pt 预训练迁移，
-  imgsz 1280，single_cls，100 epochs，patience 早停）训练单类 ball。最终 mAP50 **0.961**、
-  mAP50-95 **0.849**；真实标注图抽检 76/76 检出、球心中位误差 0.2px、0 误检。最终
-  `best.pt` 训练后自动导出静态 batch-1 `best.onnx`（`train_ball.py` 收尾，无需
-  `dynamic=True`），已部署到主仓库 `runs/detect/ball/weights/best.onnx`（live_control 加载点）。
-  坑：**onnxruntime TRT 引擎缓存 key 只按图结构、不含权重**——换 onnx 权重必须换缓存，
-  `yolo_ball.py` 已按 onnx 内容哈希分目录（`~/.cache/tabletennis/trt_engines/<hash>/`）根治，
-  详见 `vision/ball/README.md` 第 5 条。torch 栈见「torch 训练栈」节。训练完重导 ONNX 时：用
-  `dynamic=True` 导出后必须跑 `scripts/fix_onnx_dynamic.py` 把 h/w 固化成静态（否则
-  TRT EP 静默回退 CUDA），并复制到主仓库 `runs/detect/ball/weights/best.onnx`；
-  TRT 引擎缓存会自动重建（后台线程，不卡 UI）。
-- [ ] 后续模块目录待建：`pipeline/`（`reconstruction/` 已建，姿态三角化 + 匹配完成）。
-- [ ] **姿态重建精度受相机距离限制**：相机距桌面约 3~6m（球在画面 ~12~24px），
-  合成 1.5px 噪声下 3D 关节误差约 cm 级；更精确需更高分辨率或更近的机位。
+### 时间戳 / 同步
+- [x] `nHostTimeStamp` 是 ms 非 µs；设备时间戳是 10ns/tick 原始计数；`nTriggerIndex` 恒 0；`TimestampReset` 不存在——同步测量靠 CLOCK_MONOTONIC + 取模对齐。
+- [ ] 通用的按 `device_timestamp` 最近邻组帧仍待 pipeline 阶段；当前 `get_latest_bundle` 取各机最新帧，外参标定用 `get_synchronized_bundle`（清队列+各取下一帧）。
+
+### 相机 / 环境
+- [ ] **Python 3.14 太新**：装 open3d/torch 前先建 3.11 环境 `tt`。
+- [ ] **udev 权限**：枚举为 0 大概率是 USB 无权限，装海康 udev 规则或 `sudo chmod`。
+- [ ] **USB3 带宽**：4 × 1.6MP 高帧率撞带宽墙；2+2 分开插、必要时降帧率/TriggerDelay 错峰。
+- [x] `config/camera_settings.json` 共享参数（`cameras.yaml` exposure/gain 已失效）。
+
+### 标定
+- [x] OpenCV 5.0 ChArUco 新 API、IPPE 坑、DICT 子集冲突、4 标记桌面定位——见「标定工具的归属」节。
+- [ ] cam_3 内参重投影 RMS 0.56px 偏高（远端 12px 处精度最差），可考虑重标；标定尺度基准（内参焦距/板格边长）偏导致 ~5.8% 尺度误差。
+
+### 视觉 / 球
+- [x] 球检测三路线 + 训练管线 + TRT 缓存哈希分目录 + 后台线程加载——见「球检测」节。
+- [ ] **960 重训**（~3.5h，`train_ball_gray.py` imgsz=960）：唯一能兼得 ~145FPS + 可靠检测的办法。
+- [ ] 录制 100fps 未做（PNG 编码 26ms/帧是瓶颈，改 JPG + 去预标注 + 录制剥离主循环）。
+- [ ] 多球检测未做（`label_ball.py` 只支持单框、跨视角多球关联未实现）。
+- [x] conf 阈值不匹配（detector 0.25 vs `min_conf` 0.3）→ `min_conf` 降到 0.15，靠重投影/交会角兜底。
+- [x] 卡尔曼 dt 写死 0.01 假设 100FPS 致快速球误判冻结 → 用实际帧间隔，最终整体移除卡尔曼走逐帧纯 DLT。
+
+### 视觉 / 姿态
+- [x] 人检测 yolo11n 灰度（`det="yolo11n-gray"` 默认）+ 三处提速 + conf 0.5 + float32 归一化——见「人检测」节。
+- [x] RTMPose 预处理瓶颈是**归一化**（uint8→float64 占 3.35ms 的 60%），不是 warp（0.09ms）；float32 就地算省 ~1ms。
+- [ ] RTMPose `_trt_session` 加动态 batch profile(1/4/8) + 预热 batch 8（避免人数变化触发引擎重建）。
+- [ ] YOLOX decode+NMS 上 GPU（`_yolox_decode_batch` numpy CPU 3.7ms → <0.5ms，零精度损失）。
+- [ ] 姿态最大机会：Fixed ROI（半固定机位砍掉整个 YOLOX 段 ~12ms + 删 match_people）未做；RTMO one-stage 候选。
+- [x] YOLOX 动态 batch 重导出（`export_yolox_dynamic_batch.py` 纯 PyTorch 重建，输出 `(B,3549,85)` 不烤 NMS）；三个坑：不烤 /255（humanart 训练吃 0-255）、decode 用 cell 左上角（center=(delta+grid)×stride 不加 0.5）、TRT profile min1/opt4/max8。
+
+### 可视化
+- [x] `set_front` 是「lookat→相机」方向（front=[1,1,0.9] 俯瞰）；translate +y 才是上（W/S 方向）。见「可视化」节。
+
+### 球 / 三角化
+- [x] 三角化向量化（`triangulate_batch`，姿态 12×、球持平）+ `mean_conf` 只对有效视角取均值——见「三角化」节。
+- [x] 单球无需跨视角匹配；依赖只有 numpy+opencv（无 scipy/torch/filterpy）。
+- [ ] 精度预算：相机距桌面 3~6m、球 12~24px，mm/px ≈ 1.7~3.3mm；合成 0.3px 噪声下 3D 球中位误差 ~0.68mm，姿态 cm 级。毫米级靠「短曝光(≤100µs)+补光+亚像素精修+4 视角过定 DLT」。
+
+### 训练 / 数据
+- [x] 训练管线（录制→标注→归一化→增强→训练→导出→fix h/w）；yolov8n mAP50 0.961、yolo11n-gray 0.9677。
+- [x] 增强旋转方向：cv2 旋转矩阵是 `[alpha beta; -beta alpha]`（y-down），与数学 CCW 相反；光度增强对 12~24px 小球要保守（强模糊/伽马/噪声会抹掉球）。
+- [x] ultralytics `dynamic=True` 导出 h/w 全动态 → TRT EP 静默回退 CUDA 不建引擎 → `fix_onnx_dynamic.py`（`--ch` 参数支持 1 通道）固化 h/w 仅 batch 动态。
+
+### GPU / 部署
+- [x] TensorRT 全链路（姿态 YOLOX+RTMPose、球 YOLO）；onnxruntime-gpu 1.26(CUDA12)；TopK patch；引擎缓存哈希分目录。
+- [ ] 实时 GPU 争用待确认：若 detect_batch 实测 ~14ms（而非基准 6.9ms）说明 Open3D 渲染和 TRT 抢 GPU，需调低 3D 渲染频率或 `nvidia-smi -lgc` 锁频消降频抖动。
+- [x] 性能优化全景见 `docs/optimization_report.md`（球 4 项 + 姿态 3 项，12FPS → 40~90FPS 路径）。
