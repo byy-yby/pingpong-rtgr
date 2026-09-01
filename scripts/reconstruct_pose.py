@@ -43,6 +43,7 @@ from tabletennis.reconstruction import (
     MultiViewTriangulator,
     load_camera_rig,
     match_people,
+    match_people_fixed,
 )
 from tabletennis.visualization.overlay2d import annotate_frame, draw_pose, tile_images
 
@@ -76,6 +77,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--min-conf", type=float, default=0.3, help="关键点/锚点最低置信度")
     ap.add_argument("--anchor-max-reproj", type=float, default=30.0, help="锚点匹配重投影门限(px)")
+    ap.add_argument("--match", choices=["fixed", "generic"], default="fixed",
+                    help="跨视角匹配：fixed=固定相机分组(默认)，generic=通用几何匹配")
+    ap.add_argument("--person-groups", default="0,2;1,3",
+                    help="fixed 模式的相机分组，如 '0,2;1,3'（每组 = 一个人）")
     return ap
 
 
@@ -153,6 +158,18 @@ class ReconstructPose:
         self.viewer3d = None
         self._last_poses: Dict[int, List[Pose2D]] = {}
         self._pose_tracker = None
+        self._person_groups: List[List[int]] = self._parse_groups(args.person_groups)
+
+    @staticmethod
+    def _parse_groups(spec: str) -> List[List[int]]:
+        """把 '0,2;1,3' 解析成 [[0,2],[1,3]]。"""
+        groups = []
+        for part in spec.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            groups.append([int(x) for x in part.split(",") if x.strip() != ""])
+        return groups
 
     def _assoc_config(self) -> AssociationConfig:
         return AssociationConfig(
@@ -186,16 +203,27 @@ class ReconstructPose:
     # 核心：一帧 2D 检测 -> 3D 骨架
     # ------------------------------------------------------------------
     def reconstruct_frame(self, poses_per_cam: Dict[int, List[Pose2D]]) -> List[Skeleton3D]:
-        people = match_people(poses_per_cam, self.triangulator, self._assoc_config())
-        skeletons = [
+        if self.args.match == "generic":
+            people = match_people(poses_per_cam, self.triangulator, self._assoc_config())
+            skeletons = [
+                self.triangulator.triangulate_pose(obs, min_conf=self.args.min_conf)
+                for obs in people
+            ]
+            # 通用匹配顺序逐帧可能翻转：按球桌长边(Y)两侧分 ID，稳定身份
+            if self._pose_tracker is None:
+                from tabletennis.reconstruction import PoseTracker
+                self._pose_tracker = PoseTracker(partition_axis=1, partition_threshold=1.37)
+            return self._pose_tracker.update(skeletons)
+
+        # 固定分组：每组相机 = 一个人，组顺序即身份，无需跨组匹配 / PoseTracker
+        people = match_people_fixed(
+            poses_per_cam, self.triangulator,
+            groups=self._person_groups, min_conf=self.args.min_conf,
+        )
+        return [
             self.triangulator.triangulate_pose(obs, min_conf=self.args.min_conf)
             for obs in people
         ]
-        # 硬编码身份：按球桌长边(Y)两侧分 ID（Y 中点 2.74/2=1.37m），绝对稳定
-        if self._pose_tracker is None:
-            from tabletennis.reconstruction import PoseTracker
-            self._pose_tracker = PoseTracker(partition_axis=1, partition_threshold=1.37)
-        return self._pose_tracker.update(skeletons)
 
     # ------------------------------------------------------------------
     # 真实相机循环
@@ -342,6 +370,8 @@ class ReconstructPose:
             make_synthetic_skeleton(1.1, 1.9),
         ]
         view_map = [[0, 1], [2, 3]]  # 每人只被 2 台相机看到
+        # 合成模式按 view_map 设固定分组（每人那 2 台相机 = 一组）
+        self._person_groups = view_map
         self._start_viewer()
 
         errs: List[float] = []

@@ -3,7 +3,13 @@
 - :mod:`triangulate`：置信度加权的多视角 DLT 三角化（含去畸变、重投影/交会角质量）。
 - :mod:`associate`：跨视角实例级球员匹配（几何锚点 + 并查集 + 一致性精化）。
 """
-from .associate import AssociationConfig, anchor_2d, match_people
+from .associate import (
+    DEFAULT_PERSON_GROUPS,
+    AssociationConfig,
+    anchor_2d,
+    match_people,
+    match_people_fixed,
+)
 from .ball import triangulate_ball, undistort_ball_center
 from .pose_track import PoseTracker
 from .track import BallTracker
@@ -20,6 +26,8 @@ __all__ = [
     "AssociationConfig",
     "anchor_2d",
     "match_people",
+    "match_people_fixed",
+    "DEFAULT_PERSON_GROUPS",
     "triangulate_ball",
     "undistort_ball_center",
     "BallTracker",

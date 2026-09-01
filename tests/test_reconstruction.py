@@ -10,6 +10,7 @@ from tabletennis.reconstruction import (
     AssociationConfig,
     MultiViewTriangulator,
     match_people,
+    match_people_fixed,
     undistort_keypoints,
 )
 
@@ -202,6 +203,57 @@ def test_match_people_no_cross_merge():
     assert len(people) == 2
     cam_sets = sorted([tuple(sorted(p.keys())) for p in people])
     assert cam_sets == [(0, 1), (2, 3)]
+
+
+def test_match_people_fixed_groups():
+    """固定分组匹配：每组相机各自看到一个人，直接按组返回，不跨组错配。"""
+    intrinsics, extrinsics = make_rig(
+        cam_centers=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                     [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        look_at=(0.5, 0.5, 2.0),
+    )
+    tri = MultiViewTriangulator(intrinsics, extrinsics)
+
+    # A 只在 cam0/cam2 可见，B 只在 cam1/cam3 可见
+    A = np.array([0.3, 0.3, 2.0])
+    B = np.array([0.7, 0.7, 2.0])
+    poses_per_cam = {
+        0: [make_pose3(0, A, intrinsics, extrinsics)],
+        1: [make_pose3(1, B, intrinsics, extrinsics)],
+        2: [make_pose3(2, A, intrinsics, extrinsics)],
+        3: [make_pose3(3, B, intrinsics, extrinsics)],
+    }
+    people = match_people_fixed(poses_per_cam, tri, groups=[[0, 2], [1, 3]])
+    assert len(people) == 2
+    assert set(people[0].keys()) == {0, 2}
+    assert set(people[1].keys()) == {1, 3}
+
+
+def test_match_people_fixed_glimpse_picks_consistent():
+    """固定分组下 cam0 瞥到对面的人（看到 2 人）时，应挑与组内 cam2 一致的那一个。"""
+    intrinsics, extrinsics = make_rig(
+        cam_centers=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                     [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        look_at=(0.5, 0.5, 2.0),
+    )
+    tri = MultiViewTriangulator(intrinsics, extrinsics)
+
+    A = np.array([0.3, 0.3, 2.0])
+    B = np.array([0.7, 0.7, 2.0])
+    poses_per_cam = {
+        0: [make_pose3(0, A, intrinsics, extrinsics),
+            make_pose3(0, B, intrinsics, extrinsics)],  # cam0 串扰看到两人
+        1: [make_pose3(1, B, intrinsics, extrinsics)],
+        2: [make_pose3(2, A, intrinsics, extrinsics)],
+        3: [make_pose3(3, B, intrinsics, extrinsics)],
+    }
+    people = match_people_fixed(poses_per_cam, tri, groups=[[0, 2], [1, 3]])
+    assert len(people) == 2
+    # cam0/cam2 组：三角化后 X/Y 应更接近 A（挑对了 A，而不是瞥到的 B）
+    skel = tri.triangulate_pose(people[0])
+    valid = np.isfinite(skel.keypoints).all(axis=1)
+    centroid = skel.keypoints[valid].mean(axis=0)
+    assert np.linalg.norm(centroid[:2] - A[:2]) < 0.3
 
 
 def test_undistort_keypoints_passthrough():

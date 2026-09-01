@@ -82,6 +82,10 @@ def camera_kwargs_from_config(config: dict) -> dict:
 class LiveControl:
     """交互式控制：单窗口，视频在上、自绘滑块在中、提示在下。"""
 
+    # 固定相机分组（姿态重建）：cam0/cam2 看球桌一边的人、cam1/cam3 看另一边的人。
+    # 组顺序即身份 ID（0/1）；换机位/换边时改这里。
+    PERSON_GROUPS = [[0, 2], [1, 3]]
+
     def __init__(self, mgr: CameraManager, *, exposure_us, gain_db, gamma, trigger_mode, max_width):
         self.mgr = mgr
         self.trigger_mode = trigger_mode
@@ -459,8 +463,8 @@ class LiveControl:
         print("[检测] 姿态: OFF")
 
     def _reconstruct_frame(self) -> None:
-        """批处理检测所有相机 + 跨视角匹配 + 三角化，更新 Open3D 骨架与 2D 姿态。"""
-        from tabletennis.reconstruction import match_people
+        """批处理检测所有相机 + 固定分组匹配 + 三角化，更新 Open3D 骨架与 2D 姿态。"""
+        from tabletennis.reconstruction import match_people_fixed
 
         t0 = time.perf_counter()
         detector = self.detectors["pose"]
@@ -483,13 +487,10 @@ class LiveControl:
         t_recon = 0.0
         if self._triangulator is not None:
             t_r0 = time.perf_counter()
-            people = match_people(poses_per_cam, self._triangulator)
+            # 固定分组：cam0/cam2 看一边、cam1/cam3 看另一边，组顺序即身份，无需跨组匹配
+            people = match_people_fixed(poses_per_cam, self._triangulator,
+                                        groups=self.PERSON_GROUPS)
             skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
-            # 硬编码身份：按球桌长边(Y)两侧分 ID（Y 中点 2.74/2=1.37m），绝对稳定
-            if self._pose_tracker is None:
-                from tabletennis.reconstruction import PoseTracker
-                self._pose_tracker = PoseTracker(partition_axis=1, partition_threshold=1.37)
-            skeletons = self._pose_tracker.update(skeletons)
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)
             t_recon = time.perf_counter() - t_r0
