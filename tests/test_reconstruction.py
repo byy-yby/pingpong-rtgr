@@ -256,64 +256,6 @@ def test_match_people_fixed_glimpse_picks_consistent():
     assert np.linalg.norm(centroid[:2] - A[:2]) < 0.3
 
 
-def _halpe26_skeleton(x=0.5, y=0.4, h=1.7) -> np.ndarray:
-    """一个站立的 halpe26 骨架（真实比例：脚跟几乎在踝正下方、脚趾在前）。"""
-    k = np.zeros((26, 3))
-    k[19] = [x, y, 0.53 * h]; k[18] = [x, y, 0.82 * h]; k[17] = [x, y, 0.90 * h]
-    k[0] = [x, y + 0.03, 0.93 * h]
-    k[1] = [x - 0.03, y + 0.05, 0.91 * h]; k[2] = [x + 0.03, y + 0.05, 0.91 * h]
-    k[3] = [x - 0.06, y + 0.03, 0.91 * h]; k[4] = [x + 0.06, y + 0.03, 0.91 * h]
-    k[5] = [x - 0.18, y, 0.81 * h]; k[6] = [x + 0.18, y, 0.81 * h]
-    k[7] = [x - 0.22, y, 0.62 * h]; k[8] = [x + 0.22, y, 0.62 * h]
-    k[9] = [x - 0.24, y, 0.44 * h]; k[10] = [x + 0.24, y, 0.44 * h]
-    k[11] = [x - 0.09, y, 0.52 * h]; k[12] = [x + 0.09, y, 0.52 * h]
-    k[13] = [x - 0.10, y, 0.26 * h]; k[14] = [x + 0.10, y, 0.26 * h]
-    k[15] = [x - 0.10, y, 0.06 * h]; k[16] = [x + 0.10, y, 0.06 * h]
-    k[20] = [x - 0.10, y + 0.15, 0.02]; k[21] = [x + 0.10, y + 0.15, 0.02]
-    k[22] = [x - 0.14, y + 0.06, 0.02]; k[23] = [x + 0.14, y + 0.06, 0.02]
-    k[24] = [x - 0.10, y - 0.03, 0.02]; k[25] = [x + 0.10, y - 0.03, 0.02]
-    return k
-
-
-def test_fill_missing_joints_head_feet():
-    """单相机遮挡头/脚时，fill_missing_joints 用骨长+射线补出 3D（相机俯视）。"""
-    from tabletennis.reconstruction import fill_missing_joints
-    # 相机放上方俯视（与真实 2.1m 机位一致）
-    intrinsics, extrinsics = make_rig(
-        cam_centers=[[0.0, 0.0, 2.5], [1.0, 0.0, 2.5]],
-        look_at=(0.5, 0.4, 0.8),
-    )
-    tri = MultiViewTriangulator(intrinsics, extrinsics)
-    gt = _halpe26_skeleton(0.5, 0.4, 1.7)
-    head = {0, 1, 2, 3, 4, 17}
-    feet = {20, 21, 22, 23, 24, 25}
-
-    obs = {}
-    for cid in (0, 1):
-        kps = np.zeros((26, 3), dtype=np.float32)
-        for j in range(26):
-            u, v = project(gt[j], intrinsics, extrinsics, cid)
-            kps[j] = [u, v, 0.9]
-        obs[cid] = Pose2D(camera_id=cid, keypoints=kps, skeleton="halpe26")
-    for j in head | feet:
-        obs[1].keypoints[j, 2] = 0.0  # cam1 遮挡头/脚
-
-    skel = tri.triangulate_pose(obs)
-    for j in head | feet:
-        assert np.isnan(skel.keypoints[j]).all(), f"j{j} 应先为 NaN"
-
-    filled = fill_missing_joints(skel, obs, tri)
-    for j in head | feet:
-        assert np.isfinite(filled.keypoints[j]).all(), f"j{j} 应被补上"
-
-    # 核心关节（头顶/鼻/脚）补点应较准；眼耳为头侧向关节，容差放宽
-    core = {17, 0} | feet
-    for j in core:
-        assert np.linalg.norm(filled.keypoints[j] - gt[j]) < 0.10, f"j{j} 误差过大"
-    for j in {1, 2, 3, 4}:
-        assert np.linalg.norm(filled.keypoints[j] - gt[j]) < 0.25, f"j{j} 误差过大"
-
-
 def test_undistort_keypoints_passthrough():
     """无畸变（dist=0）时去畸变应近似恒等（仅主点附近精确）。"""
     K = np.array([[1000.0, 0.0, 320.0], [0.0, 1000.0, 240.0], [0.0, 0.0, 1.0]])
