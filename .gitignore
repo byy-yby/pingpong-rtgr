@@ -35,3 +35,15 @@ config/camera_settings.json
 *.pt
 *.onnx
 runs/
+
+# Claude Code worktree（多 session 并行隔离，勿提交）
+.claude/worktrees/
+
+# 训练数据集（体量大，本地保留、不进版本库）
+data/ball_dataset/
+data/ball_dataset_aug/
+
+# 下载残留 / 临时截图
+*.part
+ScreenCamera_*
+ScreenCapture_*
