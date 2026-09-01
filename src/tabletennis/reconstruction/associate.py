@@ -29,6 +29,10 @@ from .triangulate import (
 # 这些关节靠近躯干中心、通常可见且置信度高，比单用脚踝稳健。
 _ANCHOR_JOINTS = (19, 18, 5, 6, 11, 12)
 
+# 半固定机位下，球桌两侧各一组相机、各看各的人：cam0/cam2 看一边、cam1/cam3 看另一边。
+# 用于 :func:`match_people_fixed` 的默认分组（换机位/换边时改这里或用参数覆盖）。
+DEFAULT_PERSON_GROUPS: List[List[int]] = [[0, 2], [1, 3]]
+
 
 @dataclass
 class AssociationConfig:
@@ -225,3 +229,81 @@ def _obs(
     poses_per_cam: Dict[int, List[Pose2D]],
 ) -> Dict[int, Pose2D]:
     return {det_cam[g]: poses_per_cam[det_cam[g]][det_idx[g]] for g in gs}
+
+
+def match_people_fixed(
+    poses_per_cam: Dict[int, List[Pose2D]],
+    triangulator: MultiViewTriangulator,
+    groups: Optional[List[List[int]]] = None,
+    min_conf: float = DEFAULT_MIN_CONF,
+) -> List[Dict[int, Pose2D]]:
+    """固定相机分组匹配：每组相机各自拍到一个人，直接按组返回观测。
+
+    适合半固定机位下「球桌两侧各一组相机、各看各的人」的场景（如 cam0/cam2 看
+    A、cam1/cam3 看 B）：人只被自己那组相机看到，跨组做几何配对反而会错配（把
+    一边的人配到另一边的相机上）。这里不做全局匹配，每组相机内部各取一个检测，
+    直接作为一个人；组内某相机看到 >1 个检测（偶发串扰/瞥到对面的人）时，用组内
+    另一台相机做局部一致性挑选。
+
+    Args:
+        poses_per_cam: ``{cam_id: [Pose2D, ...]}``。
+        triangulator: 用于组内串扰挑选时锚点三角化。
+        groups: 相机分组，如 ``[[0, 2], [1, 3]]``；默认 :data:`DEFAULT_PERSON_GROUPS`。
+        min_conf: 锚点置信度下限。
+
+    Returns:
+        每个人一个 ``{cam_id: Pose2D}``（至少 2 个视角），列表顺序 = groups 顺序
+        （即身份，无需再按 3D 位置重排）。
+    """
+    groups = groups or DEFAULT_PERSON_GROUPS
+    people: List[Dict[int, Pose2D]] = []
+    for group in groups:
+        obs: Dict[int, Pose2D] = {}
+        for cid in group:
+            dets = poses_per_cam.get(cid, [])
+            if not dets:
+                continue
+            if len(dets) == 1:
+                obs[cid] = dets[0]
+            else:
+                obs[cid] = _pick_in_group(
+                    dets, cid, group, poses_per_cam, triangulator, min_conf
+                )
+        if len(obs) >= 2:
+            people.append(obs)
+    return people
+
+
+def _pick_in_group(
+    dets: List[Pose2D],
+    cid: int,
+    group: List[int],
+    poses_per_cam: Dict[int, List[Pose2D]],
+    triangulator: MultiViewTriangulator,
+    min_conf: float,
+) -> Pose2D:
+    """组内串扰挑选：该相机看到 >1 个检测时，选与组内另一台相机锚点最一致的那个。
+
+    用锚点 2 视角三角化的重投影误差当「一致性」：正确的人误差小，瞥到的对面的人
+    误差大。组内无其它可用相机（都漏检）时回退到第一个检测（通常 NMS 后最高分在前）。
+    """
+    refs = [c for c in group if c != cid and poses_per_cam.get(c)]
+    if not refs:
+        return dets[0]
+    rcid = refs[0]
+    ra = anchor_2d(poses_per_cam[rcid][0], min_conf)
+    if ra is None:
+        return dets[0]
+    best, best_e = dets[0], float("inf")
+    for d in dets:
+        a = anchor_2d(d, min_conf)
+        if a is None:
+            continue
+        r = triangulator.triangulate_point(
+            {cid: a[:2], rcid: ra[:2]},
+            {cid: a[2], rcid: ra[2]},
+            min_conf=min_conf,
+        )
+        if r is not None and r[2] < best_e:
+            best, best_e = d, r[2]
+    return best
