@@ -325,7 +325,7 @@ class ReconstructPose:
         images = []
         for cid, frame in sorted(bundle.frames.items()):
             images.append(annotate_frame(
-                frame.image, poses_per_cam.get(cid, []), title=f"cam{cid}"
+                frame.image, poses_per_cam.get(cid, []), title=f"cam{cid}", draw_bbox=True
             ))
         if images:
             cv2.imshow("reconstruct-2d", tile_images(images, cols=2))

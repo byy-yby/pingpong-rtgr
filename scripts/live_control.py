@@ -731,8 +731,8 @@ class LiveControl:
         if frame is not None:
             if self.enable["pose"]:
                 # 姿态由 _reconstruct_frame 批处理检测，这里只画缓存结果
-                for pose in self._last_poses.get(cid, []):
-                    draw_pose(bgr, pose, scale=scale)
+                for i, pose in enumerate(self._last_poses.get(cid, [])):
+                    draw_pose(bgr, pose, scale=scale, draw_bbox=True, index=i)
             if self.enable["ball"]:
                 # 球检测由 _reconstruct_ball_frame 每帧统一做，这里只画缓存结果
                 for ball in self._last_balls.get(cid, []):

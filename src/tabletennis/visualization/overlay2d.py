@@ -41,9 +41,11 @@ def draw_pose(
     conf_threshold: float = _CONF_THRESHOLD,
     draw_bbox: bool = False,
     scale: float = 1.0,
+    index: Optional[int] = None,
 ) -> np.ndarray:
     """把单个 :class:`Pose2D` 画到 BGR 图像上（原地返回同一张图）。``scale`` 用于
-    在降采样后的图上按比例缩放关键点坐标。"""
+    在降采样后的图上按比例缩放关键点坐标；``index`` 为该相机内检测序号（画在框
+    左上角，排查跨相机匹配错配时用）。"""
     skeleton = get_skeleton(pose.skeleton)
     names = skeleton["names"]
     edges = skeleton["edges"]
@@ -71,11 +73,11 @@ def draw_pose(
         color = _KEYPOINT_COLORS[i % len(_KEYPOINT_COLORS)]
         cv2.circle(image, (int(x * scale), int(y * scale)), 4, color, -1, cv2.LINE_AA)
 
-    # 检测框
+    # 检测框（含该相机内的检测序号，便于跨视角核对是否同一个人）
     if draw_bbox and pose.bbox is not None:
         x1, y1, x2, y2 = [int(v * scale) for v in pose.bbox]
         cv2.rectangle(image, (x1, y1), (x2, y2), _EDGE_COLOR, 1)
-        label = f"{pose.score:.2f}"
+        label = f"#{index} {pose.score:.2f}" if index is not None else f"{pose.score:.2f}"
         cv2.putText(image, label, (x1, max(0, y1 - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, _TEXT_COLOR, 1, cv2.LINE_AA)
 
@@ -95,8 +97,8 @@ def annotate_frame(
     无姿态时也返回带标题的 BGR 图，便于多路平铺时看清是哪台相机。
     """
     image = gray_to_bgr(frame_image)
-    for pose in poses or []:
-        draw_pose(image, pose, conf_threshold=conf_threshold, draw_bbox=draw_bbox)
+    for i, pose in enumerate(poses or []):
+        draw_pose(image, pose, conf_threshold=conf_threshold, draw_bbox=draw_bbox, index=i)
     if title:
         cv2.putText(image, title, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, _TEXT_COLOR, 2, cv2.LINE_AA)
