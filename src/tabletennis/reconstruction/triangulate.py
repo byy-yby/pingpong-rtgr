@@ -41,6 +41,54 @@ DEFAULT_MAX_REPROJ_PX = 12.0
 # 交会角低于该值（度）判定几何退化（两相机近共线），深度不可靠，放弃该关键点。
 DEFAULT_MIN_ANGLE_DEG = 8.0
 
+# 骨架树的根关节（按骨架名）：BFS 建父子关系用。halpe26 用骨盆(19)，coco17 用左髋(11)。
+_ROOT_JOINTS = {"halpe26": 19, "coco17": 11}
+
+# 显式父关节映射（键 = 骨架名）：fill_missing_joints 找「最近已建祖先」用它，比从
+# edges 做 BFS 更符合运动学结构——尤其修正 halpe26 里「脸经耳朵挂到肩」的定义
+# （脸应挂在头顶(17)/鼻子上），否则鼻子/眼睛会错误地锚到肩膀。值 -1 表示根。
+_PARENT_MAPS = {
+    "halpe26": {
+        19: -1,
+        11: 19, 12: 19, 18: 19,
+        13: 11, 15: 13, 20: 15, 22: 15, 24: 15,
+        14: 12, 16: 14, 21: 16, 23: 16, 25: 16,
+        17: 18, 0: 17, 1: 0, 2: 0, 3: 1, 4: 2,
+        5: 18, 7: 5, 9: 7, 6: 18, 8: 6, 10: 8,
+    },
+    "coco17": {
+        11: -1, 12: 11, 5: 11, 6: 12,
+        7: 5, 9: 7, 8: 6, 10: 8,
+        13: 11, 15: 13, 14: 12, 16: 14,
+        0: 5, 1: 0, 2: 0, 3: 1, 4: 2,
+    },
+}
+
+# 默认骨长（米，标准人体比例，键为排序后的关节对）。:func:`fill_missing_joints`
+# 用「单相机射线 ∩ 以父关节为球心、骨长为半径的球面」补末端关节时查这个表；
+# 表中没有的边回退 _DEFAULT_BONE_LEN。可用参数覆盖 / 后续在线标定。
+_DEFAULT_BONE_LEN = 0.20
+DEFAULT_BONE_LENGTHS: Dict[Tuple[int, int], float] = {
+    # 头颈（halpe26）
+    (17, 18): 0.12, (0, 17): 0.10,
+    (0, 1): 0.05, (0, 2): 0.05, (1, 2): 0.06,
+    (1, 3): 0.07, (2, 4): 0.07,
+    (3, 5): 0.18, (4, 6): 0.18,
+    # 躯干
+    (18, 19): 0.45, (11, 19): 0.10, (12, 19): 0.10,
+    (5, 18): 0.18, (6, 18): 0.18,
+    # 臂
+    (5, 7): 0.30, (6, 8): 0.30, (7, 9): 0.27, (8, 10): 0.27,
+    # 腿
+    (11, 13): 0.42, (12, 14): 0.42, (13, 15): 0.42, (14, 16): 0.42,
+    # 脚（halpe26）
+    (15, 20): 0.15, (16, 21): 0.15,
+    (15, 22): 0.14, (16, 23): 0.14,
+    (15, 24): 0.07, (16, 25): 0.07,
+    # coco17 若干（髋）
+    (5, 11): 0.40, (6, 12): 0.40, (11, 12): 0.30,
+}
+
 
 def undistort_keypoints(
     keypoints: np.ndarray, K: np.ndarray, dist: np.ndarray
@@ -113,6 +161,23 @@ class MultiViewTriangulator:
         """单视角重投影误差（像素）：世界点 X 投影到相机 cid 与观测 uv 的距离。"""
         proj = self.project(cid, X)
         return float(np.linalg.norm(proj - np.asarray(uv, dtype=np.float64)))
+
+    def backproject_ray(self, cid: int, uv) -> Tuple[np.ndarray, np.ndarray]:
+        """无畸变像素 ``uv=(x, y)`` -> 该相机世界系射线 ``(origin, direction)``。
+
+        origin 为相机光心（世界系），direction 为单位方向向量。供单相机补点
+        （:func:`fill_missing_joints`）等需要「像素 -> 3D 射线」的地方复用。
+        """
+        K = self.K[cid]
+        Kinv = np.linalg.inv(K)
+        M = Kinv @ self.P[cid]                 # 3x4 = [R | t]
+        R = M[:, :3]                            # 世界 -> 相机旋转
+        d_cam = Kinv @ np.array([uv[0], uv[1], 1.0], dtype=np.float64)
+        d_world = R.T @ d_cam                   # 相机系 -> 世界系
+        n = float(np.linalg.norm(d_world))
+        if n < 1e-12:
+            return np.asarray(self.centers[cid], dtype=np.float64), np.zeros(3)
+        return np.asarray(self.centers[cid], dtype=np.float64), d_world / n
 
     def _dlt(self, views: List[int], points: Dict[int, Tuple[float, float]],
              confs: Dict[int, float]) -> Optional[np.ndarray]:
@@ -399,6 +464,204 @@ class MultiViewTriangulator:
             n_views=nviews,
             reproj_err=rerr,
         )
+
+
+def _build_parent_map(
+    n_joints: int, edges: List[Tuple[int, int]], root: int
+) -> Tuple[Dict[int, int], List[int]]:
+    """由骨架边（无向）BFS 建「父关节」映射与 BFS 顺序（根在前）。返回 (parent, order)。
+
+    以 ``root`` 为根，``parent[j]`` 是 j 朝根方向的父关节（根为 None，不写进 dict）。
+    与根不连通的关节（如 coco17 的头与躯干断开）不进入 dict。
+    """
+    adj: Dict[int, List[int]] = {i: [] for i in range(n_joints)}
+    for a, b in edges:
+        if a < n_joints and b < n_joints:
+            adj[a].append(b)
+            adj[b].append(a)
+    parent: Dict[int, int] = {}
+    order: List[int] = []
+    queue = [root]
+    parent[root] = -1
+    while queue:
+        u = queue.pop(0)
+        order.append(u)
+        for v in adj[u]:
+            if v not in parent:
+                parent[v] = u
+                queue.append(v)
+    return parent, order
+
+
+def _parent_structure(
+    skeleton_name: str, n_joints: int
+) -> Tuple[Dict[int, int], List[int]]:
+    """返回该骨架的 (父映射, BFS 顺序)。优先用显式 :data:`_PARENT_MAPS`（更符合
+    运动学结构），未知骨架回退到 edges BFS。"""
+    pm = _PARENT_MAPS.get(skeleton_name)
+    if pm is not None:
+        parent = {j: p for j, p in pm.items() if p >= 0}
+        root = next(j for j, p in pm.items() if p < 0)
+        children: Dict[int, List[int]] = {j: [] for j in pm}
+        for j, p in pm.items():
+            if p >= 0:
+                children[p].append(j)
+        order: List[int] = []
+        queue = [root]
+        while queue:
+            u = queue.pop(0)
+            order.append(u)
+            queue.extend(children[u])
+        return parent, order
+    from ..vision.skeleton import get_skeleton
+    edges = get_skeleton(skeleton_name)["edges"]
+    return _build_parent_map(n_joints, edges, _ROOT_JOINTS.get(skeleton_name, 0))
+
+
+def _bone_len(a: int, b: int, bone_lengths: Optional[Dict[Tuple[int, int], float]]) -> float:
+    """查 (a,b) 边骨长：优先自定义表，其次默认表，最后 _DEFAULT_BONE_LEN。"""
+    key = (min(a, b), max(a, b))
+    if bone_lengths is not None and key in bone_lengths:
+        return float(bone_lengths[key])
+    return float(DEFAULT_BONE_LENGTHS.get(key, _DEFAULT_BONE_LEN))
+
+
+def _nearest_finite_ancestor(
+    j: int, parent: Dict[int, int], kp: np.ndarray,
+    bone_lengths: Optional[Dict[Tuple[int, int], float]],
+) -> Tuple[Optional[int], float]:
+    """沿父链向上找最近的「已建（有限）」祖先，返回 (祖先关节, 累计骨长)。
+
+    找不到（不连通 / 整条链都 NaN）返回 (None, 0)。
+    """
+    acc = 0.0
+    cur = j
+    while cur in parent and parent[cur] >= 0:
+        p = parent[cur]
+        acc += _bone_len(cur, p, bone_lengths)
+        if np.isfinite(kp[p]).all():
+            return p, acc
+        cur = p
+    return None, 0.0
+
+
+def _ray_sphere_intersect(
+    origin: np.ndarray, direction: np.ndarray,
+    center: np.ndarray, radius: float,
+) -> List[Tuple[float, np.ndarray]]:
+    """射线 ``origin + t*direction`` 与球 ``|X-center|=radius`` 的交点，返回
+    ``[(t, X), ...]``（仅 t>0，按 t 升序）。不相交返回空列表。"""
+    w = origin - center
+    a = float(direction @ direction)
+    b = 2.0 * float(w @ direction)
+    c = float(w @ w) - radius * radius
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return []
+    sq = float(np.sqrt(disc))
+    out = []
+    for t in ((-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a)):
+        if t > 0.0:
+            out.append((t, origin + t * direction))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def fill_missing_joints(
+    skel: Skeleton3D,
+    observations: Dict[int, Pose2D],
+    triangulator: MultiViewTriangulator,
+    min_conf: float = DEFAULT_MIN_CONF,
+    bone_lengths: Optional[Dict[Tuple[int, int], float]] = None,
+) -> Skeleton3D:
+    """用「单相机射线 + 相邻已建关节 + 骨长」补上被遮挡（<2 视角）的末端关节。
+
+    半固定机位下，躯干/四肢通常被两台相机建得很好，只有头/脚偶发只被一台相机
+    看到 → 三角化成 NaN。这里对「恰好被一台相机看到」的 NaN 关节：用那台相机的
+    2D 点反投影成 3D 射线，求它与「以最近已建祖先为球心、累计骨长为半径的球面」
+    的交点；两个交点用父骨方向（祖父→父）预测位置消歧。0 或 2 视角的 NaN 关节
+    保持不动（2 视角本可三角化、0 视角无任何约束）。
+
+    Args:
+        skel: 三角化结果（含 NaN 关节）。
+        observations: 同一帧的 ``{cam_id: Pose2D}``（与 ``triangulate_pose`` 一致）。
+        triangulator: 用于反投影射线。
+        min_conf: 单视角观测的置信度下限。
+        bone_lengths: 自定义骨长表（键为排序关节对），None 用默认标准比例。
+
+    Returns:
+        补点后的新 :class:`Skeleton3D`（不修改入参）；补上的关节 n_views 记为 1。
+    """
+    if not observations or skel.keypoints.size == 0:
+        return skel
+
+    kp = np.array(skel.keypoints, dtype=np.float64)
+    n_joints = kp.shape[0]
+    conf = (np.array(skel.confidence, dtype=np.float64)
+            if getattr(skel, "confidence", None) is not None else np.zeros(n_joints))
+    nviews = (np.array(skel.n_views, dtype=np.int32)
+              if getattr(skel, "n_views", None) is not None else np.zeros(n_joints, dtype=np.int32))
+    rerr = (np.array(skel.reproj_err, dtype=np.float64)
+            if getattr(skel, "reproj_err", None) is not None else np.full(n_joints, np.nan))
+
+    parent, order = _parent_structure(skel.skeleton, n_joints)
+
+    # 各相机去畸变后，统计每个关节被哪些相机看到（有限 + 置信度达标）
+    views_per_joint: List[List[Tuple[int, Tuple[float, float], float]]] = [
+        [] for _ in range(n_joints)
+    ]
+    for cid, obs in observations.items():
+        if cid not in triangulator.P:
+            continue
+        und = undistort_keypoints(obs.keypoints, triangulator.K[cid], triangulator.dist[cid])
+        for j in range(min(len(und), n_joints)):
+            u, v, c = float(und[j, 0]), float(und[j, 1]), float(und[j, 2])
+            if np.isfinite(u) and np.isfinite(v) and c >= min_conf:
+                views_per_joint[j].append((cid, (u, v), c))
+
+    for j in order:
+        if np.isfinite(kp[j]).all():
+            continue
+        views = views_per_joint[j]
+        if len(views) != 1:
+            continue                      # 0 或 2 视角：不补
+        cid, (u, v), c = views[0]
+        anc, L = _nearest_finite_ancestor(j, parent, kp, bone_lengths)
+        if anc is None or L <= 0.0:
+            continue
+
+        origin, direction = triangulator.backproject_ray(cid, (u, v))
+
+        # 预测方向：父骨方向（祖父→父），缺失则用世界竖直向上
+        gp = parent.get(anc, -1)
+        if gp >= 0 and np.isfinite(kp[gp]).all():
+            bone_dir = kp[anc] - kp[gp]
+            nrm = float(np.linalg.norm(bone_dir))
+            bone_dir = bone_dir / nrm if nrm > 1e-9 else np.array([0.0, 0.0, 1.0])
+        else:
+            bone_dir = np.array([0.0, 0.0, 1.0])
+        predicted = kp[anc] + bone_dir * L
+
+        cands = _ray_sphere_intersect(origin, direction, kp[anc], L)
+        if cands:
+            # 消歧：父骨（祖父→父）朝下（如膝→踝）→ 子关节在下方、离上方的相机更远
+            # → 取远交点（t 大）；父骨朝上（如髋→颈）→ 子关节在上方更近 → 取近交点。
+            X = cands[-1][1] if bone_dir[2] < 0.0 else cands[0][1]
+        else:
+            # 射线与球面不相交（骨长偏小 / 观测不一致）→ 退回骨方向预测位置
+            X = predicted
+        kp[j] = X
+        conf[j] = c
+        nviews[j] = 1
+        rerr[j] = np.nan
+
+    return Skeleton3D(
+        keypoints=kp,
+        confidence=conf,
+        skeleton=skel.skeleton,
+        n_views=nviews,
+        reproj_err=rerr,
+    )
 
 
 def load_camera_rig(root: Optional[str] = None):

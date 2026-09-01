@@ -14,7 +14,9 @@ from .ball import triangulate_ball, undistort_ball_center
 from .pose_track import PoseTracker
 from .track import BallTracker
 from .triangulate import (
+    DEFAULT_BONE_LENGTHS,
     MultiViewTriangulator,
+    fill_missing_joints,
     load_camera_rig,
     undistort_keypoints,
 )
@@ -23,6 +25,8 @@ __all__ = [
     "MultiViewTriangulator",
     "load_camera_rig",
     "undistort_keypoints",
+    "fill_missing_joints",
+    "DEFAULT_BONE_LENGTHS",
     "AssociationConfig",
     "anchor_2d",
     "match_people",
