@@ -41,6 +41,7 @@ from tabletennis.core.types import (
 from tabletennis.reconstruction import (
     AssociationConfig,
     MultiViewTriangulator,
+    fill_missing_joints,
     load_camera_rig,
     match_people,
     match_people_fixed,
@@ -81,6 +82,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="跨视角匹配：fixed=固定相机分组(默认)，generic=通用几何匹配")
     ap.add_argument("--person-groups", default="0,2;1,3",
                     help="fixed 模式的相机分组，如 '0,2;1,3'（每组 = 一个人）")
+    ap.add_argument("--no-fill", action="store_true",
+                    help="关闭单相机补点（默认开启：头/脚单视角遮挡时用骨长+射线补）")
     return ap
 
 
@@ -202,13 +205,22 @@ class ReconstructPose:
     # ------------------------------------------------------------------
     # 核心：一帧 2D 检测 -> 3D 骨架
     # ------------------------------------------------------------------
+    def _triangulate_people(self, people: List[Dict[int, Pose2D]]) -> List[Skeleton3D]:
+        """把每个人三角化，并按需补单相机遮挡的头/脚关节。"""
+        out: List[Skeleton3D] = []
+        for obs in people:
+            skel = self.triangulator.triangulate_pose(obs, min_conf=self.args.min_conf)
+            if not self.args.no_fill:
+                skel = fill_missing_joints(
+                    skel, obs, self.triangulator, min_conf=self.args.min_conf
+                )
+            out.append(skel)
+        return out
+
     def reconstruct_frame(self, poses_per_cam: Dict[int, List[Pose2D]]) -> List[Skeleton3D]:
         if self.args.match == "generic":
             people = match_people(poses_per_cam, self.triangulator, self._assoc_config())
-            skeletons = [
-                self.triangulator.triangulate_pose(obs, min_conf=self.args.min_conf)
-                for obs in people
-            ]
+            skeletons = self._triangulate_people(people)
             # 通用匹配顺序逐帧可能翻转：按球桌长边(Y)两侧分 ID，稳定身份
             if self._pose_tracker is None:
                 from tabletennis.reconstruction import PoseTracker
@@ -220,10 +232,7 @@ class ReconstructPose:
             poses_per_cam, self.triangulator,
             groups=self._person_groups, min_conf=self.args.min_conf,
         )
-        return [
-            self.triangulator.triangulate_pose(obs, min_conf=self.args.min_conf)
-            for obs in people
-        ]
+        return self._triangulate_people(people)
 
     # ------------------------------------------------------------------
     # 真实相机循环
