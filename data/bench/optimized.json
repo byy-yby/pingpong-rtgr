@@ -1,0 +1,55 @@
+{
+  "frames": 4,
+  "noise_px": 0.5,
+  "per_config": {
+    "A_original": {
+      "all_frames_median_ms": 4653.041593002854,
+      "steady_median_ms": 4604.105348989833,
+      "err_mm_median": 18.125251004783784,
+      "speedup_vs_original": 1.0,
+      "fwd_median": 254.0
+    },
+    "B_sync": {
+      "all_frames_median_ms": 4300.655980478041,
+      "steady_median_ms": 4653.2872499665245,
+      "err_mm_median": 18.6645814437579,
+      "speedup_vs_original": 1.0819376425653193,
+      "fwd_median": 257.0
+    },
+    "C_loose": {
+      "all_frames_median_ms": 3081.4856755023357,
+      "steady_median_ms": 2910.050515027251,
+      "err_mm_median": 19.53481487512765,
+      "speedup_vs_original": 1.5099994233282708,
+      "fwd_median": 193.0
+    },
+    "D_warm": {
+      "all_frames_median_ms": 2580.589217977831,
+      "steady_median_ms": 2455.764708982315,
+      "err_mm_median": 16.995331252325443,
+      "speedup_vs_original": 1.8030927047928271,
+      "fwd_median": 153.5
+    },
+    "E_warm_strict": {
+      "all_frames_median_ms": 3249.7301920084283,
+      "steady_median_ms": 3218.2470679981634,
+      "err_mm_median": 17.39986258056406,
+      "speedup_vs_original": 1.431823972477893,
+      "fwd_median": 179.0
+    },
+    "F_warm_mid": {
+      "all_frames_median_ms": 2807.1433625009377,
+      "steady_median_ms": 2503.4807129995897,
+      "err_mm_median": 17.306979859747884,
+      "speedup_vs_original": 1.6575717703485475,
+      "fwd_median": 164.5
+    },
+    "G_stream": {
+      "all_frames_median_ms": 2048.438747995533,
+      "steady_median_ms": 1994.2013469990343,
+      "err_mm_median": 17.66360208278747,
+      "speedup_vs_original": 2.2715063350349203,
+      "fwd_median": 128.0
+    }
+  }
+}
