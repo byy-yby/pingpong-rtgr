@@ -898,7 +898,7 @@ class LiveControl:
 
     def _reconstruct_frame(self) -> None:
         """批处理检测所有相机 + 固定分组匹配 + 三角化，更新 Open3D 骨架与 2D 姿态。"""
-        from tabletennis.reconstruction import fill_missing_joints, match_people_fixed
+        from tabletennis.reconstruction import match_people_fixed
 
         t0 = time.perf_counter()
         detector = self.detectors["pose"]
@@ -924,12 +924,7 @@ class LiveControl:
             # 固定分组：cam0/cam2 看一边、cam1/cam3 看另一边，组顺序即身份，无需跨组匹配
             people = match_people_fixed(poses_per_cam, self._triangulator,
                                         groups=self.PERSON_GROUPS)
-            skeletons = []
-            for obs in people:
-                skel = self._triangulator.triangulate_pose(obs)
-                # 单相机遮挡的头/脚关节用骨长 + 射线补出
-                skel = fill_missing_joints(skel, obs, self._triangulator)
-                skeletons.append(skel)
+            skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)
                 # IMU 球拍绑到右手腕（=IMU 位置）：选离桌面原点最近的右手腕，逐帧跟手
