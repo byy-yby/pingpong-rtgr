@@ -125,6 +125,118 @@ def angle_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return Rz @ Ry @ Rx
 
 
+# ---------------------------------------------------------------------------
+# 磁航向锚定（消除陀螺 yaw 漂移）
+#
+# 背景：WT9011DCL 的片上 Kalman 只有在磁力计被校准/可用时才用磁场锚定 yaw。出厂没做
+# 磁场校准、台面附近又有铁磁物时，模块 yaw 退化成纯陀螺积分 → 挥拍几圈后摆回参考姿态，
+# 拍面水平对（重力锚定）但手柄航向对不上（陀螺积漂）。上位机/App 的「转 8 字」校准能修，
+# 但不方便用上位机的场景需要主机侧等价方案：让模块把磁力计 0x54 也上报，我们由原始 mag
+# 自己算**绝对**航向；模块平放静止时把显示航向钉到磁场（漂移清零），快速倾斜挥拍时磁
+# 力计不可靠，就冻结上次修正、暂时回落模块自身 yaw（单拍 ~0.1-0.5s 内陀螺误差很小）。
+#
+# 约定（纯函数可单测）：模块欧拉 Z-Y-X（yaw 绕 Z）。``tilt_compensated_mag_heading``
+# 用模块自身的 roll/pitch 把原始磁力计读数翻平，取水平投影方位角；模块水平时它==模块
+# 的 yaw（模块 +x 指向磁场北时 heading=0，世界 yaw 增则 heading 同步增），因此
+# 「heading 相对参考的变化量」≈「真实世界航向相对参考的变化量」，与模块 yaw 漂不漂无关。
+# ---------------------------------------------------------------------------
+
+def wrap_pi(x_deg: float) -> float:
+    """把角度（度）折到 (-180, 180]。"""
+    x = float(x_deg) % 360.0
+    if x > 180.0:
+        x -= 360.0
+    if x <= -180.0:
+        x += 360.0
+    return x
+
+
+def tilt_compensated_mag_heading(roll_deg: float, pitch_deg: float, mag) -> float:
+    """倾角补偿磁航向（度）：由模块 roll/pitch 确定的倾角把原始 mag 翻平到水平面。
+
+    body->水平 = Ry(pitch) @ Rx(roll)；水平面内取 ``atan2(-My, Mx)`` 得方位角。
+    只用当前读数、不含陀螺积分 → 不漂移；但倾角大时对 roll/pitch 误差敏感，调用方
+    （:class:`MagYawLock`）应在近水平时才信任它。mag 为 0 向量时返回 0。
+    """
+    m = np.asarray(mag, dtype=np.float64).reshape(3)
+    if np.linalg.norm(m) < 1e-9:
+        return 0.0
+    r, p = np.radians([roll_deg, pitch_deg])
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+    level = Ry @ (Rx @ m)
+    return float(np.degrees(np.arctan2(-level[1], level[0])))
+
+
+def _clamp01(x: float) -> float:
+    return float(np.clip(x, 0.0, 1.0))
+
+
+class MagYawLock:
+    """主机侧磁航向锚定：把显示 yaw 钉在磁航向上，消除模块陀螺 yaw 漂移。
+
+    用法：锁参考姿态时（用户把球拍平放于桌面原点静止）调 :meth:`lock` 记录参考航向；
+    之后每个姿态包调 :meth:`update`，返回值 = 应叠加在「纯模块 yaw 的显示旋转
+    ``R_disp0``」上的**绕世界竖直轴的修正角（度）**：``R_disp = Rz_world(δ) @ R_disp0``
+    （Rz 左乘只改世界系里的水平航向、不动拍面倾角）。未锁参考 / 无 mag / 球拍明显倾斜
+    或快速转动时返回冻结值或 0（回落到模块自身 yaw）。
+    """
+
+    LEVEL_MAX_DEG = 12.0      # 平放门限：|roll|/|pitch| 超过则磁航向对倾角误差敏感
+    STILL_MAX_DEG_S = 40.0    # 转动门限：|gyro| 超过（快挥）则磁航向噪声大
+    K_ATTACK = 0.6            # 每拍向磁航向逼近的比例（静止平放约 0.1s 收敛）
+    W_EMA = 0.5               # 权重平滑系数（防 w 在门限附近抖动）
+
+    def __init__(self) -> None:
+        self._home_h: Optional[float] = None   # 参考 heading（度）
+        self._home_yaw: float = 0.0            # 参考模块 yaw（度）
+        self._delta: float = 0.0               # 当前世界竖直修正（度）
+        self._w: float = 0.0                   # 平滑后的「信任磁航向」权重 [0,1]
+
+    @property
+    def enabled(self) -> bool:
+        return self._home_h is not None
+
+    def lock(self, roll_deg: float, pitch_deg: float, yaw_deg: float, mag) -> None:
+        """在参考姿态（模块静止、水平、处于参考世界朝向）记下磁航向与模块 yaw。"""
+        self._home_h = wrap_pi(
+            tilt_compensated_mag_heading(roll_deg, pitch_deg, mag))
+        self._home_yaw = float(yaw_deg)
+        self._delta = 0.0
+        self._w = 0.0
+
+    def update(self, roll_deg: float, pitch_deg: float, yaw_deg: float,
+               gyro_norm_deg_s: float, mag) -> float:
+        """逐姿态包调用；返回世界竖直修正角（度），没有有效磁锚定时返回 0/冻结值。"""
+        if self._home_h is None or mag is None:
+            return 0.0
+        w_level = _clamp01(
+            (self.LEVEL_MAX_DEG - max(abs(roll_deg), abs(pitch_deg)))
+            / self.LEVEL_MAX_DEG)
+        w_still = _clamp01((self.STILL_MAX_DEG_S - float(gyro_norm_deg_s))
+                           / self.STILL_MAX_DEG_S)
+        w = w_level * w_still
+        self._w += self.W_EMA * (w - self._w)
+        if self._w <= 1e-6:
+            return self._delta  # 运动/倾斜中：冻结修正，别把磁噪声带进挥拍
+        h = wrap_pi(tilt_compensated_mag_heading(roll_deg, pitch_deg, mag))
+        dH = wrap_pi(h - self._home_h)          # 磁锚定的世界航向变化
+        dy = wrap_pi(yaw_deg - self._home_yaw)  # 模块自报的航向变化（可能带漂移）
+        # 权重合成期望航向变化：w=1（静止平放）取磁场 dH，w=0（运动/倾斜）取模块 dy。
+        # 用复数加权避免 ±180 折返处不连续。
+        zr = (self._w * np.cos(np.radians(dH))
+              + (1.0 - self._w) * np.cos(np.radians(dy)))
+        zi = (self._w * np.sin(np.radians(dH))
+              + (1.0 - self._w) * np.sin(np.radians(dy)))
+        desired = float(np.degrees(np.arctan2(zi, zr)))
+        target = wrap_pi(desired - dy)          # 要在 R_disp0 之上补的世界修正
+        self._delta = wrap_pi(
+            self._delta + self.K_ATTACK * wrap_pi(target - self._delta))
+        return self._delta
+
+
 class WitMotionParser:
     """增量解析 0x55 协议字节流。
 
