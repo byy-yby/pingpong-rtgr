@@ -78,6 +78,14 @@
 - 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）。
 - 每个方法里自己 `o3d = _o3d()` 惰性 import（`_update_ball_geometry` 曾漏写致渲染线程 NameError 窗口退出）；Open3D 窗口必须在主线程开，后台线程只加载模型。
 
+### IMU 姿态（维特智能 WT9011DCL，按 i）
+
+`scripts/live_control.py` 按 **i** 读插在拍柄里的 IMU，在 3D 窗口显示球拍朝向（**纯朝向，无绝对位置**，锚在桌面中心上方 0.35m；`viewer3d.add_imu_layer`/`set_imu_orientation`）。代码在 `src/tabletennis/imu/`：
+- `witmotion.py`：0x55 协议解析 + 角度/四元数 -> 旋转矩阵（纯 numpy，无 I/O）。WT9011DCL 走**新协议**：默认 **0x61 组合包**（加速度6B+角速度6B+角度6B）@115200/10Hz，角度 int16/32768×180°、欧拉 Z-Y-X；兼容经典 0x53 角度 / 0x59 四元数。校验和 = 0x55 起到数据末之和低 8 位。
+- `reader.py`：`ImuReader` 后台串口线程 + 自动波特率探测（pyserial，已装进 `tt`）。
+- **坑**：CH340（`1a86:7523`）有时不自动绑 `ch341` 驱动 → 无 `/dev/ttyUSB*`（lsusb 有、usb-serial 空）；拔插或 `sudo modprobe usbserial vendor=0x1a86 product=0x7523`。
+- **未完成**：IMU 安装角（IMU 轴 vs 拍面朝向的固定偏移）默认按「拍面法线=+Z、手柄=+X」假设，实物需校准补固定旋转；四元数默认不上报（0x59 需寄存器使能，当前用角度即可）。
+
 ## 标定工具的归属（易混）
 
 标定在本包内，分两层（都复用 `camera/mv_import/`，只吃灰度图）：

@@ -102,6 +102,51 @@ def _conf_color(conf: float) -> List[float]:
     return [1.0 - c, c, 0.20]
 
 
+def _paddle_mesh(blade_radius: float = 0.08, handle_len: float = 0.10):
+    """构造球拍三角网格（局部系：拍面在 XY 平面、法线 +Z，手柄沿 +X）。
+
+    Returns:
+        ``(vertices (N,3), triangles (M,3))`` —— 拍面圆盘 + 手柄薄盒。
+    """
+    res = 40
+    verts = [np.array([0.0, 0.0, 0.0])]
+    for i in range(res):
+        th = 2.0 * np.pi * i / res
+        verts.append(np.array([blade_radius * np.cos(th), blade_radius * np.sin(th), 0.0]))
+    tris = [[0, 1 + i, 1 + (i + 1) % res] for i in range(res)]
+
+    hw, hh = 0.014, 0.006  # 手柄半宽(Y) / 半高(Z)
+    x0, x1 = blade_radius - 0.005, blade_radius + handle_len
+    box = np.array([
+        [x0, -hw, -hh], [x1, -hw, -hh], [x1, hw, -hh], [x0, hw, -hh],
+        [x0, -hw, hh], [x1, -hw, hh], [x1, hw, hh], [x0, hw, hh],
+    ])
+    base = len(verts)
+    verts.extend(box)
+    box_t = [
+        [0, 1, 2], [0, 2, 3],
+        [4, 6, 5], [4, 7, 6],
+        [0, 4, 5], [0, 5, 1],
+        [3, 2, 6], [3, 6, 7],
+        [1, 5, 6], [1, 6, 2],
+        [0, 3, 7], [0, 7, 4],
+    ]
+    tris.extend([[a + base, b + base, c + base] for a, b, c in box_t])
+    return np.asarray(verts, dtype=np.float64), np.asarray(tris, dtype=np.int32)
+
+
+def _imu_axes_geometry(size: float = 0.18):
+    """IMU 坐标架几何：X/Y/Z 三段线（红/绿/蓝），起点都在原点。"""
+    pts = np.array([
+        [0.0, 0.0, 0.0], [size, 0.0, 0.0],
+        [0.0, 0.0, 0.0], [0.0, size, 0.0],
+        [0.0, 0.0, 0.0], [0.0, 0.0, size],
+    ], dtype=np.float64)
+    lines = np.array([[0, 1], [2, 3], [4, 5]], dtype=np.int32)
+    colors = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float64)
+    return pts, lines, colors
+
+
 def _skeleton_geometry(skel: Skeleton3D, edges: List, bone_color: List[float]):
     """把 :class:`Skeleton3D` 转成骨架几何数据。
 
@@ -176,6 +221,18 @@ class SceneViewer3D:
         self._smpl_joints = None
         self._latest_smpl = None   # dict{vertices, faces, joints} 或 None
         self._smpl_dirty = False
+        # 实时 IMU 层：球拍网格 + 坐标架，按最新旋转矩阵朝向（无绝对位置，锚点固定）
+        self._imu_lock = threading.Lock()
+        self._imu_anchor = None
+        self._imu_axes = None
+        self._imu_paddle = None
+        self._imu_template_verts = None
+        self._imu_template_tris = None
+        self._imu_axes_pts = None
+        self._imu_axes_lines = None
+        self._imu_axes_colors = None
+        self._latest_imu_R = None
+        self._imu_dirty = False
 
     # ------------------------------------------------------------------
     # 场景构建（主线程，start 前调用一次）
@@ -480,6 +537,80 @@ class SceneViewer3D:
         vis.update_geometry(self._smpl_mesh)
         vis.update_geometry(self._smpl_bones)
         vis.update_geometry(self._smpl_joints)
+    # 实时 IMU 层（球拍朝向）
+    # ------------------------------------------------------------------
+    def has_imu_layer(self) -> bool:
+        """IMU 球拍层是否已加入场景。"""
+        return self._imu_paddle is not None
+
+    def add_imu_layer(self, anchor=None) -> None:
+        """预分配 IMU 球拍几何（拍面 + 手柄 + 坐标架），须在 ``start()`` 前调用。
+
+        IMU 只有朝向没有绝对位置，球拍锚定在 ``anchor``（世界系=桌面系，米）处只做
+        旋转；默认锚在原点上方 0.4m。初始为空（隐藏），``set_imu_orientation`` 写入
+        朝向后才显示。
+        """
+        o3d = _o3d()
+        self._imu_anchor = np.asarray(
+            anchor if anchor is not None else [0.0, 0.0, 0.4], dtype=np.float64
+        ).reshape(3)
+        self._imu_template_verts, self._imu_template_tris = _paddle_mesh()
+        (self._imu_axes_pts, self._imu_axes_lines,
+         self._imu_axes_colors) = _imu_axes_geometry()
+
+        self._imu_axes = o3d.geometry.LineSet()
+        self._imu_axes.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        self._imu_axes.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), dtype=np.int32))
+        self._imu_axes.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+
+        self._imu_paddle = o3d.geometry.TriangleMesh()
+        self._imu_paddle.vertices = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        self._imu_paddle.triangles = o3d.utility.Vector3iVector(
+            np.zeros((0, 3), dtype=np.int32))
+        self._imu_paddle.paint_uniform_color([0.95, 0.25, 0.20])
+
+        self._geometries.append(self._imu_axes)
+        self._geometries.append(self._imu_paddle)
+
+    def set_imu_orientation(self, R) -> None:
+        """线程安全写入最新 IMU 朝向（3x3 旋转矩阵，body -> world）；None 隐藏。"""
+        with self._imu_lock:
+            self._latest_imu_R = (
+                None if R is None else np.asarray(R, dtype=np.float64).reshape(3, 3)
+            )
+            self._imu_dirty = True
+
+    def _update_imu_geometry(self, vis) -> None:
+        """渲染线程内调用：按最新旋转矩阵更新球拍 + 坐标架朝向。"""
+        with self._imu_lock:
+            if not self._imu_dirty:
+                return
+            R = None if self._latest_imu_R is None else self._latest_imu_R.copy()
+            self._imu_dirty = False
+
+        if self._imu_paddle is None or self._imu_axes is None:
+            return
+        o3d = _o3d()
+        a = self._imu_anchor
+        if R is None:
+            empty3 = np.zeros((0, 3))
+            self._imu_axes.points = o3d.utility.Vector3dVector(empty3)
+            self._imu_axes.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), dtype=np.int32))
+            self._imu_axes.colors = o3d.utility.Vector3dVector(empty3)
+            self._imu_paddle.vertices = o3d.utility.Vector3dVector(empty3)
+            self._imu_paddle.triangles = o3d.utility.Vector3iVector(
+                np.zeros((0, 3), dtype=np.int32))
+        else:
+            self._imu_axes.points = o3d.utility.Vector3dVector(
+                (R @ self._imu_axes_pts.T).T + a)
+            self._imu_axes.lines = o3d.utility.Vector2iVector(self._imu_axes_lines)
+            self._imu_axes.colors = o3d.utility.Vector3dVector(self._imu_axes_colors)
+            self._imu_paddle.vertices = o3d.utility.Vector3dVector(
+                (R @ self._imu_template_verts.T).T + a)
+            self._imu_paddle.triangles = o3d.utility.Vector3iVector(self._imu_template_tris)
+            self._imu_paddle.compute_vertex_normals()
+        vis.update_geometry(self._imu_axes)
+        vis.update_geometry(self._imu_paddle)
 
     # ------------------------------------------------------------------
     # 渲染线程
@@ -532,6 +663,7 @@ class SceneViewer3D:
                 self._update_skeleton_geometry(vis)
                 self._update_ball_geometry(vis)
                 self._update_smpl_geometry(vis)
+                self._update_imu_geometry(vis)
                 vis.update_renderer()
                 time.sleep(0.01)
         except Exception as exc:  # noqa: BLE001 —— 3D 窗口失败不影响 2D 主流程

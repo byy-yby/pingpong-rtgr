@@ -151,6 +151,9 @@ class LiveControl:
         self._latest_smpl = None             # 最近一帧 SMPL 拟合结果（含 vertices/faces/joints）
         self._em_recon_running = False
         self._em_recon_thread: Optional[threading.Thread] = None
+        # IMU 朝向显示（按 i）：维特智能 WT9011DCL 串口读取 + 3D 球拍朝向
+        self._imu_reader = None
+        self._imu_enabled = False
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -335,6 +338,9 @@ class LiveControl:
         if key == ord("r"):
             self.toggle_record()
             return
+        if key == ord("i"):
+            self.toggle_imu()
+            return
         for kind, (_, k) in DETECTION_TOGGLES.items():
             if key == ord(k):
                 self.toggle(kind)
@@ -435,6 +441,7 @@ class LiveControl:
         self.viewer3d.add_skeleton_layer(skeleton="halpe26", max_people=8)
         self.viewer3d.add_ball_layer()
         self.viewer3d.add_smpl_layer()
+        self.viewer3d.add_imu_layer(anchor=self._imu_anchor())
         self.viewer3d.start()
         print("✓ 已生成 3D 场景窗口（Open3D，可鼠标旋转 / 缩放）。")
 
@@ -442,6 +449,57 @@ class LiveControl:
         if self.viewer3d is not None:
             self.viewer3d.close()
             self.viewer3d = None
+
+    # ------------------------------------------------------------------
+    # IMU 朝向显示（按 i）
+    # ------------------------------------------------------------------
+    def toggle_imu(self) -> None:
+        """切换 IMU 朝向显示：读串口姿态 -> 3D 场景球拍朝向。"""
+        self._imu_enabled = not self._imu_enabled
+        if self._imu_enabled:
+            self._enable_imu()
+        else:
+            self._disable_imu()
+
+    def _imu_anchor(self) -> np.ndarray:
+        """IMU 球拍朝向的锚点（世界系 = 桌面系，米）：桌面中心上方。"""
+        if self._table_detector is not None:
+            t = self._table_detector.table
+            return np.array([t.width / 2.0, t.length / 2.0, 0.35], dtype=np.float64)
+        return np.array([0.0, 0.0, 0.35], dtype=np.float64)
+
+    def _enable_imu(self) -> None:
+        """按 i 开启：确保 3D 场景存在 + 启动串口读取线程。"""
+        # 3D 场景：复用姿态重建的标定加载路径（table detector + extrinsics + viewer）
+        if self.viewer3d is None or not self.viewer3d.is_running():
+            if self._table_detector is None:
+                self._table_detector = create_detector("table")
+            if not self._table_poses:
+                try:
+                    from tabletennis.reconstruction import load_camera_rig
+                    _, extrinsics = load_camera_rig()
+                    if extrinsics:
+                        self._table_poses = {cid: (e.R, e.t) for cid, e in extrinsics.items()}
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[IMU] 标定加载失败：{exc}")
+            if self._table_detector is not None and self._table_poses:
+                self._start_viewer()
+            else:
+                print("[IMU] 未找到标定外参（table_extrinsics.yaml）→ 无法开 3D 场景，仅读取 IMU 数据")
+
+        from tabletennis.imu.reader import ImuReader
+        if self._imu_reader is None:
+            self._imu_reader = ImuReader()
+            self._imu_reader.start()
+        print("[IMU] ON——读 WT9011DCL 串口姿态，3D 窗口显示球拍朝向")
+
+    def _disable_imu(self) -> None:
+        if self._imu_reader is not None:
+            self._imu_reader.stop()
+            self._imu_reader = None
+        if self.viewer3d is not None:
+            self.viewer3d.set_imu_orientation(None)
+        print("[IMU] OFF")
 
     # ------------------------------------------------------------------
     # 3D 姿态重建（按 P）
@@ -1040,7 +1098,7 @@ class LiveControl:
         elif time.time() < self._save_flash_until:
             cv2.putText(hint, "已保存 ✓", (w - 110, 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [s]EasyMocap [r]录制 保存=按钮  退出:[q]/ESC/X",
+        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [s]EasyMocap [i]imu [r]录制 保存=按钮  退出:[q]/ESC/X",
                     (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
         return hint
 
@@ -1120,6 +1178,12 @@ class LiveControl:
                     self._em_pending_viewer = False
 
                 # （3D 球重建已由后台线程 _ball_recon_loop 负责，这里不再调用）
+
+                # IMU 朝向（按 i 开启后，每帧把最新姿态推给 3D 场景球拍层）
+                if self._imu_enabled and self._imu_reader is not None and self.viewer3d is not None:
+                    R = self._imu_reader.latest_rotation()
+                    if R is not None:
+                        self.viewer3d.set_imu_orientation(R)
 
                 canvas = self._compose_canvas()
                 cv2.imshow(MAIN_WIN, canvas)
