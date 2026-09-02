@@ -84,17 +84,24 @@ class ImuReader:
 
     def __init__(self, device_name: Optional[str] = None, mac: Optional[str] = None,
                  scan_timeout: float = 6.0, output_rate_hz: float = 100.0,
-                 retry_delay: float = 2.0) -> None:
+                 retry_delay: float = 2.0, request_mag: bool = False) -> None:
         self.device_name = device_name
         self.mac = mac
         self.scan_timeout = scan_timeout
         self.output_rate_hz = _snap_rate(float(output_rate_hz))
         self.retry_delay = retry_delay
         self.parser = WitMotionParser(checksum=False)   # BLE 流无校验字节，见模块 docstring
+        # 连接后额外请求磁力计(0x54)上报（RRST 寄存器写，**不 SAVE**：只在本次会话生效，
+        # 掉电复原），供主机侧磁航向锚定消 yaw 漂移。默认 False——寄存器语义按模块实机
+        # 自校验（见 _request_mag_output），不保证每个固件都支持。
+        self.request_mag = bool(request_mag)
 
         # 每个有效姿态包回调 ``on_orientation(R)``（R 为 3x3，body->world）。
         # 在 notify 线程调用，须尽快返回（只做跨线程写，别做重活）。
         self.on_orientation: Optional[Callable[[np.ndarray], None]] = None
+        # 增强回调 ``on_packet(dict)``：每收到含角度/四元数的包触发一次，dict 带最新
+        # R(3x3)、roll/pitch/yaw(度)、accel/gyro(组合包)、mag(0x54；无则 None)。
+        self.on_packet: Optional[Callable[[dict], None]] = None
 
         # 调试模式（TT_IMU_DEBUG=1）：打印原始 notify（长度 + 十六进制）与解析统计，
         # 用于定位「模块没发够快」还是「模块在发但解析拒了大部分」。
@@ -110,9 +117,17 @@ class ImuReader:
         self._last_R: Optional[np.ndarray] = None   # 3x3（body -> world）
         self._last_rpy: Optional[Tuple[float, float, float]] = None
         self._last_quat: Optional[Tuple[float, float, float, float]] = None
+        self._last_accel: Optional[Tuple[float, float, float]] = None  # g（组合包）
+        self._last_gyro: Optional[Tuple[float, float, float]] = None  # deg/s
+        self._last_mag: Optional[Tuple[float, float, float]] = None   # 0x54（原始 int16）
         self._last_t: float = 0.0      # 最近一次有效姿态时间（仅本线程访问）
         self._connect_t: float = 0.0   # 最近一次连上时间（仅本线程访问）
         self._rate_hz: float = 0.0     # 实测数据速率 EMA（跨线程读，锁保护）
+
+        # 报文类型计数（notify 线程自增；_request_mag_output 用它们自校验写是否生效）
+        self._n_pkt = 0
+        self._n_angle = 0
+        self._n_mag = 0
 
         # 遥测
         self._diag_t0 = time.time()
@@ -174,6 +189,8 @@ class ImuReader:
                         except Exception:  # noqa: BLE001
                             pass
                     await self._configure_output_rate(client)
+                    if self.request_mag:
+                        await self._request_mag_output(client)
                     print(f"[IMU] 已连接 {name or addr}，等待姿态数据…")
                     while self._running:
                         if not client.is_connected:
@@ -237,6 +254,41 @@ class ImuReader:
         except Exception as exc:  # noqa: BLE001
             print(f"[IMU] 下发速率命令失败（保持模块当前速率，不影响连接）：{exc}")
 
+    async def _request_mag_output(self, client) -> None:
+        """让模块补报磁力计（0x54）：RRST 寄存器 0x02 写成 0x0F（加速度|角速度|角度|磁场）。
+
+        WT9011DCL 默认只报 0x61 组合包（加速度|角速度|角度，即内容 0x07）——模块自身
+        yaw 在没有可用磁场基准时会退化成纯陀螺积分（挥拍后航向漂移）。把内容加上磁场位，
+        主机侧就能拿到原始磁力计做**磁航向锚定**。**故意不 SAVE**：内容配置只在本次
+        会话生效、掉电复原，避免把猜错的配置持久化到模块 flash。
+
+        写后自校验（~0.8s）：真的收到 0x54（``_n_mag`` 涨）才算成功；角度流还在则正常
+        结束；角度停了（固件把内容整体切走，罕见）就回写 0x07 复原。固件忽略未知寄存器
+        写 = 静默无变化，回落模块自身融合航向（不中断读取）。
+        """
+        try:
+            a0, m0 = self._n_angle, self._n_mag
+            await client.write_gatt_char(_SEND_UUID, _UNLOCK_CMD, response=False)
+            await asyncio.sleep(0.06)
+            # NORMAL 协议 5B：FF AA <reg> <valL> <valH>；RRST=0x02，值 0x0F
+            await client.write_gatt_char(
+                _SEND_UUID, bytes([0xFF, 0xAA, 0x02, 0x0F, 0x00]), response=False)
+            await asyncio.sleep(0.8)
+            a1, m1 = self._n_angle, self._n_mag
+            if m1 > m0 and a1 > a0:
+                print("[IMU] 磁力计已开启（0x54 收到）→ 主机侧磁航向锚定可用")
+            elif m1 > m0 and not a1 > a0:
+                print("[IMU] 磁力计开启但角度流停了 → 回写 0x07 复原内容配置")
+                await client.write_gatt_char(_SEND_UUID, _UNLOCK_CMD, response=False)
+                await asyncio.sleep(0.06)
+                await client.write_gatt_char(
+                    _SEND_UUID, bytes([0xFF, 0xAA, 0x02, 0x07, 0x00]), response=False)
+            else:
+                print("[IMU] 模块未回传磁力计（该固件可能不支持 RRST 写）→ 维持模块自身"
+                      "融合航向，无磁锚定")
+        except Exception as exc:  # noqa: BLE001 —— 失败不影响连接与读取
+            print(f"[IMU] 请求磁力计失败（忽略，不影响读取）：{exc}")
+
     async def _sleep_cancellable(self, seconds: float) -> None:
         """分段 sleep：``stop()`` 置 ``_running=False`` 后最多 0.1s 内返回。"""
         while self._running and seconds > 0:
@@ -277,21 +329,38 @@ class ImuReader:
 
     def _handle(self, pkt) -> None:
         t = time.time()
+        self._n_pkt += 1
+        # 先刷新各类原始量快照（无论是否含姿态）——若模块被切成分离包（0x51/52/53/54），
+        # 加速度/角速度/磁场各自单独到达，姿态包回调时读的是它们的最新值。
+        if "accel" in pkt:
+            with self._lock:
+                self._last_accel = tuple(float(v) for v in pkt["accel"])
+        if "gyro" in pkt:
+            with self._lock:
+                self._last_gyro = tuple(float(v) for v in pkt["gyro"])
+        if "mag" in pkt:
+            self._n_mag += 1
+            with self._lock:
+                self._last_mag = tuple(float(v) for v in pkt["mag"])
+        if not ("quat" in pkt or "angle" in pkt):
+            return  # 只有原始量（无姿态）：不触发回调
         if "quat" in pkt:
             R = quat_to_rotmat(*pkt["quat"])
+            roll = pitch = yaw = None
             with self._lock:
                 self._last_R, self._last_quat, self._last_t = R, pkt["quat"], t
                 self._last_rpy = None
-        elif "angle" in pkt:
+        else:
             roll, pitch, yaw = pkt["angle"]
             R = angle_to_rotmat(roll, pitch, yaw)
             with self._lock:
                 self._last_R, self._last_rpy, self._last_t = R, (roll, pitch, yaw), t
                 self._last_quat = None
-        else:
-            return
+        self._n_angle += 1
         self._diag_n += 1
         self._last_t = t
+        with self._lock:
+            accel, gyro, mag = self._last_accel, self._last_gyro, self._last_mag
         cb = self.on_orientation
         if cb is not None:
             try:
@@ -299,6 +368,15 @@ class ImuReader:
             except Exception as exc:  # noqa: BLE001 —— 回调（推 3D）失败不影响数据流
                 if time.time() - self._last_err_t > 5.0:
                     print(f"[IMU] on_orientation 回调异常：{exc}")
+                    self._last_err_t = time.time()
+        cp = self.on_packet
+        if cp is not None:
+            try:
+                cp({"R": R, "roll": roll, "pitch": pitch, "yaw": yaw,
+                    "accel": accel, "gyro": gyro, "mag": mag})
+            except Exception as exc:  # noqa: BLE001 —— 同上，不打断订阅
+                if time.time() - self._last_err_t > 5.0:
+                    print(f"[IMU] on_packet 回调异常：{exc}")
                     self._last_err_t = time.time()
 
     def _maybe_report_rate(self) -> None:

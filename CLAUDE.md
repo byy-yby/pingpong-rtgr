@@ -86,6 +86,18 @@
 - `reader.py`：`ImuReader` 后台 BLE 线程（`bleak`，已装进 `tt`）。GATT 服务 `0000ffe5` / notify 收数据 `0000ffe4` / 写命令 `0000ffe9`（UUID 来自官方 SDK `WitBluetooth_BWT901BLE5_0` 的 `BleUUID.java`）；扫描广播名含 "WT" 的模块。
 - **坑**：BLE 流**无校验字节**（20B 包，见上）；上报率默认 10Hz 已由 reader 连上后自动提 100Hz（官方 5 字节写命令 `FF AA 69 88 B5` 解锁 → `FF AA 03 <val> 00` RATE → `FF AA 00 00 00` 保存）；模块上电可能被手机/上位机占用（BLE 一般单连接），用 `--imu-mac` 直接指定 MAC 更稳。
 - **参考姿态初始化（已解决安装角问题，无需知道 IMU 轴方向）**：按 i 后把球拍平放于**桌面坐标系原点**（桌角原点标记，正面朝上、点口端/手柄朝桌面 −Y；表系 X=短边/Y=长边 2.74m/Z 向上），live_control 采集 `_IMU_INIT_N=20` 个静止样本（窗内角偏差 ≤5°）锁成 `R_home`，之后每个读数经 `imu_to_paddle_world(R, R_home, R_ref)`（`witmotion.py`，= `R@R_home.T@R_ref`）换算成球拍桌面系世界朝向，`R_ref=_IMU_REF_YZ=Rz(-90°)`（mesh 手柄 +X→桌面 −Y、拍面 +Z→+Z）——固定安装角 A 被消掉、参考时刻输出恰为 `R_ref`，挥拍时贴合真实世界朝向。**⚠️ 别用 `R_home.T@R_imu`（共轭旋转），一般三维运动屏幕朝向会整体错位**（有回归测试 `test_imu_to_paddle_world_*` 锁定）。若实测手柄反了 180° 把 `_IMU_REF_YZ` 反号即可。运动时不锁（滚动窗+限频提示），重按 i 重锁。
+- **磁力计航向锚定（消 yaw 漂移，2026-09-02 加）**：症状「挥拍几圈摆回参考姿态，拍面平对
+  但手柄航向对不上」= 模块片上 Kalman 的 yaw 在没有可用磁场基准时退化成纯陀螺积分（模块
+  默认只报 0x61 acc+gyro+角度，**磁力计根本没吐**）。主机侧修法（无需上位机「转 8 字」）：
+  `ImuReader(request_mag=True)` 把 RRST 寄存器 0x02 写成 0x0F 请求 0x54 磁力计补报（**故意
+  不 SAVE**——内容配置只在本次会话生效、掉电复原；写后 ~0.8s 自校验，角度停流回写 0x07
+  复原，固件忽略则静默回落模块 yaw）；锁参考那一刻把当前磁航向记进 `MagYawLock`
+  （`witmotion.py`；纯函数 `tilt_compensated_mag_heading`/`wrap_pi` 可单测），之后每包在
+  模块**平放且静止**（|roll|/|pitch|≤12°、|gyro|≤40°/s）时把显示航向锚回磁场（世界竖直
+  修正 `R_disp = Rz(δ) @ R_disp0`），快速倾斜挥拍/转动时冻结修正、回落模块 yaw。绝对磁场
+  方向在「heading 相对参考相减」里被消掉 → 不依赖 IMU 轴方向、不需要任何磁场校准。验证
+  看 `[IMU] 磁力计已开启（0x54 收到）` 与锁参考后的 `磁力计航向锚定已启用` 日志；单测
+  `test_mag_*` / `test_imu_yaw_lock_*` 在 `tests/test_imu.py`。
 - `right_wrist_anchor` / `so3_project` / `imu_to_paddle_world` 逻辑可测（`viewer3d.right_wrist_anchor` 按骨架名找 `right_wrist`，halpe26=idx10；锚点默认原点 = 桌面原点 (0,0,0)）。
 - 四元数默认不上报（0x59 需 `FF AA 27 51 00` 寄存器读，当前用角度即可）。
 

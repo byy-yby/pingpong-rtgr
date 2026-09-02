@@ -14,11 +14,14 @@ from tabletennis.imu.reader import (
     _set_rate_cmd,
 )
 from tabletennis.imu.witmotion import (
+    MagYawLock,
     WitMotionParser,
     angle_to_rotmat,
     imu_to_paddle_world,
     quat_to_rotmat,
     so3_project,
+    tilt_compensated_mag_heading,
+    wrap_pi,
 )
 from tabletennis.visualization.viewer3d import (
     SceneViewer3D,
@@ -343,3 +346,152 @@ def test_set_imu_anchor_threadsafe_state():
     v.set_imu_anchor(None)
     with v._imu_lock:
         assert np.allclose(v._imu_anchor, [0.2, 0.5, 1.0])  # None 被忽略
+
+
+# ----------------------------------------------------------------------
+# 磁航向锚定：tilt_compensated_mag_heading / MagYawLock（消除陀螺 yaw 漂移）
+# ----------------------------------------------------------------------
+_NORTH = np.array([1.0, 0.0, 0.0])   # 水平磁场指北（任意均匀刻度在 atan2 中抵消）
+
+
+def _mag_for_rpy(roll, pitch, yaw):
+    """模块处于欧拉(roll,pitch,yaw) 且世界水平磁场 = _NORTH 时，body 系磁力计读数。"""
+    return angle_to_rotmat(roll, pitch, yaw).T @ _NORTH
+
+
+def _rotz(deg):
+    a = np.radians(deg); c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _ang_between(A, B):
+    cos = (np.trace(A.T @ B) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+
+def test_wrap_pi():
+    assert abs(wrap_pi(190.0) - (-170.0)) < 1e-9
+    assert abs(wrap_pi(-190.0) - 170.0) < 1e-9
+    assert abs(wrap_pi(360.0)) < 1e-9
+    assert abs(wrap_pi(180.0) - 180.0) < 1e-9
+    assert abs(wrap_pi(540.0) - 180.0) < 1e-9
+    assert abs(wrap_pi(-540.0) - 180.0) < 1e-9   # ≡ +180°，取区间代表 +180
+
+
+def test_mag_heading_flat_equals_yaw():
+    """水平时 heading == 模块 yaw：+x 指磁场北时 0，yaw 增则 heading 同步增。"""
+    for yaw in (-170.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 170.0, 179.0):
+        h = tilt_compensated_mag_heading(0.0, 0.0, _mag_for_rpy(0.0, 0.0, yaw))
+        assert abs(wrap_pi(h - yaw)) < 1e-6, f"yaw={yaw} heading={h}"
+
+
+def test_mag_heading_tilt_invariant():
+    """倾角补偿后 heading 只反映世界航向，与 roll/pitch 无关（水平磁场下 == yaw）。"""
+    for roll, pitch, yaw in [(25.0, 0.0, 0.0), (0.0, 30.0, 0.0),
+                             (15.0, -20.0, 45.0), (-35.0, 20.0, -120.0),
+                             (-10.0, 5.0, 178.0)]:
+        h = tilt_compensated_mag_heading(roll, pitch,
+                                         _mag_for_rpy(roll, pitch, yaw))
+        assert abs(wrap_pi(h - yaw)) < 1e-6, f"rpy=({roll},{pitch},{yaw}) h={h}"
+
+
+def test_mag_heading_zero_mag_returns_zero():
+    assert tilt_compensated_mag_heading(0.0, 0.0, (0.0, 0.0, 0.0)) == 0.0
+
+
+def test_mag_yaw_lock_returns_reference_after_drift():
+    """核心场景：模块 yaw 漂 +35°，球拍物理上已回到参考姿态。磁锚定应输出 -35°
+    的绕世界竖直修正，使 R_disp0（含漂移的显示旋转）被拉回 R_ref。"""
+    lock = MagYawLock()
+    lock.lock(0.0, 0.0, 0.0, _mag_for_rpy(0.0, 0.0, 0.0))
+    # 模块自报 yaw 从 0 涨到 35（漂移）；磁力计读数同参考（物理姿态相同 → 磁场同）
+    delta = 0.0
+    for _ in range(60):
+        delta = lock.update(0.0, 0.0, 35.0, 0.0, _mag_for_rpy(0.0, 0.0, 0.0))
+    assert abs(delta - (-35.0)) < 0.5, f"delta={delta}（期望 ≈ -35）"
+
+    # 落到真实显示路径：R_home = 参考时刻模块 R（M=I 时 = Rz(-90°)）
+    R_home = _R_REF
+    R_disp0 = imu_to_paddle_world(angle_to_rotmat(0.0, 0.0, -90.0 + 35.0),
+                                  R_home, _R_REF)
+    R_corr = _rotz(delta) @ R_disp0
+    assert _ang_between(R_corr, _R_REF) < 0.5
+
+
+def test_mag_yaw_lock_no_drift_keeps_zero():
+    """无漂移时锚定不加修正：物理转 +90°（模块 yaw=+90、磁场同步），delta 保持 ~0。"""
+    lock = MagYawLock()
+    lock.lock(0.0, 0.0, 0.0, _mag_for_rpy(0.0, 0.0, 0.0))
+    for _ in range(30):
+        delta = lock.update(0.0, 0.0, 90.0, 0.0, _mag_for_rpy(0.0, 0.0, 90.0))
+    assert abs(delta) < 0.5, f"delta={delta}（无漂移应保持 0）"
+
+
+def test_mag_yaw_lock_freezes_during_fast_motion():
+    """快挥（|gyro| > 门限）时修正冻结：不把磁噪声带进挥拍。"""
+    lock = MagYawLock()
+    lock.lock(0.0, 0.0, 0.0, _mag_for_rpy(0.0, 0.0, 0.0))
+    for _ in range(30):                       # 先在静止下收敛
+        v0 = lock.update(0.0, 0.0, 0.0, 0.0, _mag_for_rpy(0.0, 0.0, 0.0))
+    for _ in range(5):                        # 快速平面转 +90°，gyro 300°/s
+        v = lock.update(0.0, 0.0, 90.0, 300.0, _mag_for_rpy(0.0, 0.0, 90.0))
+        assert abs(v - v0) < 1e-6, f"运动中断言 delta 冻结：{v} vs {v0}"
+
+
+def test_mag_yaw_lock_tilted_does_not_lock():
+    """明显倾斜（|roll| > 平放门限）时不锚定：即使模块 yaw 已漂，也冻结上次修正。"""
+    lock = MagYawLock()
+    lock.lock(0.0, 0.0, 0.0, _mag_for_rpy(0.0, 0.0, 0.0))
+    v0 = 0.0
+    for _ in range(5):
+        v0 = lock.update(40.0, 0.0, 45.0, 0.0,
+                         _mag_for_rpy(40.0, 0.0, 45.0))
+    assert abs(v0) < 1e-6  # 倾斜即权重 0，修正保持 0（不追 45° 的假锚定）
+
+
+def test_mag_yaw_lock_disabled_without_mag():
+    lock = MagYawLock()
+    assert not lock.enabled
+    assert lock.update(0.0, 0.0, 35.0, 0.0, (1.0, 0.0, 0.0)) == 0.0
+    lock.lock(0.0, 0.0, 0.0, (1.0, 0.0, 0.0))
+    assert lock.enabled
+    assert lock.update(0.0, 0.0, 0.0, 0.0, None) == 0.0
+
+
+def test_reader_request_mag_flag_and_snapshot_path():
+    """request_mag 透传；0x54 磁场包进快照，on_packet 携带最新 accel/gyro/mag。
+
+    ImuReader._on_notify 是同步可测路径（不走 asyncio/BLE）。
+    """
+    r = ImuReader(request_mag=True)
+    assert r.request_mag is True
+    assert ImuReader().request_mag is False
+    packets = []
+    r.on_packet = packets.append
+
+    # 1) 组合包（无 mag 快照）→ on_packet 触发，mag=None
+    comb = (_i16(0) * 3 + _i16(0) * 3 + _angle_payload(0.0, 0.0, 90.0))
+    r._on_notify(None, _ble_pkt(0x61, comb))
+    assert len(packets) == 1
+    assert packets[0]["mag"] is None
+    assert abs(packets[0]["yaw"] - 90.0) < 1e-6
+    assert packets[0]["accel"] == (0.0, 0.0, 0.0)
+    assert r.latest_rotation() is not None
+
+    # 2) 单独 0x54 磁场包：只刷快照，不触发 on_packet
+    r._on_notify(None, _ble_pkt(0x54, _i16(100) + _i16(-200) + _i16(300)))
+    assert len(packets) == 1          # 没触发第二次
+    assert r._n_mag == 1
+
+    # 3) 再来一个组合包 → on_packet 带上上一步的 mag 快照
+    r._on_notify(None, _ble_pkt(0x61, comb))
+    assert len(packets) == 2
+    assert packets[1]["mag"] == (100.0, -200.0, 300.0)
+
+    # 4) 分离包路径：加速度 0x51 / 磁场 0x54 / 角度 0x53 各自到达
+    r._on_notify(None, _ble_pkt(0x51, _i16(0) * 3))
+    r._on_notify(None, _ble_pkt(0x54, _i16(7) + _i16(8) + _i16(9)))
+    r._on_notify(None, _ble_pkt(0x53, _angle_payload(0.0, 0.0, 45.0)))
+    assert len(packets) == 3
+    assert packets[2]["mag"] == (7.0, 8.0, 9.0)
+    assert abs(packets[2]["yaw"] - 45.0) < 1e-6
