@@ -1,18 +1,27 @@
-"""维特智能 (WitMotion) IMU 的 0x55 串口协议解析 + 姿态换算。
+"""维特智能 (WitMotion) IMU 的 0x55 协议解析 + 姿态换算。
 
 WT9011DCL 走「新协议」：默认以组合包 ``0x55 0x61 ...``（加速度 6B + 角速度 6B +
-角度 6B）在 115200 波特率、10Hz 输出；经典协议的单字段包（0x51 加速度 /
-0x52 角速度 / 0x53 角度 / 0x59 四元数）也一并兼容。数据一律小端、int16。
+角度 6B）在 115200 波特率输出；经典协议的单字段包（0x51 加速度 / 0x52 角速度 /
+0x53 角度 / 0x59 四元数）也一并兼容。数据一律小端、int16。
 
-帧格式：``0x55 | Flag | DataL DataH ... | Checksum``，校验和 = 从 0x55 起到
-数据末（不含校验字节）全部字节之和的低 8 位。
+**帧格式（UART vs BLE 实测不一样，这是本项目踩过的大坑）**：
+- UART：``0x55 | Flag | Data | Checksum``，共 ``2+len+1`` 字节，校验和 = 从 0x55
+  起到数据末（不含校验字节）全部字节之和的低 8 位。
+- **BLE（WT901BLE5.0 实测，MTU 23）：0x61 组合包只有 ``0x55 | 0x61 | 18B 数据``
+  共 20 字节，不带校验和字节**；模块把连续多个包塞进同一条 notify（80B=4 包、
+  40B=2 包）。若仍按 21B 带校验解析，每个包校验都失败，有效包只剩 1/256 的运气值
+  → 表现为「能连上但姿态几乎不动 / 偶发跳一下」。
+
+所以 :class:`WitMotionParser` 带 ``checksum`` 开关：``checksum=True`` 是 UART 21B
+带校验（默认，向后兼容）；BLE 读取（:mod:`tabletennis.imu.reader`）用
+``checksum=False`` 按 20B 无校验解析。
 
 换算：
 - 角度（roll/pitch/yaw，度）= int16 / 32768 * 180；
 - 四元数 Q0~Q3 = int16 / 32768（Q0=w 实部，Q1..3=x,y,z）；
 - 欧拉角序列为 Z-Y-X（绕 Z 转 yaw、绕 Y 转 pitch、绕 X 转 roll）。
 
-本模块纯 numpy、无 I/O；串口读取在 :mod:`tabletennis.imu.reader`。
+本模块纯 numpy、无 I/O；读取在 :mod:`tabletennis.imu.reader`。
 """
 from __future__ import annotations
 
@@ -88,13 +97,23 @@ class WitMotionParser:
 
     用法：反复 ``feed(chunk)``，每次返回该 chunk 内解析出的完整报文列表；
     跨 chunk 的残包会在内部缓冲，直到凑齐（或校验失败丢弃）。
+
+    Args:
+        checksum: True = UART 帧（``2+len+1`` 字节，带校验和，默认）；False =
+            BLE 帧（``2+len`` 字节，无校验和，见模块 docstring 的实测结论）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, checksum: bool = True) -> None:
         self._buf = bytearray()
+        self.checksum = checksum
+        # 解析统计（调试用）：bytes=累计输入字节，packets=成功报文，checksum_fail=校验失败，
+        # unknown_flag=未知 flag，partial_wait=等更多字节（跨块残包）。
+        self.stats = {"bytes": 0, "packets": 0, "checksum_fail": 0,
+                      "unknown_flag": 0, "partial_wait": 0}
 
     def feed(self, chunk: bytes) -> List[Dict]:
         self._buf += chunk
+        self.stats["bytes"] += len(chunk)
         out: List[Dict] = []
         pos = 0
         n = len(self._buf)
@@ -107,6 +126,7 @@ class WitMotionParser:
                 break  # 头 + flag 字节没齐，等下一块
             pkt, consumed = self._parse_one(self._buf[pos:])
             if pkt is not None:
+                self.stats["packets"] += 1
                 out.append(pkt)
                 pos += consumed
             elif consumed == 0:
@@ -131,12 +151,15 @@ class WitMotionParser:
         flag = buf[1]
         ln = _FLAG_LEN.get(flag)
         if ln is None:
+            self.stats["unknown_flag"] += 1
             return None, 1  # 未知 flag：丢掉这个 0x55
-        total = 2 + ln + 1
+        total = 2 + ln + (1 if self.checksum else 0)
         if len(buf) < total:
+            self.stats["partial_wait"] += 1
             return None, 0  # 数据未到齐
         data = buf[2:2 + ln]
-        if (sum(buf[:2 + ln]) & 0xFF) != buf[2 + ln]:
+        if self.checksum and (sum(buf[:2 + ln]) & 0xFF) != buf[2 + ln]:
+            self.stats["checksum_fail"] += 1
             return None, 1  # 校验和不匹配：丢掉这个 0x55
         return self._decode(flag, data), total
 
