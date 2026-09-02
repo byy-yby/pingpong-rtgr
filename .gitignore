@@ -36,6 +36,9 @@ config/camera_settings.json
 *.onnx
 runs/
 
+# SMPL 身体模型（smpl.is.tue.mpg.de 注册下载，非再分发，不进版本库）
+data/bodymodels/
+
 # Claude Code worktree（多 session 并行隔离，勿提交）
 .claude/worktrees/
 

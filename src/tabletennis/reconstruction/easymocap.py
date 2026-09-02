@@ -33,18 +33,19 @@ from ..core.types import CameraExtrinsics, CameraIntrinsics, Pose2D
 # EasyMocap 代码的默认位置（可通过 EASYMOCAP_ROOT 覆盖）
 DEFAULT_EASYMOCAP_ROOT = "/home/yby/projects/EasyMocap"
 
-# halpe26 -> SMPL24（LSP 顺序）关键点映射：(halpe26 索引, SMPL 关节索引)。
-# SMPL 24 关节顺序：0 pelvis, 1/2 hip, 3/4 knee, 5/6 ankle, 7/8 foot,
-# 9/10/11 spine1/2/3, 12 neck, 13 head, 14/15 collar, 16/17 shoulder,
-# 18/19 elbow, 20/21 wrist, 22/23 hand。
+# halpe26 -> SMPL24 关键点映射：(halpe26 索引, SMPL 关节索引)。
+# ⚠️ SMPL 模型文件的关节是「原生顺序」（EasyMocap 的 SMPLModel 不做重排），
+# 由 kintree_table 推出：0 pelvis, 1/2 hip, 3 spine1, 4/5 knee, 6 spine2,
+# 7/8 ankle, 9 spine3, 10/11 foot, 12 neck, 13/14 collar, 15 head,
+# 16/17 shoulder, 18/19 elbow, 20/21 wrist, 22/23 hand。
 HALPE26_TO_SMPL24: List[Tuple[int, int]] = [
     (19, 0),                 # hip(骨盆)      -> pelvis
     (11, 1), (12, 2),        # 左右髋          -> hip
-    (13, 3), (14, 4),        # 左右膝          -> knee
-    (15, 5), (16, 6),        # 左右踝          -> ankle
-    (24, 7), (25, 8),        # 左右脚跟        -> foot（脚部只取脚跟，权重略低）
+    (13, 4), (14, 5),        # 左右膝          -> knee
+    (15, 7), (16, 8),        # 左右踝          -> ankle
+    (24, 10), (25, 11),      # 左右脚跟        -> foot（脚部只取脚跟，权重略低）
     (18, 12),                # 颈              -> neck
-    (17, 13), (0, 13),       # 头顶 + 鼻子     -> head
+    (17, 15), (0, 15),       # 头顶 + 鼻子     -> head
     (5, 16), (6, 17),        # 左右肩          -> shoulder
     (7, 18), (8, 19),        # 左右肘          -> elbow
     (9, 20), (10, 21),       # 左右腕          -> wrist
@@ -58,6 +59,10 @@ DEFAULT_MIN_CONF = 0.3   # 2D 关键点置信度阈值，低于此值不参与�
 DEFAULT_N_ITER = 200     # Adam 迭代次数（基础版，未做加速）
 DEFAULT_W_POSE = 1e-2    # 姿态先验权重（正则到 T-pose）
 DEFAULT_W_SHAPE = 1e-1   # 形状先验权重（正则到平均体型）
+
+# 全局旋转 Rh 的初值：SMPL 模型是 Y 轴朝上，我们的桌面系是 Z 轴朝上，
+# 绕 X 轴 +90° 把 Y->Z，让人体从「直立」起步（否则零初值易陷入倒立/倾斜的局部最优）。
+DEFAULT_RH_INIT = (np.pi / 2, 0.0, 0.0)
 
 # 常见 SMPL 模型文件名（在 data/bodymodels/ 下按顺序尝试）
 _MODEL_CANDIDATES = [
@@ -139,13 +144,19 @@ class EasymocapReconstructor:
             )
             return
 
-        self._model = SMPLModel(model_path=path, regressor_path=None, device=device)
+        # NUM_SHAPES=10：标准 SMPL 只用前 10 个形状主成分（betas 10 维），
+        # 原始 shapedirs 有 300 列，需截断。
+        self._model = SMPLModel(model_path=path, regressor_path=None, device=device,
+                                NUM_SHAPES=10)
         self._error = None
         self._device = self._model.device
         self._faces = self._model.faces  # (13776, 3) 面索引
         self._n_joints = 24
+        self._n_shapes = self._model.NUM_SHAPES   # 10
+        self._n_poses = self._model.NUM_POSES     # 69（24 关节 - 根旋转）
         print(f"[EasyMocap] SMPL 模型已加载：{os.path.basename(path)}"
-              f"（{self._model.nVertices} 顶点 / {self._n_joints} 关节，device={self._model.device}）")
+              f"（{self._model.nVertices} 顶点 / {self._n_joints} 关节 / "
+              f"{self._n_shapes} 形状 / {self._n_poses} 姿态，device={self._model.device}）")
 
     @property
     def ready(self) -> bool:
@@ -215,6 +226,7 @@ class EasymocapReconstructor:
         min_conf: float = DEFAULT_MIN_CONF,
         w_pose: float = DEFAULT_W_POSE,
         w_shape: float = DEFAULT_W_SHAPE,
+        rh_init: Tuple[float, float, float] = DEFAULT_RH_INIT,
     ) -> Optional[dict]:
         """把 SMPL 拟合到多视角 2D 关键点（重投影损失，不做三角测量）。
 
@@ -254,10 +266,10 @@ class EasymocapReconstructor:
         th0 = root if root is not None else np.array([0.0, 0.0, 0.9])
         print(f"[EasyMocap] {len(obs_by_cam)} 视角观测，根部初值 Th={th0.round(2)}")
 
-        # 可微参数：pose(1,69) / shape(1,10) / Rh(1,3) / Th(1,3)
-        poses = torch.zeros((1, 69), dtype=dtype, device=device, requires_grad=True)
-        shapes = torch.zeros((1, 10), dtype=dtype, device=device, requires_grad=True)
-        Rh = torch.zeros((1, 3), dtype=dtype, device=device, requires_grad=True)
+        # 可微参数：pose(1,n_poses) / shape(1,n_shapes) / Rh(1,3) / Th(1,3)
+        poses = torch.zeros((1, self._n_poses), dtype=dtype, device=device, requires_grad=True)
+        shapes = torch.zeros((1, self._n_shapes), dtype=dtype, device=device, requires_grad=True)
+        Rh = torch.tensor(rh_init, dtype=dtype, device=device).reshape(1, 3).requires_grad_(True)
         Th = torch.tensor(th0, dtype=dtype, device=device).reshape(1, 3).requires_grad_(True)
 
         optimizer = torch.optim.Adam([poses, shapes, Rh, Th], lr=0.05)
