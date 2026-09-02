@@ -20,6 +20,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# 内部缓冲上限：若字节流长时间不含 0x55（噪声/半包垃圾），feed() 只保留尾部
+# 一小段继续等头，防止长时间会话里内存无限增长、find 变慢。
+_MAX_BUF = 4096
+_KEEP_TAIL = 1024
+
 # 各 flag 对应的数据字节数（不含 0x55 头、flag 字节与校验字节）
 _FLAG_LEN = {
     0x50: 11,   # 时间（经典协议；WT9011DCL 默认不上报）
@@ -110,6 +115,10 @@ class WitMotionParser:
                 pos += consumed  # 坏头（校验失败/未知 flag）：跳过这个 0x55 重新找头
         if pos > 0:
             del self._buf[:pos]
+        elif len(self._buf) > _MAX_BUF:
+            # 本轮没消费任何字节且缓冲超限：说明长时间没有 0x55 头（噪声流），
+            # 只保留尾部小窗继续等下一帧，防内存无限增长。
+            del self._buf[:len(self._buf) - _KEEP_TAIL]
         return out
 
     def _parse_one(self, buf) -> Tuple[Optional[Dict], int]:
