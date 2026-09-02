@@ -40,7 +40,7 @@ from tabletennis.visualization.overlay2d import (
 )
 from tabletennis.vision.ball import ClassicalBallDetector
 from tabletennis.vision.detector import create_detector
-from tabletennis.imu.witmotion import so3_project
+from tabletennis.imu.witmotion import imu_to_paddle_world, so3_project
 from tabletennis.visualization.viewer3d import right_wrist_anchor
 
 MAIN_WIN = "Cameras"
@@ -60,12 +60,26 @@ PARAM_SPECS = [
 ]
 PARAM_BY_KEY = {s["key"]: s for s in PARAM_SPECS}
 
-# IMU 参考姿态初始化：用户初次连接时把球拍平放于桌面原点（拍面朝上），采集一小段
-# 静止样本锁成 R_home，之后所有朝向都相对它输出（消除 IMU 安装角 + 放置姿态的固定偏差）。
+# IMU 参考姿态初始化：用户初次连接时把球拍平放于桌面原点（正面朝上、点口端/手柄侧朝
+# 桌面 −Y；表系 X=短边 1.525m、Y=长边 2.74m、Z 向上、原点=桌角原点标记）。采集一小段静止
+# 样本锁成 R_home，之后显示朝向 = imu_to_paddle_world(R, R_home, _IMU_REF_YZ)，参考时刻
+# 输出 _IMU_REF_YZ，消除 IMU 安装角 + 放置姿态的固定偏差。
 _IMU_INIT_N = 20              # 参考姿态采样数（@100Hz 约 0.2s）
 _IMU_INIT_MAX_DEG = 5.0       # 窗内最大角偏差（度），超过则视为用户还在动，滚动窗继续采
 _IMU_INIT_HINT_S = 2.0        # 等待参考姿态期间的限频提示间隔（秒）
 _WRIST_MIN_CONF = 0.3         # 右手腕锚点的最低三角化置信度（低于视为无效）
+
+# 参考姿态的世界旋转 R_ref：用户初始化时球拍平放、正面朝上（拍面法线 → +Z）、点口端/手柄
+# 朝桌面 −Y。viewer3d._paddle_mesh 默认手柄沿 +X、拍面法线 +Z，故 R_ref = Rz(-90°) 把
+# 手柄 +X 转到桌面 −Y（同时 +Z 拍面法线保持朝上）。IMU 模块自身轴方向不需要预先知道——
+# 参考锁定把它全消掉了；R_ref 只由「用户把拍子摆成什么姿态」决定。
+# 若实测发现屏幕拍子绕竖直轴反了 180°（手柄指向 +Y 才是实物手柄那侧），把 R_ref 的
+# ±1 符号整体反一下即可。
+_IMU_REF_YZ = np.array([
+    [0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+], dtype=np.float64)
 
 GRID_COLS = 2
 DEFAULT_MAX_WIDTH = 1920          # 视频网格目标宽度（越大窗口越大）
@@ -464,11 +478,13 @@ class LiveControl:
         return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
     def _imu_anchor(self) -> np.ndarray:
-        """IMU 球拍朝向的锚点（世界系 = 桌面系，米）：桌面中心上方。"""
-        if self._table_detector is not None:
-            t = self._table_detector.table
-            return np.array([t.width / 2.0, t.length / 2.0, 0.35], dtype=np.float64)
-        return np.array([0.0, 0.0, 0.35], dtype=np.float64)
+        """IMU 球拍回退锚点（世界系 = 桌面系，米）：桌面原点（桌角原点标记）上方。
+
+        用户按 i 时把球拍平放在「桌面坐标系原点」(0,0,0)（桌角那个原点标记处）做参考；
+        姿态重建还没出右手腕前，球拍先停在这附近——是原点，不是桌面中心。一旦手腕出数
+        锚点即被逐帧覆盖成手腕 3D 位置。z=0.05：桌面表面在 z=0，抬高一点避免沉进桌里。
+        """
+        return np.array([0.0, 0.0, 0.05], dtype=np.float64)
 
     def _enable_imu(self) -> None:
         """按 i 开启：确保 3D 场景存在 + 启动串口读取线程。"""
@@ -504,14 +520,18 @@ class LiveControl:
         self._last_init_hint = 0.0
         print("[IMU] ON——读 WT9011DCL 蓝牙姿态，3D 窗口显示球拍朝向"
               f"（上报率 {self.imu_rate:g}Hz）")
-        print("[IMU] 请把球拍平放在桌面原点（拍面朝上、手柄朝+X），保持静止以锁定参考姿态…")
+        print("[IMU] 请把球拍平放在桌面原点（正面朝上、点口端朝桌面 −Y，"
+              "Y=长边）：保持静止约 0.2s 以锁定参考姿态…")
 
     def _imu_on_orientation(self, R) -> None:
-        """notify 线程回调：锁定参考姿态，再把相对朝向推给 3D 场景。
+        """notify 线程回调：锁定参考姿态，再把球拍世界朝向推给 3D 场景。
 
-        首次连接时用户把球拍平放在桌面原点（拍面朝上），这里采集一小段静止样本锁成
-        ``R_home``，之后所有朝向都输出「相对参考姿态」的旋转 ``R_rel = R_home^T @ R``
-        ——既消除了 IMU 安装角与放置姿态的固定偏差，也让初始化那一刻球拍正好「平放朝上」。
+        首次连接时用户把球拍平放在桌面原点（正面朝上、点口端朝桌面 −Y），这里采集一小段
+        静止样本锁成 ``R_home``；此后每个读数都经
+        ``R_disp = imu_to_paddle_world(R, R_home, _IMU_REF_YZ) = R @ R_home.T @ R_ref``
+        换算成球拍在桌面系里的世界朝向——安装角 A 被消掉，参考时刻恰好显示成
+        ``R_ref``（拍面平放朝上 +Z、手柄朝 −Y），之后挥拍时拍面/手柄贴合真实世界朝向。
+        （不要用 ``R_home.T @ R``：那是共轭旋转，一般三维运动下屏幕朝向会整体错位。）
 
         走回调路径而非主循环逐帧轮询，是为了**绕开主循环帧率钳制**（主循环约 20FPS，
         而 IMU 上报率可到 100Hz——串行推会在 60fps 窗口里仍然顿挫）。
@@ -542,9 +562,9 @@ class LiveControl:
             self._imu_init_samples = []
             print("[IMU] 参考姿态已锁定（球拍平放于桌面原点）。"
                   "按 P 开启姿态重建后，球拍将绑定到右手腕位置。")
-        R_rel = self._imu_R_home.T @ R
+        R_disp = imu_to_paddle_world(R, self._imu_R_home, _IMU_REF_YZ)
         if self.viewer3d is not None:
-            self.viewer3d.set_imu_orientation(R_rel)
+            self.viewer3d.set_imu_orientation(R_disp)
 
     def _disable_imu(self) -> None:
         if self._imu_reader is not None:
