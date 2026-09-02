@@ -5,7 +5,12 @@
 """
 import numpy as np
 
-from tabletennis.imu.reader import ImuReader
+from tabletennis.imu.reader import (
+    ImuReader,
+    _SAVE_CMD,
+    _UNLOCK_CMD,
+    _set_rate_cmd,
+)
 from tabletennis.imu.witmotion import (
     WitMotionParser,
     angle_to_rotmat,
@@ -112,3 +117,43 @@ def test_reader_notify_path():
     R = r.latest_rotation()
     assert R is not None
     assert np.allclose(R @ np.array([1, 0, 0]), np.array([0, 1, 0]), atol=1e-6)
+
+
+def test_write_cmd_bytes_official():
+    """写命令字节须与官方 SDK 完全一致（NORMAL 协议 5 字节无校验）。"""
+    # Android 例程 Bwt901cl.unlockReg() / setReturnRate()，C SDK WitWriteReg()
+    assert _UNLOCK_CMD == bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5])   # 解锁 KEY=0x69
+    assert _SAVE_CMD == bytes([0xFF, 0xAA, 0x00, 0x00, 0x00])     # 保存 SAVE=0x00
+    assert _set_rate_cmd(10.0) == bytes([0xFF, 0xAA, 0x03, 0x06, 0x00])   # RATE=0x03
+    assert _set_rate_cmd(50.0) == bytes([0xFF, 0xAA, 0x03, 0x08, 0x00])
+    assert _set_rate_cmd(100.0) == bytes([0xFF, 0xAA, 0x03, 0x09, 0x00])
+    assert _set_rate_cmd(200.0) == bytes([0xFF, 0xAA, 0x03, 0x0B, 0x00])
+    assert all(len(c) == 5 for c in (_UNLOCK_CMD, _SAVE_CMD, _set_rate_cmd(100.0)))
+
+
+def test_reader_rate_snap():
+    """请求的上报率就近归整到模块支持的取值。"""
+    assert ImuReader(output_rate_hz=90).output_rate_hz == 100.0
+    assert ImuReader(output_rate_hz=30).output_rate_hz == 20.0
+    assert ImuReader(output_rate_hz=1.5).output_rate_hz == 1.0
+    assert ImuReader(output_rate_hz=300).output_rate_hz == 200.0
+
+
+def test_on_orientation_callback():
+    """notify 解析出姿态后调用 on_orientation(R)，R 为正确旋转矩阵。"""
+    r = ImuReader()
+    got = []
+    r.on_orientation = got.append
+    payload = _i16(0) * 3 + _i16(0) * 3 + _angle_payload(0.0, 0.0, 90.0)
+    r._on_notify(None, _pkt(0x61, payload))
+    assert len(got) == 1
+    assert np.allclose(got[0] @ np.array([1, 0, 0]), np.array([0, 1, 0]), atol=1e-6)
+
+
+def test_on_orientation_callback_not_called_on_garbage():
+    """无有效姿态（非角度/四元数包）不触发回调。"""
+    r = ImuReader()
+    got = []
+    r.on_orientation = got.append
+    r._on_notify(None, b"\x00\x01\x02\x03")   # 纯垃圾
+    assert got == []

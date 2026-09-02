@@ -97,7 +97,7 @@ class LiveControl:
     # 组顺序即身份 ID（0/1）；换机位/换边时改这里。
     PERSON_GROUPS = [[0, 2], [1, 3]]
     def __init__(self, mgr: CameraManager, *, exposure_us, gain_db, gamma, trigger_mode,
-                 max_width, imu_name=None, imu_mac=None):
+                 max_width, imu_name=None, imu_mac=None, imu_rate=100.0):
         self.mgr = mgr
         self.trigger_mode = trigger_mode
         self.max_width = max_width
@@ -166,6 +166,7 @@ class LiveControl:
         self._imu_enabled = False
         self.imu_name = imu_name
         self.imu_mac = imu_mac
+        self.imu_rate = imu_rate     # 期望上报率（Hz，连接后自动下发命令提上去）
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -501,12 +502,27 @@ class LiveControl:
 
         from tabletennis.imu.reader import ImuReader
         if self._imu_reader is None:
-            self._imu_reader = ImuReader(device_name=self.imu_name, mac=self.imu_mac)
+            self._imu_reader = ImuReader(
+                device_name=self.imu_name, mac=self.imu_mac,
+                output_rate_hz=self.imu_rate,
+            )
+            self._imu_reader.on_orientation = self._imu_on_orientation
             self._imu_reader.start()
-        print("[IMU] ON——读 WT9011DCL 蓝牙姿态，3D 窗口显示球拍朝向")
+        print("[IMU] ON——读 WT9011DCL 蓝牙姿态，3D 窗口显示球拍朝向"
+              f"（上报率 {self.imu_rate:g}Hz）")
+
+    def _imu_on_orientation(self, R) -> None:
+        """notify 线程回调：直接把最新朝向推给 3D 场景。
+
+        走这条路径而非主循环逐帧轮询，是为了**绕开主循环帧率钳制**（主循环约
+        20FPS，而 IMU 上报率可到 100Hz——串行推会在 60fps 窗口里仍然顿挫）。
+        """
+        if self.viewer3d is not None:
+            self.viewer3d.set_imu_orientation(R)
 
     def _disable_imu(self) -> None:
         if self._imu_reader is not None:
+            self._imu_reader.on_orientation = None
             self._imu_reader.stop()
             self._imu_reader = None
         if self.viewer3d is not None:
@@ -1190,12 +1206,8 @@ class LiveControl:
                     self._em_pending_viewer = False
 
                 # （3D 球重建已由后台线程 _ball_recon_loop 负责，这里不再调用）
-
-                # IMU 朝向（按 i 开启后，每帧把最新姿态推给 3D 场景球拍层）
-                if self._imu_enabled and self._imu_reader is not None and self.viewer3d is not None:
-                    R = self._imu_reader.latest_rotation()
-                    if R is not None:
-                        self.viewer3d.set_imu_orientation(R)
+                # （IMU 朝向由 notify 线程 on_orientation 回调直接推给 3D 场景，
+                #   见 _imu_on_orientation——绕开这里 ~20FPS 的主循环，避免顿挫。）
 
                 canvas = self._compose_canvas()
                 cv2.imshow(MAIN_WIN, canvas)
@@ -1229,6 +1241,9 @@ def main() -> None:
     ap.add_argument("--max-width", type=int, default=DEFAULT_MAX_WIDTH, help="视频网格目标宽度（越大窗口越大）")
     ap.add_argument("--imu-name", default=None, help="IMU 蓝牙广播名子串（默认自动找名字含 'WT' 的模块）")
     ap.add_argument("--imu-mac", default=None, help="IMU 蓝牙 MAC 地址（如 AA:BB:CC:DD:EE:FF，跳过扫描）")
+    ap.add_argument("--imu-rate", type=float, default=100.0,
+                    help="IMU 上报率 Hz（默认 100；连接后自动下发命令设置，"
+                         "支持 0.2/0.5/1/2/5/10/20/50/100/200）")
     args = ap.parse_args()
 
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -1263,6 +1278,7 @@ def main() -> None:
                 max_width=args.max_width,
                 imu_name=args.imu_name,
                 imu_mac=args.imu_mac,
+                imu_rate=args.imu_rate,
             )
             ui.run()
     except KeyboardInterrupt:
