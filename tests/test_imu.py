@@ -9,8 +9,10 @@ import numpy as np
 from tabletennis.core.types import Skeleton3D
 from tabletennis.imu.reader import (
     ImuReader,
+    _MAG_REG,
     _SAVE_CMD,
     _UNLOCK_CMD,
+    _read_reg_cmd,
     _set_rate_cmd,
 )
 from tabletennis.imu.witmotion import (
@@ -44,6 +46,13 @@ def _pkt(flag: int, payload: bytes) -> bytes:
 def _ble_pkt(flag: int, payload: bytes) -> bytes:
     """BLE 帧（WT901BLE5.0 实测）：0x55 | Flag | Data（共 2+len 字节，无校验）。"""
     return bytes([0x55, flag]) + payload
+
+
+def _reg_pkt(reg: int, vals8) -> bytes:
+    """BLE 0x71 寄存器读响应（20B 无校验）：0x55 0x71 regL regH + 8×int16 连续寄存器值。"""
+    payload = bytes([reg & 0xFF, reg >> 8]) + b"".join(_i16(int(v)) for v in vals8)
+    assert len(vals8) == 8 and len(payload) == 18
+    return _ble_pkt(0x71, payload)
 
 
 def _angle_payload(roll: float, pitch: float, yaw: float) -> bytes:
@@ -497,6 +506,53 @@ def test_reader_request_mag_flag_and_snapshot_path():
     assert len(packets) == 3
     assert packets[2]["mag"] == (7.0, 8.0, 9.0)
     assert abs(packets[2]["yaw"] - 45.0) < 1e-6
+
+
+def test_read_reg_cmd_bytes_official():
+    """寄存器读命令 == 官方 BWT901BLE5.0 ReadData：``FF AA 27 <reg> 00``。"""
+    assert _read_reg_cmd(0x3A) == bytes([0xFF, 0xAA, 0x27, 0x3A, 0x00])  # 磁力计
+    assert _read_reg_cmd(0x51) == bytes([0xFF, 0xAA, 0x27, 0x51, 0x00])  # 四元数
+    assert len(_read_reg_cmd(0x3A)) == 5
+
+
+def test_parse_reg_0x71_response():
+    """BLE 0x71 寄存器读响应：``55 71 regL regH`` + 8×int16，解析出 reg 与连续值。
+
+    官方多平台（Android/C#/Python）一致：读 0x3A 时响应首 3 个值 = HX/HY/HZ。
+    """
+    f = _reg_pkt(0x3A, [100, -200, 300, 0, 0, 0, 0, 0])
+    assert len(f) == 20
+    out = WitMotionParser(checksum=False).feed(f)
+    assert len(out) == 1
+    assert out[0]["type"] == "reg"
+    assert out[0]["reg"] == 0x3A
+    assert out[0]["values"][:3] == (100.0, -200.0, 300.0)
+
+
+def test_reader_mag_snapshot_from_reg_0x3a():
+    """磁力计走官方 BLE 方式：轮询读寄存器 0x3A → 0x71 帧刷新 ``_last_mag``。
+
+    reg 帧只刷快照、不触发 on_packet；随后 0x61 姿态包带上最新 mag（锚定用）。
+    """
+    r = ImuReader(request_mag=True)
+    packets = []
+    r.on_packet = packets.append
+    comb = _i16(0) * 3 + _i16(0) * 3 + _angle_payload(0.0, 0.0, 0.0)
+
+    r._on_notify(None, _ble_pkt(0x61, comb))
+    assert len(packets) == 1 and packets[0]["mag"] is None
+
+    r._on_notify(None, _reg_pkt(_MAG_REG, [111, -22, 333, 0, 0, 0, 0, 0]))
+    assert r._n_mag == 1
+    assert len(packets) == 1          # reg 帧不触发姿态回调
+
+    r._on_notify(None, _ble_pkt(0x61, comb))
+    assert len(packets) == 2
+    assert packets[1]["mag"] == (111.0, -22.0, 333.0)
+
+    # 读别的寄存器（0x51 四元数）不影响 mag 快照
+    r._on_notify(None, _reg_pkt(0x51, [16384, 0, 0, 0, 0, 0, 0, 0]))
+    assert r._n_mag == 1
 
 
 def test_reader_ready_flag_and_on_ready():

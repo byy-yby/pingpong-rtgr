@@ -2,7 +2,10 @@
 
 WT9011DCL 走「新协议」：默认以组合包 ``0x55 0x61 ...``（加速度 6B + 角速度 6B +
 角度 6B）在 115200 波特率输出；经典协议的单字段包（0x51 加速度 / 0x52 角速度 /
-0x53 角度 / 0x59 四元数）也一并兼容。数据一律小端、int16。
+0x53 角度 / 0x59 四元数）也一并兼容。**BLE 固件（官方 BWT901BLE5.0）的磁力计与
+四元数不在周期流里**——要主动发寄存器读命令（``FF AA 27 <reg> 00``），模块以
+``0x55 0x71 <regL><regH>`` 开头的 20B 响应帧回传（连续寄存器值，读 0x3A 回
+HX/HY/HZ、读 0x51 回四元数 Q0..Q3）。数据一律小端、int16。
 
 **帧格式（UART vs BLE 实测不一样，这是本项目踩过的大坑）**：
 - UART：``0x55 | Flag | Data | Checksum``，共 ``2+len+1`` 字节，校验和 = 从 0x55
@@ -14,7 +17,7 @@ WT9011DCL 走「新协议」：默认以组合包 ``0x55 0x61 ...``（加速度 
 
 所以 :class:`WitMotionParser` 带 ``checksum`` 开关：``checksum=True`` 是 UART 21B
 带校验（默认，向后兼容）；BLE 读取（:mod:`tabletennis.imu.reader`）用
-``checksum=False`` 按 20B 无校验解析。
+``checksum=False`` 按 20B 无校验解析（0x61 与 0x71 都是 20B）。
 
 换算：
 - 角度（roll/pitch/yaw，度）= int16 / 32768 * 180；
@@ -37,12 +40,13 @@ _KEEP_TAIL = 1024
 # 各 flag 对应的数据字节数（不含 0x55 头、flag 字节与校验字节）
 _FLAG_LEN = {
     0x50: 11,   # 时间（经典协议；WT9011DCL 默认不上报）
-    0x51: 6,    # 加速度 Ax Ay Az
-    0x52: 6,    # 角速度 Wx Wy Wz
+    0x51: 6,    # 加速度 Ax Ay Az（经典协议）
+    0x52: 6,    # 角速度 Wx Wy Wz（经典协议）
     0x53: 6,    # 角度 Roll Pitch Yaw（经典协议）
-    0x54: 6,    # 磁场 Hx Hy Hz
+    0x54: 6,    # 磁场 Hx Hy Hz（经典协议）
     0x59: 8,    # 四元数 Q0 Q1 Q2 Q3
     0x61: 18,   # 组合包：加速度 + 角速度 + 角度（WT9011DCL 默认上报）
+    0x71: 18,   # BLE 寄存器读响应：reg(2B) + 8×int16 连续寄存器值（官方 BWT901BLE5.0）
 }
 
 _ACCEL_SCALE = 16.0 / 32768.0     # g
@@ -131,9 +135,10 @@ def angle_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
 # 背景：WT9011DCL 的片上 Kalman 只有在磁力计被校准/可用时才用磁场锚定 yaw。出厂没做
 # 磁场校准、台面附近又有铁磁物时，模块 yaw 退化成纯陀螺积分 → 挥拍几圈后摆回参考姿态，
 # 拍面水平对（重力锚定）但手柄航向对不上（陀螺积漂）。上位机/App 的「转 8 字」校准能修，
-# 但不方便用上位机的场景需要主机侧等价方案：让模块把磁力计 0x54 也上报，我们由原始 mag
-# 自己算**绝对**航向；模块平放静止时把显示航向钉到磁场（漂移清零），快速倾斜挥拍时磁
-# 力计不可靠，就冻结上次修正、暂时回落模块自身 yaw（单拍 ~0.1-0.5s 内陀螺误差很小）。
+# 但不方便用上位机的场景需要主机侧等价方案：周期读磁力计寄存器（BLE 0x71 响应，见
+# reader），我们由原始 mag 自己算**绝对**航向；模块平放静止时把显示航向钉到磁场
+# （漂移清零），快速倾斜挥拍时磁力计不可靠，就冻结上次修正、暂时回落模块自身 yaw
+# （单拍 ~0.1-0.5s 内陀螺误差很小）。
 #
 # 约定（纯函数可单测）：模块欧拉 Z-Y-X（yaw 绕 Z）。``tilt_compensated_mag_heading``
 # 用模块自身的 roll/pitch 把原始磁力计读数翻平，取水平投影方位角；模块水平时它==模块
@@ -385,4 +390,11 @@ class WitMotionParser:
         if flag == 0x54:
             hx, hy, hz = _i16s(data, 0, 3, 1.0)
             return {"type": "mag", "mag": (float(hx), float(hy), float(hz))}
+        if flag == 0x71:  # BLE 寄存器读响应（官方 BWT901BLE5.0：0x55 0x71 regL regH + 连续寄存器值）
+            # data = reg(2B 小端) + 8×int16；首个值 = reg 寄存器，随后 reg+1, reg+2, …
+            reg = data[0] | (data[1] << 8)
+            vals = _i16s(data, 2, 4, 1.0)
+            return {"type": "reg", "reg": reg,
+                    "values": (float(vals[0]), float(vals[1]),
+                               float(vals[2]), float(vals[3]))}
         return {"type": "unknown", "flag": flag}
