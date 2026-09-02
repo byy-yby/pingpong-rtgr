@@ -14,6 +14,12 @@
   参数化人体模型直接拟合到多视角 2D 关键点的重投影误差上，模型先验补全「只有
   单视角可见」的部位。基础版单人 / SMPL-24 关节（无手脸细节），依赖 EasyMocap
   的 `easymocap.bodymodel.smpl.SMPLModel` + SMPL 身体模型文件（见下）。
+- `em_fit.py` —— 优化层（`EmFit` + `EMSettings`）：对官方 `reconstruct()` 的
+  热启动 / 去同步 / 收敛开关封装，`run(..., prev=上帧 params)` 帧间连续拟合
+  （离线脚本默认档位，约 x2.3 且误差≈官方）。
+- `video_source.py` —— **离线输入**：把 `data/video/<session>/cam*.mp4` + ts
+  副产物读成对齐的多视角灰度帧流（`VideoSource.frames_for_ref`）。四路各自丢帧时
+  用**脉冲号对齐**把帧绑回同一触发（详见模块文档）。
 
 ## 数据流
 
@@ -70,3 +76,18 @@ result = rec.reconstruct(poses_per_cam, intrinsics, extrinsics)
 - **依赖**：EasyMocap 代码（`easymocap.bodymodel.smpl`，路径 `EASYMOCAP_ROOT` 或默认
   `/home/yby/projects/EasyMocap`），纯 torch+numpy，无需 smplx/chumpy。
 - 实时入口在 `scripts/live_control.py` 按 S。
+
+## 离线：录像 → EasyMocap（EasyMocap 无法实时时的替代路线）
+
+```bash
+# 1) live_control 按 v（或面板「录像」按钮）录四路 → data/video/<时间戳>/cam{0..3}.mp4 + ts
+# 2) 离线重建该文件夹：
+python scripts/reconstruct_video.py data/video/<时间戳> [--config stream] [--stride 1]
+#    → <时间戳>/recon/：逐帧 frame_NNNNNN.npz + recon_index.npz + recon_meta.json
+#    --fake-poses 无硬件/视频内容验证整条管道（注入合成站姿人，跑检测器时不读画面）
+```
+
+- `--config`：`official`（官方 cold `reconstruct()`，每帧冷启动，最慢）、
+  `warm` / `stream`（`em_fit.EmFit` 热启动，前者准、后者快，默认 `stream`）。
+- 丢帧不影响正确性：录制端把设备时间戳写 `cam{cid}_ts.npy`，离线按**脉冲号**对齐
+  （各机时钟绝对基准不可比，见 CLAUDE.md 时间戳节）。

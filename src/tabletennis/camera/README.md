@@ -13,6 +13,7 @@
 | `camera_manager.py` | 多相机统一管理：`setup/start/stop/close`、按序列号/索引选相机、`get_latest_bundle`。 |
 | `trigger.py` | 外部触发（信号发生器 Line0）/ 软件触发 / 连续采集的 GenICam 配置。 |
 | `parameter.py` | `ImageControl`：曝光/增益/黑电平/伽马/亮度/对比度/帧率/像素格式的读写 + 范围查询。 |
+| `recorder.py` | **四路同步录像**（`SessionVideoRecorder`）：每相机独立后台编码线程 + 帧 sink 旁路取帧 + 设备时间戳副产物，离线重建用。见下方「离线录像」。 |
 | `mv_import/` | vendor 的海康 MVS Python 绑定（`MvCameraControl_class.py` 等）。**生成代码，勿手改**。 |
 
 ## 怎么用
@@ -49,6 +50,26 @@ finalize_sdk()
 `grab_preview.py`（单机预览）、`grab_sync.py`（四机同步验证）、`query_parameters.py`（参数范围）。
 
 > 运行前先关 MVS 客户端，否则 `OpenDevice` 报 `0x80000203`（设备被独占）。
+
+## 离线录像（camera/recorder.py）
+
+`Camera.set_frame_sink(sink)` 把每帧**旁路**交给录制回调（采集线程里同步调用，须快进快出），
+`SessionVideoRecorder` 给每台相机开一个后台编码线程消费该回调，写
+`data/video/<YYYYmmdd_HHMMSS>/cam{cid}.mp4`（mp4v；编码跟不上时丢最旧帧不阻塞抓帧）。
+每个写进文件的帧都记下设备时间戳 → `cam{cid}_ts.npy`，离线脚本靠它把丢帧后的四路
+重新对齐到同一触发脉冲。
+
+```python
+from tabletennis.camera import CameraManager
+from tabletennis.camera.recorder import SessionVideoRecorder
+
+mgr = CameraManager(trigger_mode="external"); mgr.start()
+rec = SessionVideoRecorder(mgr.cameras, fps=100.0)   # fps 只影响播放速度
+rec.start(); ...; rec.stop()                          # stop() 返回 meta（帧数/时长/相机序列号）
+```
+
+入口：`live_control.py` 按 `v`（或点面板「录像」按钮）；重建端见
+`reconstruction/video_source.py` + `scripts/reconstruct_video.py`。
 
 ## 还没做完
 
