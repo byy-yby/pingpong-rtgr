@@ -23,6 +23,10 @@ IMU 走 **蓝牙 5.0 (BLE)**，不是串口。GATT 服务 ``ffe5``、notify 收�
   字节**，模块还把连续多个包塞进同一条 notify（80B=4 包、40B=2 包）。解析器必须以
   ``checksum=False`` 建（按 20B 解析），否则每个包校验都失败、有效包只剩 1/256 的运气值
   → 实测就是「能连上但姿态几乎不动 / 偶发跳一下」。
+- **磁力计不是周期流，要主动轮询读寄存器**：WT901BLE5.0 固件默认只周期上报 0x61
+  组合包；磁力计得发寄存器读命令 ``FF AA 27 3A 00``，模块以 ``0x71`` 响应帧回传
+  HX(0x3A)/HY(0x3B)/HZ(0x3C)（RRST 改回传内容的 0x54 流在该固件上实测不开）。
+  连上并提好速率后本线程按 ``_MAG_POLL_S`` 周期轮询，供主机侧磁航向锚定消 yaw 漂移。
 - 连不上 / 扫描不到不抛异常，只在日志提示，方便按 i 重试。
 """
 from __future__ import annotations
@@ -47,6 +51,15 @@ _SEND_UUID = "0000ffe9-0000-1000-8000-00805f9a34fb"    # write：发命令
 # 以及 Android 例程 Bwt901cl.unlockReg() / setReturnRate()。
 _UNLOCK_CMD = bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5])   # 解锁（KEY=0x69, 数据 0xB588）
 _SAVE_CMD = bytes([0xFF, 0xAA, 0x00, 0x00, 0x00])     # 保存（SAVE=0x00, 数据 0x0000）
+
+# 寄存器读命令（官方 BWT901BLE5.0：FF AA 27 <reg> 00，模块以 0x71 帧回传连续寄存器值）
+_MAG_REG = 0x3A        # 磁力计数据寄存器起点：读它回 HX(0x3A)/HY(0x3B)/HZ(0x3C)
+_MAG_POLL_S = 0.05     # 磁力计轮询周期（秒）≈20Hz；官方例程每轮都读 0x3A
+
+
+def _read_reg_cmd(reg: int) -> bytes:
+    """封装寄存器读命令（官方 ReadData：``FF AA 27 <reg> 00``）。"""
+    return bytes([0xFF, 0xAA, 0x27, reg & 0xFF, 0x00])
 
 # RATE 寄存器 0x03 取值 -> Hz（来自官方 SDK WitStandardProtocol_JY901 的 REG.h；
 # WT9011DCL 走 NORMAL 协议，默认 0x06=10Hz）
@@ -91,16 +104,16 @@ class ImuReader:
         self.output_rate_hz = _snap_rate(float(output_rate_hz))
         self.retry_delay = retry_delay
         self.parser = WitMotionParser(checksum=False)   # BLE 流无校验字节，见模块 docstring
-        # 连接后额外请求磁力计(0x54)上报（RRST 寄存器写，**不 SAVE**：只在本次会话生效，
-        # 掉电复原），供主机侧磁航向锚定消 yaw 漂移。默认 False——寄存器语义按模块实机
-        # 自校验（见 _request_mag_output），不保证每个固件都支持。
+        # 连接后轮询读磁力计寄存器 0x3A（官方 BWT901BLE5.0 方式：主动读寄存器、模块以
+        # 0x71 响应帧回传 HX/HY/HZ；不是 RRST 改回传内容的 0x54 周期流——该固件实测不开）。
+        # 自校验 + 周期轮询见 _probe_mag / _mag_poll_loop。默认 False。
         self.request_mag = bool(request_mag)
 
         # 每个有效姿态包回调 ``on_orientation(R)``（R 为 3x3，body->world）。
         # 在 notify 线程调用，须尽快返回（只做跨线程写，别做重活）。
         self.on_orientation: Optional[Callable[[np.ndarray], None]] = None
         # 增强回调 ``on_packet(dict)``：每收到含角度/四元数的包触发一次，dict 带最新
-        # R(3x3)、roll/pitch/yaw(度)、accel/gyro(组合包)、mag(0x54；无则 None)。
+        # R(3x3)、roll/pitch/yaw(度)、accel/gyro(组合包)、mag(轮询读寄存器 0x3A；无则 None)。
         self.on_packet: Optional[Callable[[dict], None]] = None
         # 连接完成速率配置（+磁力计请求）后触发一次 ``on_ready()``（每个新连接一次）。
         # notify 在 start_notify 后立即开流、早于速率配置——调用方要等 ready 才锁参考，
@@ -124,12 +137,12 @@ class ImuReader:
         self._last_quat: Optional[Tuple[float, float, float, float]] = None
         self._last_accel: Optional[Tuple[float, float, float]] = None  # g（组合包）
         self._last_gyro: Optional[Tuple[float, float, float]] = None  # deg/s
-        self._last_mag: Optional[Tuple[float, float, float]] = None   # 0x54（原始 int16）
+        self._last_mag: Optional[Tuple[float, float, float]] = None   # 寄存器 0x3A（原始 int16）
         self._last_t: float = 0.0      # 最近一次有效姿态时间（仅本线程访问）
         self._connect_t: float = 0.0   # 最近一次连上时间（仅本线程访问）
         self._rate_hz: float = 0.0     # 实测数据速率 EMA（跨线程读，锁保护）
 
-        # 报文类型计数（notify 线程自增；_request_mag_output 用它们自校验写是否生效）
+        # 报文类型计数（notify 线程自增；_probe_mag 用它们自校验读寄存器是否生效）
         self._n_pkt = 0
         self._n_angle = 0
         self._n_mag = 0
@@ -195,22 +208,28 @@ class ImuReader:
                         except Exception:  # noqa: BLE001
                             pass
                     await self._configure_output_rate(client)
+                    poll_task = None
                     if self.request_mag:
-                        await self._request_mag_output(client)
+                        if await self._probe_mag(client):
+                            poll_task = asyncio.create_task(self._mag_poll_loop(client))
                     self._set_ready(True)    # 配置完成：此后才是干净的期望速率流
                     print(f"[IMU] 已连接 {name or addr}，等待姿态数据…")
-                    while self._running:
-                        if not client.is_connected:
-                            print("[IMU] BLE 连接断开（模块关机 / 离开 / 被其它设备占用？）")
-                            break
-                        if time.time() - max(self._last_t, self._connect_t) > 4.0:
-                            print("[IMU] 已连接但 4s 无数据，强制重连…")
-                            break
-                        await asyncio.sleep(0.05)
                     try:
-                        await client.stop_notify(_READ_UUID)
-                    except Exception:  # noqa: BLE001
-                        pass
+                        while self._running:
+                            if not client.is_connected:
+                                print("[IMU] BLE 连接断开（模块关机 / 离开 / 被其它设备占用？）")
+                                break
+                            if time.time() - max(self._last_t, self._connect_t) > 4.0:
+                                print("[IMU] 已连接但 4s 无数据，强制重连…")
+                                break
+                            await asyncio.sleep(0.05)
+                    finally:
+                        if poll_task is not None:
+                            poll_task.cancel()   # 断开连接：停掉磁力计轮询任务
+                        try:
+                            await client.stop_notify(_READ_UUID)
+                        except Exception:  # noqa: BLE001
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 —— 断连/超时走自动重连
@@ -261,40 +280,48 @@ class ImuReader:
         except Exception as exc:  # noqa: BLE001
             print(f"[IMU] 下发速率命令失败（保持模块当前速率，不影响连接）：{exc}")
 
-    async def _request_mag_output(self, client) -> None:
-        """让模块补报磁力计（0x54）：RRST 寄存器 0x02 写成 0x0F（加速度|角速度|角度|磁场）。
+    async def _probe_mag(self, client) -> bool:
+        """自校验磁力计寄存器读是否生效：连发读 0x3A，等到 0x71 响应（HX/HY/HZ）算成功。
 
-        WT9011DCL 默认只报 0x61 组合包（加速度|角速度|角度，即内容 0x07）——模块自身
-        yaw 在没有可用磁场基准时会退化成纯陀螺积分（挥拍后航向漂移）。把内容加上磁场位，
-        主机侧就能拿到原始磁力计做**磁航向锚定**。**故意不 SAVE**：内容配置只在本次
-        会话生效、掉电复原，避免把猜错的配置持久化到模块 flash。
-
-        写后自校验（~0.8s）：真的收到 0x54（``_n_mag`` 涨）才算成功；角度流还在则正常
-        结束；角度停了（固件把内容整体切走，罕见）就回写 0x07 复原。固件忽略未知寄存器
-        写 = 静默无变化，回落模块自身融合航向（不中断读取）。
+        官方 BWT901BLE5.0 的磁力计**不在周期流里**（RRST 0x02 改回传内容的 0x54 流
+        实测不开），要主动发寄存器读命令 ``FF AA 27 3A 00``、模块以 ``0x71`` 帧回传。
+        这里按 ~8Hz 连发最多 2s：``_n_mag`` 涨即返回 True（周期轮询由调用方启动）；
+        无响应说明该固件读不了这个寄存器，返回 False——回落模块自身融合航向，磁航向
+        锚定降级为静止冻结 + 原点自动重锁（不中断读取）。
         """
         try:
-            a0, m0 = self._n_angle, self._n_mag
-            await client.write_gatt_char(_SEND_UUID, _UNLOCK_CMD, response=False)
-            await asyncio.sleep(0.06)
-            # NORMAL 协议 5B：FF AA <reg> <valL> <valH>；RRST=0x02，值 0x0F
-            await client.write_gatt_char(
-                _SEND_UUID, bytes([0xFF, 0xAA, 0x02, 0x0F, 0x00]), response=False)
-            await asyncio.sleep(0.8)
-            a1, m1 = self._n_angle, self._n_mag
-            if m1 > m0 and a1 > a0:
-                print("[IMU] 磁力计已开启（0x54 收到）→ 主机侧磁航向锚定可用")
-            elif m1 > m0 and not a1 > a0:
-                print("[IMU] 磁力计开启但角度流停了 → 回写 0x07 复原内容配置")
-                await client.write_gatt_char(_SEND_UUID, _UNLOCK_CMD, response=False)
-                await asyncio.sleep(0.06)
-                await client.write_gatt_char(
-                    _SEND_UUID, bytes([0xFF, 0xAA, 0x02, 0x07, 0x00]), response=False)
-            else:
-                print("[IMU] 模块未回传磁力计（该固件可能不支持 RRST 写）→ 维持模块自身"
-                      "融合航向，无磁锚定")
+            base = self._n_mag
+            deadline = time.time() + 2.0
+            while self._running and time.time() < deadline:
+                await client.write_gatt_char(_SEND_UUID, _read_reg_cmd(_MAG_REG),
+                                             response=False)
+                await asyncio.sleep(0.12)
+                if self._n_mag > base:
+                    print("[IMU] 磁力计读取可用（寄存器 0x3A / 0x71 响应）"
+                          "→ 主机侧磁航向锚定可用")
+                    return True
+            print("[IMU] 模块未回传磁力计（读寄存器 0x3A 无响应）→ 维持模块自身融合航向，"
+                  "无磁锚定")
+            return False
         except Exception as exc:  # noqa: BLE001 —— 失败不影响连接与读取
             print(f"[IMU] 请求磁力计失败（忽略，不影响读取）：{exc}")
+            return False
+
+    async def _mag_poll_loop(self, client) -> None:
+        """周期读磁力计寄存器 0x3A，保持 ``_last_mag`` 新鲜（~20Hz）。
+
+        0x71 响应经 notify 回调进 :meth:`_handle` 刷新 ``_last_mag``，姿态包回调读到的
+        ``mag`` 即最新磁力计。断开连接 / stop() 时由调用方 cancel 结束。
+        """
+        try:
+            while self._running and client.is_connected:
+                await client.write_gatt_char(_SEND_UUID, _read_reg_cmd(_MAG_REG),
+                                             response=False)
+                await asyncio.sleep(_MAG_POLL_S)
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 —— 轮询失败不影响读取（磁锚定降级为静止冻结）
+            pass
 
     async def _sleep_cancellable(self, seconds: float) -> None:
         """分段 sleep：``stop()`` 置 ``_running=False`` 后最多 0.1s 内返回。"""
@@ -354,6 +381,13 @@ class ImuReader:
     def _handle(self, pkt) -> None:
         t = time.time()
         self._n_pkt += 1
+        if pkt.get("type") == "reg":        # BLE 寄存器读响应（0x71 帧，见 _probe_mag）
+            if pkt["reg"] == _MAG_REG:      # 磁力计：值 = 连续寄存器 0x3A/0x3B/0x3C
+                v = pkt["values"]
+                self._n_mag += 1
+                with self._lock:
+                    self._last_mag = (v[0], v[1], v[2])
+            return
         # 先刷新各类原始量快照（无论是否含姿态）——若模块被切成分离包（0x51/52/53/54），
         # 加速度/角速度/磁场各自单独到达，姿态包回调时读的是它们的最新值。
         if "accel" in pkt:

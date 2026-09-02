@@ -91,21 +91,24 @@
 - `reader.py`：`ImuReader` 后台 BLE 线程（`bleak`，已装进 `tt`）。GATT 服务 `0000ffe5` / notify 收数据 `0000ffe4` / 写命令 `0000ffe9`（UUID 来自官方 SDK `WitBluetooth_BWT901BLE5_0` 的 `BleUUID.java`）；扫描广播名含 "WT" 的模块。
 - **坑**：BLE 流**无校验字节**（20B 包，见上）；上报率默认 10Hz 已由 reader 连上后自动提 100Hz（官方 5 字节写命令 `FF AA 69 88 B5` 解锁 → `FF AA 03 <val> 00` RATE → `FF AA 00 00 00` 保存）；模块上电可能被手机/上位机占用（BLE 一般单连接），用 `--imu-mac` 直接指定 MAC 更稳。
 - **参考姿态初始化（已解决安装角问题，无需知道 IMU 轴方向）**：按 i 后把球拍平放于**桌面坐标系原点**（桌角原点标记，正面朝上、点口端/手柄朝桌面 −Y；表系 X=短边/Y=长边 2.74m/Z 向上），live_control 采集 `_IMU_INIT_N=20` 个静止样本（窗内角偏差 ≤5°）锁成 `R_home`，之后每个读数经 `imu_to_paddle_world(R, R_home, R_ref)`（`witmotion.py`，= `R@R_home.T@R_ref`）换算成球拍桌面系世界朝向，`R_ref=_IMU_REF_YZ=Rz(-90°)`（mesh 手柄 +X→桌面 −Y、拍面 +Z→+Z）——固定安装角 A 被消掉、参考时刻输出恰为 `R_ref`，挥拍时贴合真实世界朝向。**⚠️ 别用 `R_home.T@R_imu`（共轭旋转），一般三维运动屏幕朝向会整体错位**（有回归测试 `test_imu_to_paddle_world_*` 锁定）。若实测手柄反了 180° 把 `_IMU_REF_YZ` 反号即可。运动时不锁（滚动窗+限频提示），重按 i 重锁。
-- **磁力计航向锚定（消 yaw 漂移，2026-09-02 加）**：症状「挥拍几圈摆回参考姿态，拍面平对
-  但手柄航向对不上」= 模块片上 Kalman 的 yaw 在没有可用磁场基准时退化成纯陀螺积分（模块
-  默认只报 0x61 acc+gyro+角度，**磁力计根本没吐**）。主机侧修法（无需上位机「转 8 字」）：
-  `ImuReader(request_mag=True)` 把 RRST 寄存器 0x02 写成 0x0F 请求 0x54 磁力计补报（**故意
-  不 SAVE**——内容配置只在本次会话生效、掉电复原；写后 ~0.8s 自校验，角度停流回写 0x07
-  复原，固件忽略则静默回落模块 yaw）；锁参考那一刻把当前磁航向记进 `MagYawLock`
-  （`witmotion.py`；纯函数 `tilt_compensated_mag_heading`/`wrap_pi` 可单测），之后每包在
-  模块**平放且静止**（|roll|/|pitch|≤12°、|gyro|≤40°/s）时把显示航向锚回磁场（世界竖直
-  修正 `R_disp = Rz(δ) @ R_disp0`），快速倾斜挥拍/转动时冻结修正、回落模块 yaw。绝对磁场
-  方向在「heading 相对参考相减」里被消掉 → 不依赖 IMU 轴方向、不需要任何磁场校准。验证
-  看 `[IMU] 磁力计已开启（0x54 收到）` 与锁参考后的 `磁力计航向锚定已启用` 日志；单测
-  `test_mag_*` / `test_imu_yaw_lock_*` 在 `tests/test_imu.py`。
-  **⚠️ 实测 WT901BLE67 固件忽略 RRST 写 → 0x54 永不回传 → 磁锚定不启用**（日志
-  `模块未回传磁力计`）。此时走降级：① `WorldHeadingHold` 静止冻结（消「不动也慢漂」：
-  模块真静止时把显示航向冻住，静止期零偏不进显示，转动不跳变）；② `live_control.
+- **磁力计航向锚定（消 yaw 漂移，2026-09-02 加，09-02 晚改寄存器读）**：症状「挥拍几圈
+  摆回参考姿态，拍面平对但手柄航向对不上」= 模块片上 Kalman 的 yaw 在没有可用磁场基准时
+  退化成纯陀螺积分（模块默认只报 0x61 acc+gyro+角度，**磁力计根本没吐**）。主机侧修法
+  （无需上位机「转 8 字」）——**官方 BWT901BLE5.0 固件不上报磁力计数据流**（RRST 寄存器
+  0x02 写 0x0F 请求 0x54 补报实测无效），正确做法是**主动读寄存器**：`ImuReader
+  (request_mag=True)` 提好速率后 `_probe_mag` 连发读命令 `FF AA 27 3A 00`（`_read_reg_cmd`，
+  寄存器 0x3A = 磁力计 HX 起点），模块以 **0x71 响应帧**回传 HX/HY/HZ(0x3A/B/C)，收到即开
+  `_mag_poll_loop` ~20Hz 轮询保持快照（**纯读不写、不 SAVE、不依赖固件**）；锁参考那一刻
+  把当前磁航向记进 `MagYawLock`（`witmotion.py`；纯函数 `tilt_compensated_mag_heading`/
+  `wrap_pi` 可单测），之后每包在模块**平放且静止**（|roll|/|pitch|≤12°、|gyro|≤40°/s）时
+  把显示航向锚回磁场（世界竖直修正 `R_disp = Rz(δ) @ R_disp0`），快速倾斜挥拍/转动时冻结
+  修正、回落模块 yaw。绝对磁场方向在「heading 相对参考相减」里被消掉 → 不依赖 IMU 轴方向、
+  不需要任何磁场校准。验证看 `[IMU] 磁力计读取可用（寄存器 0x3A / 0x71 响应）` 与锁参考
+  后的 `磁锚定` 日志；单测 `test_mag_*` / `test_imu_yaw_lock_*` / `test_parse_reg_0x71*` /
+  `test_reader_mag_snapshot_*` 在 `tests/test_imu.py`。
+  **⚠️ 若 0x3A 读无响应**（日志 `[IMU] 模块未回传磁力计（读寄存器 0x3A 无响应）`，固件读
+  不了该寄存器），磁锚定不启用。此时走降级：① `WorldHeadingHold` 静止冻结（消「不动也慢
+  漂」：模块真静止时把显示航向冻住，静止期零偏不进显示，转动不跳变）；② `live_control.
   _maybe_auto_relock` 原点自动重锁（**须开 P 有真实右手腕**：手腕在桌面原点水平 0.45m
   内 + 平放 + 静止持续 ~1.2s → 重锁参考清零，须先挪开再回原点才再触发）；③ 参考锁定等
   `ImuReader.on_ready`（配置完成后才锁，避免锁到过渡期低速流——曾见 0.5 包/秒时已锁）。
@@ -138,6 +141,7 @@
 - 实测单帧真机开销：检测不在此列；EmFit stream ~2.1s、official cold ~6.2s（GPU 5080）——
   即**放弃实时（100fps 视频离线跑）是必然选择**。
 >>>>>>> worktree-easymocap-recon
+- 四元数默认不上报（0x51 寄存器读响应同 0x71 帧；当前用角度 + 磁力计寄存器读即可）。
 
 ## 标定工具的归属（易混）
 

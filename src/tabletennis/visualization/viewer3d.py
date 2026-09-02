@@ -259,7 +259,6 @@ class SceneViewer3D:
         self._latest_ball = None
         self._ball_dirty = False
 
-<<<<<<< HEAD
         # EasyMocap SMPL 层：人体网格 + 关节骨架，跨线程传递最新拟合结果
         self._smpl_lock = threading.Lock()
         self._smpl_mesh = None
@@ -268,10 +267,8 @@ class SceneViewer3D:
         self._latest_smpl = None   # dict{vertices, faces, joints} 或 None
         self._smpl_dirty = False
         # 实时 IMU 层：球拍网格 + 坐标架，按最新旋转矩阵朝向（无绝对位置，锚点固定）
-=======
         # 实时 IMU 层：球拍网格 + 坐标架，按最新旋转矩阵朝向；锚点 = 右手腕位置
         # （跨线程写入：朝向来自 IMU notify 线程，位置来自主循环姿态重建）
->>>>>>> worktree-imu-3d-pose
         self._imu_lock = threading.Lock()
         self._imu_anchor = None
         self._imu_axes = None

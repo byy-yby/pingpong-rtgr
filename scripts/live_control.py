@@ -101,16 +101,18 @@ _IMU_REF_YZ = np.array([
 # 磁航向锚定（消除「拍面平对、手柄航向漂」）：
 # WT9011DCL 默认只报 0x61（accel+gyro+角度），模块片上 yaw 在没有可用的磁场基准时退化
 # 成纯陀螺积分 → 挥拍后摆回参考姿态航向对不上。上位机「转8字」磁场校准能修，但不方便
-# 用上位机的场景走这里：live_control 让 reader 请求磁力计 0x54（request_mag=True，见
-# ImuReader._request_mag_output），锁参考姿态时把当前磁航向记进 MagYawLock（不依赖 IMU
-# 轴方向、无需任何校准）；之后每个包在模块**平放&静止**（权重=1）时把显示航向锚回磁场，
-# 快速倾斜挥拍时冻结修正、回落模块 yaw（单拍内陀螺误差小）。见 witmotion.MagYawLock。
+# 用上位机的场景走这里：live_control 让 reader 轮询读磁力计寄存器 0x3A（request_mag=True，
+# 见 ImuReader._probe_mag / 官方 BWT901BLE5.0 的 0x71 寄存器读响应；非 RRST 改内容的
+# 0x54 流），锁参考姿态时把当前磁航向记进 MagYawLock（不依赖 IMU 轴方向、无需任何
+# 校准）；之后每个包在模块**平放&静止**（权重=1）时把显示航向锚回磁场，快速倾斜挥拍时
+# 冻结修正、回落模块 yaw（单拍内陀螺误差小）。见 witmotion.MagYawLock。
 _MAG_ANCHOR_HINT = ("[IMU] 磁锚定：静止平放时航向自动锚回磁场，摆回原点参考姿态应复位；"
                     "挥拍/倾斜时不锚（回落模块 yaw）。")
 
-# 无磁力计（本固件开不了 0x54）时的降级提示：静止冻结 + 原点自动重锁压漂移
-_NO_MAG_HINT = ("[IMU] 无磁力计数据（0x54 未回传）→ 无绝对航向锚定。已启用：①静止冻结"
-                "（不动时不漂）②开 P 姿态重建后，把球拍摆回桌面原点平放静止约 1s 自动重锁清零。")
+# 无磁力计（读寄存器 0x3A 无响应）时的降级提示：静止冻结 + 原点自动重锁压漂移
+_NO_MAG_HINT = ("[IMU] 无磁力计数据（寄存器 0x3A 读无响应）→ 无绝对航向锚定。已启用："
+                "①静止冻结（不动时不漂）②开 P 姿态重建后，把球拍摆回桌面原点平放静止约 1s "
+                "自动重锁清零。")
 
 # 静止冻结（消「不动时也在慢漂」，见 witmotion.WorldHeadingHold）：
 # 模块真静止（桌面静置）时显示航向冻结，静止期攒的陀螺零偏不进显示；手持抖动
@@ -622,7 +624,7 @@ class LiveControl:
             self._imu_reader = ImuReader(
                 device_name=self.imu_name, mac=self.imu_mac,
                 output_rate_hz=self.imu_rate,
-                request_mag=True,   # 让模块补报 0x54 磁力计（自校验，失败不影响读取）
+                request_mag=True,   # 轮询读磁力计寄存器 0x3A（官方 0x71 响应；失败不影响读取）
             )
             # 全部姿态处理走 on_packet（含四元数回退）；不挂 on_orientation，否则每个
             # 角度包会被回调两次、参考样本翻倍、显示被推两遍。
@@ -720,13 +722,13 @@ class LiveControl:
         主路径：每个含姿态的包触发一次，``pkt`` 带最新 accel/gyro/mag（见
         ``reader._handle``）。参考锁定走 :meth:`_imu_collect_reference`（**须等
         reader ready**，见 :meth:`_imu_on_ready`）；锁定那一刻把当前磁航向记进
-        ``MagYawLock``（若 0x54 可用）——绝对磁场方向在「heading 相对参考相减」里被
-        消掉，不依赖 IMU 轴方向、无需上位机校准。
+        ``MagYawLock``（若寄存器 0x3A 轮询读到了磁力计快照）——绝对磁场方向在
+        「heading 相对参考相减」里被消掉，不依赖 IMU 轴方向、无需上位机校准。
 
         之后每包取一个绕**世界竖直轴**的修正角 ``delta``，优先级：
-        1. **磁锚定**（``MagYawLock``，0x54 可用时）：模块平放且静止时把显示航向锚回
-           磁场 → 消除陀螺 yaw 漂移；快速倾斜挥拍/转动时权重 0、修正冻结回落模块 yaw。
-        2. **静止冻结**（``WorldHeadingHold``，本固件开不了 0x54 时）：模块**真静止**
+        1. **磁锚定**（``MagYawLock``，磁力计读数可用时）：模块平放且静止时把显示航向
+           锚回磁场 → 消除陀螺 yaw 漂移；快速倾斜挥拍/转动时权重 0、修正冻结回落模块 yaw。
+        2. **静止冻结**（``WorldHeadingHold``，磁力计读无响应时）：模块**真静止**
            时把显示航向冻住，静止期攒的零偏不进显示；转动时贴合模块。
         再经 ``R_disp = Rz_world(delta) @ R_disp0`` 推给 3D（Rz 只改世界航向、不动
         拍面倾角）。最后判**摆回原点自动重锁**（:meth:`_maybe_auto_relock`）——
