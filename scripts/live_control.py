@@ -218,8 +218,8 @@ class LiveControl:
         self._imu_ready = False      # reader 是否完成速率配置（on_ready 置 True）
         self._imu_heading_hold: Optional[WorldHeadingHold] = None
         self._imu_gyro_ema = 0.0     # |gyro| EMA（判「真静止」，手持抖动不算）
-        self._imu_anchor = None      # 最近一次主循环给的右手腕锚点（世界系，米）
-        self._imu_anchor_t = 0.0     # 该锚点的时间戳（超过 0.5s 不算数）
+        self._imu_wrist_pos = None   # 最近一次主循环给的右手腕位置（世界系，米）
+        self._imu_wrist_t = 0.0      # 该位置的时间戳（超过 0.5s 不算数）
         self._relock_since = None    # 连续满足原点静止条件的起始时刻
         self._relock_armed = False   # 已离开参考姿态（=True）才能再次自动重锁
         self._imu_last_relock_t = 0.0  # 上次（重）锁参考的时刻（冷却用）
@@ -579,8 +579,8 @@ class LiveControl:
         self._imu_ready = False            # 等 reader 配置完成后（on_ready）才锁参考
         self._imu_heading_hold = WorldHeadingHold()
         self._imu_gyro_ema = 0.0
-        self._imu_anchor = None
-        self._imu_anchor_t = 0.0
+        self._imu_wrist_pos = None
+        self._imu_wrist_t = 0.0
         self._relock_since = None
         self._relock_armed = False
         self._imu_last_relock_t = 0.0
@@ -748,13 +748,13 @@ class LiveControl:
         """
         if not self._imu_enabled or self._imu_R_home is None:
             return
-        if not (self.enable.get("pose") and self._imu_anchor is not None
-                and time.time() - self._imu_anchor_t <= 0.5):
+        if not (self.enable.get("pose") and self._imu_wrist_pos is not None
+                and time.time() - self._imu_wrist_t <= 0.5):
             self._relock_armed = False   # 没真实手腕位置：永不自动重锁
             self._relock_since = None
             return
         g = 0.0 if gyro is None else float(np.linalg.norm(gyro))
-        anchor_xy = float(np.hypot(self._imu_anchor[0], self._imu_anchor[1]))
+        anchor_xy = float(np.hypot(self._imu_wrist_pos[0], self._imu_wrist_pos[1]))
         cond = (abs(roll) <= _IMU_RELOCK_TILT_DEG
                 and abs(pitch) <= _IMU_RELOCK_TILT_DEG
                 and g <= _IMU_RELOCK_STILL_DEG_S
@@ -876,8 +876,8 @@ class LiveControl:
                         self.viewer3d.set_imu_anchor(anchor)
                         # 记下最新右手腕锚点给 IMU notify 线程判「摆回原点自动重锁」用
                         # （notify 线程只读这两项；跨线程写 GIL 原子赋值即可）。
-                        self._imu_anchor = anchor
-                        self._imu_anchor_t = time.time()
+                        self._imu_wrist_pos = anchor
+                        self._imu_wrist_t = time.time()
             t_recon = time.perf_counter() - t_r0
             # 诊断日志：前 5 帧 + 每 60 帧打印一次，定位骨架不出现的环节
             self._frame_idx += 1
