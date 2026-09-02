@@ -91,6 +91,54 @@ def _resolve_model_dir(project_data_dir: Optional[str]) -> Optional[str]:
     return None
 
 
+def convert_npz_to_pkl(npz_path: str, model_dir: str, easymocap_root: str) -> str:
+    """npz（纯 numpy）-> 官方 load_model 可读的 pkl（纯 numpy，无 chumpy），并拷 J_regressor。
+
+    data/ 整体被 gitignore，fresh checkout 只有 npz 没有 pkl；本函数让
+    :class:`EasymocapReconstructor` 在缺模型文件时**自动生成**，无需手动跑脚本。
+    scripts/npz_to_smpl_pkl.py 是它的 CLI 包装（单一实现，勿另写一套转换）。
+    """
+    import pickle
+
+    d = np.load(npz_path)
+    keys = ["f", "J_regressor", "v_template", "weights", "posedirs",
+            "shapedirs", "kintree_table"]
+    out = {k: np.ascontiguousarray(d[k]) for k in keys}
+    os.makedirs(os.path.join(model_dir, "smpl"), exist_ok=True)
+    with open(os.path.join(model_dir, "smpl", "SMPL_NEUTRAL.pkl"), "wb") as f:
+        pickle.dump(out, f, protocol=4)
+    # J_regressor_body25.npy（load_model(skel_type='body25') 依赖）
+    import shutil
+
+    src_reg = os.path.join(easymocap_root, "data", "smplx", "J_regressor_body25.npy")
+    dst_reg = os.path.join(model_dir, "J_regressor_body25.npy")
+    if os.path.exists(src_reg):
+        os.makedirs(model_dir, exist_ok=True)
+        shutil.copyfile(src_reg, dst_reg)
+    return model_dir
+
+
+def _ensure_model_data(project_data_dir: Optional[str],
+                       easymocap_root: str) -> Optional[str]:
+    """npz 在而 pkl 缺失时自动转换；成功返回 model_dir，否则 None。"""
+    if not project_data_dir:
+        return None
+    npz = os.path.join(project_data_dir, "bodymodels", "SMPL_NEUTRAL.npz")
+    model_dir = os.path.join(project_data_dir, "bodymodels")
+    if not os.path.exists(npz):
+        return None
+    print(f"[EasyMocap] 缺 smpl/SMPL_NEUTRAL.pkl，从 {npz} 自动生成…")
+    try:
+        convert_npz_to_pkl(npz, model_dir, easymocap_root)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[EasyMocap] npz->pkl 自动转换失败（{exc}），请手动跑 "
+              f"scripts/npz_to_smpl_pkl.py", file=sys.stderr)
+        return None
+    if os.path.exists(os.path.join(model_dir, "smpl", "SMPL_NEUTRAL.pkl")):
+        return model_dir
+    return None
+
+
 def _make_args(verbose: bool = True) -> SimpleNamespace:
     """官方 ``smpl_from_keypoints3d`` 需要的 args（Config 读 verbose/model/robust3d，
     load_weight_* 读 opts）。opts 留空 = 用官方默认损失权重。"""
@@ -126,12 +174,14 @@ class EasymocapReconstructor:
 
         model_dir = model_path or _resolve_model_dir(project_data_dir)
         if model_dir is None:
+            # data/ 被 gitignore：fresh checkout 常有 npz 无 pkl -> 自动转换
+            model_dir = _ensure_model_data(project_data_dir, root)
+        if model_dir is None:
             self._model = None
             self._error = (
                 "未找到 EasyMocap 需要的 SMPL 模型目录（含 smpl/SMPL_NEUTRAL.pkl + "
-                "J_regressor_body25.npy）。先用 scripts/npz_to_smpl_pkl.py 从项目 "
-                "data/bodymodels/SMPL_NEUTRAL.npz 生成，或用环境变量 EASYMOCAP_SMPL_DIR "
-                "指定模型目录。"
+                "J_regressor_body25.npy）。项目需有 data/bodymodels/SMPL_NEUTRAL.npz "
+                "（有它则按 S 会自动生成 pkl），或用环境变量 EASYMOCAP_SMPL_DIR 指定。"
             )
             return
 
