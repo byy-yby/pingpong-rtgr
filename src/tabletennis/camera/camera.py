@@ -82,6 +82,7 @@ class Camera:
         self._opened = False
         self._grabbing = False
         self._frame_queue: "queue.Queue" = queue.Queue(maxsize=max_queue)
+        self._frame_sink = None   # Optional[Callable[[Frame], None]]：每帧旁路回调（录制用）
         self._grab_thread: Optional[threading.Thread] = None
         self._soft_trigger_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -214,6 +215,18 @@ class Camera:
         except queue.Empty:
             return None
 
+    def set_frame_sink(self, sink) -> None:
+        """注册 / 取消每帧旁路回调（四路视频录制用）。
+
+        回调在采集线程里、每抓到一帧时同步调用（与主队列消费互不影响），必须**快速返回**
+        ——实现侧应只做入队（满则丢最旧），真正的磁盘编码放自己的后台线程（见
+        ``camera/recorder.py::_CameraWriter``）。传 None 取消注册。
+
+        Args:
+            sink: ``Callable[[Frame], None]`` 或 None。
+        """
+        self._frame_sink = sink
+
     def drain(self) -> None:
         """清空队列（消费端处理不过来时用于快速跳到最新帧）。"""
         try:
@@ -239,6 +252,11 @@ class Camera:
 
             if frame is None:
                 continue
+
+            # 旁路录制：在入主队列之前把帧送给录制 sink（快进快出，录制线程负责编码）
+            sink = self._frame_sink
+            if sink is not None:
+                sink(frame)
 
             # 有界队列：满了丢最旧帧，保证拿到的是最新画面
             try:

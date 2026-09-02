@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""离线用 EasyMocap 重建某次四路录像：``data/video/<session>/cam{0..3}.mp4``。
+
+流程（与 live_control 在线 EasyMocap 同一套检测 + 拟合，只是输入换成视频文件）
+  1) 读 session 文件夹里的 ``cam{cid}.mp4``（cid = 标定相机号）＋ ts 副产物；
+  2) 按设备时间戳把四路重新对齐到主时钟相机（允许编码丢帧，见 video_source 文档）；
+  3) 每个主时钟帧：各相机对齐帧 → 人检测(yolo11n-gray) + RTMPose halpe26 →
+     每相机取最高置信度的人 → SMPL 拟合（默认 EmFit **热启动流式**，帧间连续）；
+  4) 输出：逐帧 ``npz`` + ``recon_index.npz`` + ``recon_meta.json``。
+
+用法
+  python scripts/reconstruct_video.py data/video/20260902_180000 \
+      [--config stream] [--stride 1] [--ref-cam 0] [--out ...]
+
+拟合档位 --config
+  official = 官方 cold ``reconstruct()``，每帧冷启动（最慢，行为=原版）
+  warm     = EmFit 热启动 ftol 5e-4 / maxiters 40（约 x1.8，误差≈官方）
+  stream   = EmFit 热启动 ftol 1.5e-3 / maxiters 25（约 x2.3，误差略优于官方，默认）
+
+调试选项
+  --fake-poses  不跑检测，注入一个合成站姿人观测 → 专用于验证 录制→对齐→重建→存档
+                整条管道（视频内容无关），或给重建流程计时。
+  --stride N    主时钟每 N 帧重建 1 帧（默认 1 全量）。
+  --max-frames  最多处理前 N 个主时钟帧（调试/计时用，0 = 全部）。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Dict, List, Optional
+
+_THIS = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_THIS)
+sys.path.insert(0, os.path.join(_ROOT, "src"))
+
+import numpy as np
+
+
+def _add_easymocap_path(root: str) -> None:
+    if os.path.isdir(root) and root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def _median(x):
+    x = [v for v in x if v is not None]
+    return float(np.median(x)) if x else float("nan")
+
+
+# ----------------------------------------------------------------------
+# 合成站姿观测（--fake-poses）：用同一套 2D 投影生成一个固定人，模拟每帧检测结果
+# ----------------------------------------------------------------------
+_FAKE_PS = None   # lazy: SMPL 参数（站立在球桌中心附近）
+
+
+def fake_obs_for(recon, intrinsics, extrinsics, cids, rng=None):
+    """给 cids 每台相机一份同一站姿人的 halpe26 Pose2D（噪声可选）。"""
+    from tabletennis.core.types import Pose2D
+    from tabletennis.reconstruction.easymocap import HALPE26_TO_BODY25
+    global _FAKE_PS
+    if _FAKE_PS is None:
+        body = recon._model
+        rng0 = np.random.default_rng(0)
+        betas = rng0.uniform(-0.5, 0.5, size=10).astype(np.float32)
+        betas[0] = 1.0
+        ps = np.zeros((1, 72), np.float32)
+        ps[0, 3 * 3:4 * 3] = [0, 0, 0.15]
+        ps[0, 18 * 3:19 * 3] = [0, 0.5, 0]
+        ps[0, 4 * 3:5 * 3] = [0.15, 0, 0]
+        ps[0, 5 * 3:6 * 3] = [-0.15, 0, 0]
+        p = {"poses": ps, "shapes": betas[None],
+             "Rh": np.array([[np.pi / 2, 0, 0]], np.float32),
+             "Th": np.array([[1.0, 1.0, 0.386]], np.float32)}
+        with __import__("torch").no_grad():
+            v = body(return_verts=True, return_tensor=False, **p)[0]
+        p["Th"] = p["Th"] + np.array([[0, 0, -0.76 - v[:, 2].min()]], np.float32)
+        with __import__("torch").no_grad():
+            j25 = body(return_verts=False, return_tensor=False, **p)[0]
+        _FAKE_PS = j25
+    j25 = _FAKE_PS
+    if rng is None:
+        rng = np.random.default_rng(1)
+    best: Dict[int, object] = {}
+    for cid in cids:
+        K = intrinsics[cid].K
+        P = K @ np.hstack([extrinsics[cid].R, extrinsics[cid].t.reshape(3, 1)])
+        c = np.hstack([j25, np.ones((25, 1))]) @ P.T
+        p2d = c[:, :2] / c[:, 2:3]
+        halpe = np.zeros((26, 3), np.float32)
+        for hi, b25 in HALPE26_TO_BODY25:
+            x, y = p2d[b25]
+            x += rng.normal(0, 0.3); y += rng.normal(0, 0.3)
+            halpe[hi] = (x, y, 1.0)
+        best[cid] = Pose2D(camera_id=cid, keypoints=halpe, score=1.0, skeleton="halpe26")
+    return best
+
+
+def _proj_err_px(Pall: np.ndarray, kp2d: np.ndarray, j25: np.ndarray) -> tuple:
+    """拟合出的 body25 关节（世界系）投影回各视角 vs 观测 2D 的重投影误差 (mean, max) px。"""
+    errs = []
+    for i in range(kp2d.shape[0]):
+        c = np.hstack([j25, np.ones((25, 1))]) @ Pall[i].T      # (25,3) 相机系
+        uv = c[:, :2] / c[:, 2:3]
+        m = kp2d[i, :, 2] > 0
+        if m.sum() == 0:
+            continue
+        errs.append(np.linalg.norm(uv[m] - kp2d[i, m, :2], axis=1))
+    if not errs:
+        return float("nan"), float("nan")
+    all_err = np.concatenate(errs)
+    return float(np.mean(all_err)), float(np.max(all_err))
+
+
+# ----------------------------------------------------------------------
+def build_args():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("session_dir", help="data/video/<session> 文件夹（含 cam*.mp4）")
+    ap.add_argument("--config", choices=["official", "warm", "stream"], default="stream")
+    ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--max-frames", type=int, default=0, help="0=全部")
+    ap.add_argument("--ref-cam", type=int, default=None)
+    ap.add_argument("--min-cams", type=int, default=2)
+    ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
+    ap.add_argument("--fake-poses", action="store_true")
+    ap.add_argument("--em-ftol", type=float, default=None)
+    ap.add_argument("--em-maxiters", type=int, default=None)
+    ap.add_argument("--progress", type=int, default=10)
+    ap.add_argument("--em-verbose", action="store_true")
+    ap.add_argument("--easymocap-root", default="/home/yby/projects/EasyMocap")
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = build_args()
+    _add_easymocap_path(args.easymocap_root)
+
+    from tabletennis.core.types import Frame  # noqa: F401
+    from tabletennis.reconstruction.easymocap import EasymocapReconstructor
+    from tabletennis.reconstruction.em_fit import EmFit, EMSettings
+    from tabletennis.reconstruction.triangulate import load_camera_rig
+    from tabletennis.reconstruction.video_source import VideoSource
+    from tabletennis.vision.detector import create_detector
+
+    session_dir = args.session_dir
+    if not os.path.isdir(session_dir):
+        print(f"✗ 找不到文件夹：{session_dir}")
+        sys.exit(2)
+
+    out_dir = args.out or os.path.join(session_dir, "recon")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---- 输入：四路视频 + 对齐 ----
+    src = VideoSource(session_dir, ref_cam=args.ref_cam)
+    print("=== 视频源 ===")
+    for cid in src.cids:
+        print(f"  cam{cid}: {src.n_frames_by_cam[cid]} 帧，"
+              f"脉冲周期 {src.period_sec(cid)*1000:.2f}ms"
+              + ("（有 ts）" if cid in src.ts_by_cam else "（无 ts，按帧号对齐）"))
+    print(f"  主时钟 cam{src.ref_cam} → 对齐后 {src.n_ref} 帧")
+
+    # ---- 标定 ----
+    intrinsics, extrinsics = load_camera_rig()
+    cids_ok = [c for c in src.cids if c in intrinsics and c in extrinsics]
+    missing = [c for c in src.cids if c not in cids_ok]
+    if missing:
+        print(f"  ⚠ 以下相机无标定，重建时跳过：{missing}")
+
+    # ---- 模型 / 检测 / 拟合器 ----
+    recon = EasymocapReconstructor(verbose=False)
+    if not recon.ready:
+        print(f"✗ {recon.error}")
+        sys.exit(1)
+    detector = None if args.fake_poses else create_detector("pose")
+    if detector is None and not args.fake_poses:
+        print("✗ 姿态检测器未就绪")
+        sys.exit(1)
+
+    if args.config == "official":
+        fit = None
+        print("档位：official（官方 cold reconstruct，每帧冷启动）")
+    else:
+        s = EMSettings(
+            ftol=args.em_ftol if args.em_ftol is not None else (1.5e-3 if args.config == "stream" else 5e-4),
+            maxiters=args.em_maxiters if args.em_maxiters is not None else (25 if args.config == "stream" else 40),
+            no_item_sync=True, warm_init=True, skip_global_rt_warm=True, refit_shape_every=0,
+        )
+        fit = EmFit(recon, s, verbose=args.em_verbose)
+        print(f"档位：{args.config}（EmFit 热启动 ftol={s.ftol} maxiters={s.maxiters}）")
+
+    # ---- 主循环 ----
+    def run_one(k: int):
+        nonlocal prev, detector, fit
+        frames_k = src.frames_for_ref(k)
+        frames_k = {cid: f for cid, f in frames_k.items() if cid in cids_ok}
+        if not frames_k:
+            return None, {"status": "no_person"}
+        if args.fake_poses:
+            best = fake_obs_for(recon, intrinsics, extrinsics, list(frames_k.keys()))
+        else:
+            items = sorted(frames_k.items())
+            poses = detector.detect_batch([f for _, f in items])
+            best = {}
+            for (cid, _f), pl in zip(items, poses):
+                if pl:
+                    best[cid] = max(pl, key=lambda p: p.score)
+        if len(best) < args.min_cams:
+            return None, {"status": "no_person"}
+        if fit is not None:
+            res = fit.run(best, intrinsics, extrinsics, prev=prev)
+        else:
+            res = recon.reconstruct(best, intrinsics, extrinsics)
+        if res is None:
+            return None, {"status": "fit_failed"}
+        prev = res["params"]
+        # 重投影误差（拟合关节 vs 观测，px）
+        kp2d, _, Pall = recon._to_body25_2d(best, intrinsics, extrinsics, min_conf=0.0)
+        if kp2d is not None:
+            em, ew = _proj_err_px(Pall, kp2d, np.asarray(res["joints_body25"]))
+        else:
+            em = ew = float("nan")
+        return res, {"status": "ok", "cam_idx": {c: src.maps[k][c] for c in best},
+                     "err_mean": em, "err_worst": ew}
+
+    prev = None
+    n_total = src.n_ref
+    indices = list(range(0, n_total, max(1, args.stride)))
+    if args.max_frames > 0:
+        indices = indices[: args.max_frames]
+    t0 = time.time()
+    n_ok = n_gap = n_fail = 0
+    wall_ms_list = []
+    err_list = []
+
+    # 汇总数组（与 indices 一一对应，供 recon_index.npz 快速画图/分析）
+    idx_arr, status_arr, wall_arr, err_mean_arr, err_worst_arr = [], [], [], [], []
+    code = {"ok": 0, "no_person": 1, "fit_failed": 2, "error": 3}
+
+    for i, k in enumerate(indices):
+        t = time.perf_counter()
+        try:
+            res, extra = run_one(k)
+        except Exception as exc:  # noqa: BLE001 —— 单帧异常不中断整段
+            print(f"  [帧 {k}] ✗ 异常：{exc}")
+            res, extra = None, {"status": "error"}
+        dt = (time.perf_counter() - t) * 1000
+        status = extra.get("status", "?")
+        idx_arr.append(k)
+        status_arr.append(code.get(status, 3))
+        wall_arr.append(dt)
+        if status == "ok":
+            n_ok += 1
+            wall_ms_list.append(dt)
+            save_one(out_dir, k, res, dt, extra.get("err_mean"),
+                     extra.get("err_worst"), extra.get("cam_idx"))
+            err_mean_arr.append(extra.get("err_mean"))
+            err_worst_arr.append(extra.get("err_worst"))
+        else:
+            err_mean_arr.append(float("nan"))
+            err_worst_arr.append(float("nan"))
+            if status == "no_person":
+                n_gap += 1
+            else:
+                n_fail += 1
+        if (i + 1) % max(1, args.progress) == 0 or i == len(indices) - 1:
+            el = time.time() - t0
+            print(f"  帧 {i+1}/{len(indices)} (主时钟 {k}/{n_total}) | "
+                  f"{dt:6.0f}ms/帧 | 已过 {el:6.1f}s | ok={n_ok} gap={n_gap} fail={n_fail}")
+
+    src.close()
+
+    # ---- 汇总 / 存档 ----
+    wall_s = time.time() - t0
+    np.savez(os.path.join(out_dir, "recon_index.npz"),
+             ref_frame=np.asarray(idx_arr, np.int64),
+             status=np.asarray(status_arr, np.int8),
+             wall_ms=np.asarray(wall_arr, np.float64),
+             err_mean_px=np.asarray(err_mean_arr, np.float64),
+             err_worst_px=np.asarray(err_worst_arr, np.float64))
+    index_data = {
+        "session_dir": session_dir, "out_dir": out_dir,
+        "config": args.config, "stride": args.stride,
+        "ref_cam": src.ref_cam,
+        "n_ref_frames": n_total, "processed": len(indices),
+        "ok": n_ok, "no_person_gap": n_gap, "failed": n_fail,
+        "wall_s": round(wall_s, 3),
+        "recon_per_frame_ms_median": _median(wall_ms_list),
+        "reproj_err_mean_px_median": _median(err_mean_arr),
+        "source": src.summary(),
+    }
+    with open(os.path.join(out_dir, "recon_meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(index_data, fh, ensure_ascii=False, indent=2)
+    print("=== 完成 ===")
+    print(f"  处理 {len(indices)} 帧（ok={n_ok}, 无人缺口={n_gap}, 失败={n_fail}）耗时 {wall_s:.1f}s")
+    print(f"  平均 {wall_s/max(1, len(indices))*1000:.0f}ms/帧 | 单帧中位 {_median(wall_ms_list):.0f}ms")
+    print(f"  重投影误差中位 {_median(err_mean_arr):.2f}px |  → {out_dir}")
+
+
+def save_one(out_dir: str, k: int, res: dict, dt_ms: float,
+             err_mean=None, err_worst=None, cam_idx=None) -> None:
+    """把一帧拟合结果存 npz（含网格/关节/SMPL 参数/参与视角/重投影误差）。"""
+    np.savez_compressed(
+        os.path.join(out_dir, f"frame_{k:06d}.npz"),
+        ref_frame=k,
+        joints=np.asarray(res["joints"], dtype=np.float32),
+        joints_body25=np.asarray(res["joints_body25"], dtype=np.float32),
+        vertices=np.asarray(res["vertices"], dtype=np.float32),
+        params_poses=res["params"]["poses"].reshape(-1),
+        params_shapes=res["params"]["shapes"].reshape(-1),
+        params_Rh=res["params"]["Rh"].reshape(-1),
+        params_Th=res["params"]["Th"].reshape(-1),
+        wall_ms=dt_ms,
+        err_mean_px=err_mean, err_worst_px=err_worst)
+    if cam_idx:
+        cids_a = np.asarray(list(cam_idx.keys()), np.int32)
+        idx_a = np.asarray(list(cam_idx.values()), np.int64)
+        with open(os.path.join(out_dir, f"frame_{k:06d}_cams.json"), "w") as fh:
+            json.dump({str(c): int(i) for c, i in zip(cids_a, idx_a)}, fh)
+
+
+if __name__ == "__main__":
+    main()

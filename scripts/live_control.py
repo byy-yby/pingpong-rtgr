@@ -128,6 +128,11 @@ class LiveControl:
         self._record_detector = None
         self._record_saved_framenum: Dict[int, int] = {}
 
+        # 视频录制（按 v / 面板按钮）：四路 mp4 → data/video/<时间戳>/，供离线重建
+        self._video_recorder = None   # camera.recorder.SessionVideoRecorder（激活时非 None）
+        self._video_t0 = 0.0          # 本次录像起始墙钟（OSD 计时）
+        self._record_rect = (0, 0, 0, 0)   # 录像按钮命中区域（画布坐标）
+
         # 3D 姿态重建（按 P）：标定三角化器 + 各相机最近一帧的 2D 姿态
         self._triangulator = None
         self._recon_extrinsics: Dict[int, object] = {}
@@ -185,6 +190,27 @@ class LiveControl:
         save_camera_settings(self.values["exposure"], self.values["gain"], self.values["gamma"])
         self._save_flash_until = time.time() + 1.5
         print("✓ 已保存曝光/增益/伽马到 config/camera_settings.json")
+
+    # ------------------------------------------------------------------
+    # 视频录制（按 v）：四路 mp4 → data/video/<时间戳>/，离线 EasyMocap 重建用
+    # ------------------------------------------------------------------
+    def toggle_record_video(self) -> None:
+        """切换录像：空闲按 v 开始（立即），录像中按 v / 再点按钮停止。"""
+        if self._video_recorder is not None:
+            self._video_recorder.stop()
+            self._video_recorder = None
+            self._video_t0 = 0.0
+            print("[录像] 完成后可跑 scripts/reconstruct_video.py <上面的文件夹> 离线重建")
+            return
+        from tabletennis.camera.recorder import SessionVideoRecorder
+        try:
+            fps = 100.0 if self.trigger_mode == "external" else 30.0
+            self._video_recorder = SessionVideoRecorder(self.mgr.cameras, fps=fps)
+            self._video_recorder.start()
+            self._video_t0 = time.time()
+        except Exception as exc:  # noqa: BLE001
+            self._video_recorder = None
+            print(f"[录像] ✗ 启动失败：{exc}")
 
     # ------------------------------------------------------------------
     # 数据录制（按 r）：倒计时 3s → 存图 + 预标注，再按 r 停止
@@ -344,6 +370,9 @@ class LiveControl:
     def handle_key(self, key: int) -> None:
         if key == ord("r"):
             self.toggle_record()
+            return
+        if key == ord("v"):
+            self.toggle_record_video()
             return
         for kind, (_, k) in DETECTION_TOGGLES.items():
             if key == ord(k):
@@ -897,6 +926,12 @@ class LiveControl:
                 self._apply_param(key, self.values[key])
                 return
 
+        # 录像按钮（面板右上第二颗）
+        rx0, rx1, ry0, ry1 = self._record_rect
+        if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+            self.toggle_record_video()
+            return
+
         # 保存按钮
         bx0, bx1, by0, by1 = self._save_rect
         if bx0 <= x <= bx1 and by0 <= y <= by1:
@@ -959,6 +994,16 @@ class LiveControl:
             cv2.circle(grid, (16, 16), 9, (0, 165, 255), -1)
             cv2.putText(grid, f"{n}", (32, 22), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (0, 165, 255), 2, cv2.LINE_AA)
+
+        # 视频录像指示（四路 mp4 录制中，顶中；红色时长为录制秒数）
+        if self._video_recorder is not None:
+            secs = time.time() - self._video_t0
+            txt = f"● 录像 {secs:6.1f}s"
+            gw0 = grid.shape[1]
+            (tw, _th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            cv2.circle(grid, (gw0 // 2 - tw // 2 - 18, 22), 9, (0, 0, 255), -1)
+            cv2.putText(grid, txt, (gw0 // 2 - tw // 2, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
         # 球重建实际帧率（右上角，按 B 开启后显示）
         if self.enable["ball"] and self._ball_fps is not None:
@@ -1030,6 +1075,19 @@ class LiveControl:
         cv2.putText(panel, "保存", (bx0 + 38, by0 + 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 255, 255), 1, cv2.LINE_AA)
         self._save_rect = (bx0, bx1, y_offset + by0, y_offset + by1)
+
+        # 录像按钮（保存按钮左侧；红=录制中，橙=空闲）
+        rx0, rx1 = w - 320, w - 164
+        ry0, ry1 = by0, by1
+        rec_on = self._video_recorder is not None
+        fill = (60, 40, 120) if rec_on else (40, 60, 80)
+        edge = (0, 0, 255) if rec_on else (0, 165, 255)
+        cv2.rectangle(panel, (rx0, ry0), (rx1, ry1), fill, -1, cv2.LINE_AA)
+        cv2.rectangle(panel, (rx0, ry0), (rx1, ry1), edge, 1, cv2.LINE_AA)
+        txt = "■ 停止录像" if rec_on else "● 录像 [v]"
+        cv2.putText(panel, txt, (rx0 + 8, ry0 + 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        self._record_rect = (rx0, rx1, y_offset + ry0, y_offset + ry1)
         return panel
 
     def _draw_hint(self, w: int) -> np.ndarray:
@@ -1050,7 +1108,7 @@ class LiveControl:
         elif time.time() < self._save_flash_until:
             cv2.putText(hint, "已保存 ✓", (w - 110, 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [s]EasyMocap [r]录制 保存=按钮  退出:[q]/ESC/X",
+        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [s]EasyMocap [r]录图 [v]录像4路  退出:[q]/ESC/X",
                     (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
         return hint
 
@@ -1139,6 +1197,9 @@ class LiveControl:
                     break
                 self.handle_key(key)
         finally:
+            if self._video_recorder is not None:   # 退出时若还在录像则自动收尾
+                self._video_recorder.stop()
+                self._video_recorder = None
             self._stop_ball_recon_thread()
             self._stop_em_recon_thread()
             self._close_viewer()

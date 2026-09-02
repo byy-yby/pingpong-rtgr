@@ -7,6 +7,10 @@
 - **相机控制** `src/tabletennis/camera/` —— 开关、外部/软件触发、图像参数、多机管理。
   脚本 `list_cameras` / `grab_preview` / `grab_sync` / `query_parameters`。
 - **交互式控制** `scripts/live_control.py` —— 四机 2×2 平铺 + trackbar 调参 + 检测开关 + 外部触发自检。
+- **录像 + 离线重建（EasyMocap 放弃实时后的主路线）** —— live_control 按 `v`（或点面板「录像」）
+  四路 mp4 录到 `data/video/<YYYYmmdd_HHMMSS>/cam{cid}.mp4` + `cam{cid}_ts.npy` + `meta.json`
+  （`camera/recorder.py::SessionVideoRecorder`）；`scripts/reconstruct_video.py <session>`
+  离线 EasyMocap 重建（`reconstruction/video_source.py` 对齐 + `em_fit.py` 热启动流式拟合）。
 - **姿态 2D** `vision/pose/rtmpose_pose.py` —— RTMPose-l-halpe26（26 点），top-down。
   **人检测默认换 `yolo11n-gray`**（1ch 灰度原生），见「人检测」节。
 - **球检测** `vision/ball/` —— 三条路线都实现：经典 CV、YOLO（yolov8n）、灰度 yolo11n（1ch）。
@@ -77,6 +81,31 @@
 - 键盘：`VisualizerWithKeyCallback` + **W/A/S/D 平移、方向键旋转、+/− 缩放、R 复位**。**translate 的 +y 才是「向上」**（W=`translate(0,+step)`、S=`translate(0,-step)`，曾写反）。
 - 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）。
 - 每个方法里自己 `o3d = _o3d()` 惰性 import（`_update_ball_geometry` 曾漏写致渲染线程 NameError 窗口退出）；Open3D 窗口必须在主线程开，后台线程只加载模型。
+
+### 录像 + 离线重建（EasyMocap 的主路线）
+
+录制端 `camera/recorder.py`：
+- **帧走旁路 sink 不进主循环**：`Camera.set_frame_sink(fn)` 在采集线程入主队列前把帧送给录制
+  回调（须快进快出，只入队）；`SessionVideoRecorder` 每台相机一个后台编码线程
+  `_CameraWriter` 消费队列写 `mp4v`→`.mp4`，**编码跟不上丢最旧帧不阻塞抓帧**——写进文件
+  的每一帧都 append 设备时间戳，收尾 `np.save cam{cid}_ts.npy`。
+- **编解码实测**（本机 OpenCV 5.0）：1440×1080 Mono8 下 `mp4v` ~8ms/帧（100fps 预算内可行）；
+  MJPG 26ms 太慢；`avc1`(h264) 无 v4l2 设备打不开。`fps` 只写 mp4 头（播放速度），重建读
+  帧序号 + ts 副产物，不受影响。
+- 命名按**逻辑相机号** `cam{cid}.mp4`（cid=标定 `cam_{cid}.yaml` 的号），与在线 EasyMocap
+  一致；live_control 按 `v` / 面板「录像」按钮启停（`fps=100` 外部触发 / `30` 自由采集）。
+
+离线端 `reconstruction/video_source.py` + `scripts/reconstruct_video.py`：
+- **跨相机对齐绝不用「减绝对 ts 差」（各机时钟基准偏移秒级不可比）**，改为**脉冲号对齐**：
+  每台相机内部对相邻 ts 差/周期取整 → 丢几拍加几号（`_pulse_ids`），主时钟每帧的脉冲号
+  用 `searchsorted` 在目标相机的脉冲号序列里找同号帧（单调 → 天然不倒退）；目标相机那拍被
+  编码丢掉就没帧给（该视角缺帧）。录制 sink 挂在同一触发抓帧流上、四台从同一拍起写，
+  所以「脉冲号相同 ⇒ 同一物理触发」成立。
+- `np.savez_compressed` 返回 None（不是 file 对象），别调 `.close()`。
+- 默认档位 `--config stream`（EmFit 热启动 ~2.1s/帧）；`--fake-poses` 注入合成站姿人跑
+  整条 录制→对齐→检测→拟合→存档 管道，无硬件/无真人视频也能验证与计时。
+- 实测单帧真机开销：检测不在此列；EmFit stream ~2.1s、official cold ~6.2s（GPU 5080）——
+  即**放弃实时（100fps 视频离线跑）是必然选择**。
 
 ## 标定工具的归属（易混）
 
@@ -165,7 +194,8 @@ MvCamera.MV_CC_Finalize()
 
 ### 时间戳 / 同步
 - [x] `nHostTimeStamp` 是 ms 非 µs；设备时间戳是 10ns/tick 原始计数；`nTriggerIndex` 恒 0；`TimestampReset` 不存在——同步测量靠 CLOCK_MONOTONIC + 取模对齐。
-- [ ] 通用的按 `device_timestamp` 最近邻组帧仍待 pipeline 阶段；当前 `get_latest_bundle` 取各机最新帧，外参标定用 `get_synchronized_bundle`（清队列+各取下一帧）。
+- [x] **离线跨相机对齐用「脉冲号」**：设备 ts 只在单机内部相减、丢几拍加几号，再按主时钟脉冲号 searchsorted 同号帧（`reconstruction/video_source.py`，绝对 ts 不可比）。见「录像 + 离线重建」节。
+- [ ] 实时按 `device_timestamp` 最近邻组帧仍待 pipeline 阶段；当前 `get_latest_bundle` 取各机最新帧，外参标定用 `get_synchronized_bundle`（清队列+各取下一帧）。
 
 ### 相机 / 环境
 - [ ] **Python 3.14 太新**：装 open3d/torch 前先建 3.11 环境 `tt`。
@@ -192,6 +222,11 @@ MvCamera.MV_CC_Finalize()
 - [ ] YOLOX decode+NMS 上 GPU（`_yolox_decode_batch` numpy CPU 3.7ms → <0.5ms，零精度损失）。
 - [ ] 姿态最大机会：Fixed ROI（半固定机位砍掉整个 YOLOX 段 ~12ms + 删 match_people）未做；RTMO one-stage 候选。
 - [x] YOLOX 动态 batch 重导出（`export_yolox_dynamic_batch.py` 纯 PyTorch 重建，输出 `(B,3549,85)` 不烤 NMS）；三个坑：不烤 /255（humanart 训练吃 0-255）、decode 用 cell 左上角（center=(delta+grid)×stride 不加 0.5）、TRT profile min1/opt4/max8。
+- [ ] 录像离线重建目前每相机取最高置信度一人（`reconstruct_video.py`，与 live_control 在线一致）；多人离线（match_people 或逐人 EmFit）未串。
+
+### 录像 / 重建相关已踩坑
+- [x] `np.savez_compressed` 返回 None（无 `.close()`）；编解码实测 mp4v≈8ms 可用、MJPG 太慢、h264 无 v4l2 打不开——见「录像 + 离线重建」节。
+- [ ] 录像 meta/fps 头为标称值；若以后要按真实触发率校准视频时间轴，读 `cam{cid}_ts.npy` 中位差即可（离线已如此，见 video_source.period_sec）。
 
 ### 可视化
 - [x] `set_front` 是「lookat→相机」方向（front=[1,1,0.9] 俯瞰）；translate +y 才是上（W/S 方向）。见「可视化」节。

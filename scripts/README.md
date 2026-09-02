@@ -17,6 +17,7 @@
 | `calibrate_intrinsics.py` | **相机内参标定 GUI**（PySide6, ChArUco）：四路预览 + 点击选中 + Enter 采集 + 计算并检验（RMS/主点/焦距判定）。 |
 | `calibrate_extrinsics.py` | **多相机外参标定 GUI**（PySide6，ChArUco）：四路预览 + Enter 四机同时拍照 + 检测/位姿 + 求外参保存。 |
 | `export_yolox_dynamic_batch.py` | 纯 PyTorch 重建 YOLOX-tiny 并从 mmdet 权重重导出**动态 batch** ONNX（4 相机一次 forward，`detect_batch` 用；带 `--verify` 自检）。 |
+| `reconstruct_video.py` | **离线用 EasyMocap 重建某次四路录像**：读 `data/video/<session>/` 的四路 mp4 + ts → 按脉冲对齐 → 人检测 + RTMPose → SMPL 拟合 → 逐帧 npz。录像是放弃实时后的主路线（EasyMocap 单帧 ~2s，无法实时）。 |
 
 ## 怎么用
 
@@ -35,16 +36,21 @@ python scripts/calibrate_intrinsics.py                  # 内参标定 GUI
 python scripts/calibrate_extrinsics.py                  # 外参标定 GUI（ChArUco）
 python scripts/calibrate_extrinsics.py --generate-board board.png   # 只生成打印板
 python scripts/export_yolox_dynamic_batch.py --verify               # YOLOX 动态 batch 重导出
+
+# —— 放弃实时后的主路线：录像 → 离线重建 ——
+python scripts/live_control.py                         # 开相机后按 [v] 录四路视频（再按一次停止）
+python scripts/reconstruct_video.py data/video/<session>            # 离线重建（--config stream 默认）
+python scripts/reconstruct_video.py data/video/<session> --fake-poses --max-frames 2   # 无硬件/内容验证管道
 ```
 
-`live_control.py` 键盘：`[p]` 姿态、`[b]` 球、`[t]` 球桌、`[q]`/`[ESC]` 退出；
+`live_control.py` 键盘：`[p]` 姿态、`[b]` 球、`[t]` 球桌、`[s]` EasyMocap、`[r]` 录图、
+`[v]` 录像 4 路（`data/video/<时间戳>/`，再按一次停止）、`[q]`/`[ESC]` 退出；
 外部触发模式下收不到帧会在画面顶部报「NO TRIGGER SIGNAL」并提示检查信号发生器 / Line0。
 
 > 所有脚本运行前先关 MVS 客户端（避免设备被独占报 `0x80000203`）。
 
 ## 还没做完
 
-- **缺 pipeline 编排脚本**：目前是「单功能脚本」，还没有一个把
-  「采集 → 多路检测 → 2D→3D 重建 → 3D 可视化」串起来的整体入口（等重建 / 3D 可视化模块就绪）。
-- **缺录制 / 回放脚本**：没有把四机同步帧序列存盘、再从盘上回放的脚本（`data/recordings/` 目前空置）。
+- **无多人重建**：`reconstruct_video.py` 每相机取最高置信度的一人（与 live_control 一致），
+  多人（`match_people`）离线未串。
 - `live_control.py` 的球 / 球桌开关现在点了只会提示「接口已定义，算法待实现」，等 `vision` 注册后自动生效。
