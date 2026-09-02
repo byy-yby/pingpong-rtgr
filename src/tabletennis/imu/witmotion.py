@@ -237,6 +237,56 @@ class MagYawLock:
         return self._delta
 
 
+def handle_bearing(R) -> float:
+    """手柄方向在桌面系 XY 平面的方位角（度，atan2，range −180..180]。
+
+    viewer3d 的球拍 mesh 手柄默认沿 +X，故取 ``R @ [1,0,0]`` 在世界系的方向，
+    投影到 XY 平面取方位角——平放时 = 手柄世界航向；绕世界 +Z 转 ``deg`` 时方位角
+    正好平移 ``deg``（Rz 与 XY 投影可交换），是「世界航向修正」的自然度量。
+    """
+    d = np.asarray(R, dtype=np.float64).reshape(3, 3) @ np.array([1.0, 0.0, 0.0])
+    return float(np.degrees(np.arctan2(d[1], d[0])))
+
+
+class WorldHeadingHold:
+    """静止冻结显示航向：把模块「完全不动」时仍在慢漂的 yaw 整体丢弃。
+
+    模块 yaw 在无磁场基准（本固件不开 0x54）时是纯陀螺积分，静止时零偏也照积
+    （手持/桌面几分钟漂 1~3°）。本类在**真静止**（调用方按模块角速度 EMA + 门限判定，
+    桌面静置是、手持抖动通常不是）时把显示航向冻在进静止那一刻，模块静止期自己攒的
+    漂移不进显示；转动恢复时从冻结值继续累积模块航向的真实变化——**不跳变、静止期的
+    漂移被永久丢弃**（不是冻结到转动瞬间再补回来）。它只给「相对保持」、给不了绝对
+    航向，「摆回原点应复位」由 live_control 的**原点自动重锁**负责。
+
+    用法：锁参考后逐姿态包 ``delta = update(bearing(R_disp0), still)``，返回绕世界
+    +Z 的修正角（度），``R_disp = Rz_world(delta) @ R_disp0`` 使静止时显示航向恒定、
+    转动时贴合模块。``still`` 须由调用方对 |gyro| 平滑后与门限比较（见 live_control），
+    别把手上 6~12Hz 的抖动判成「转动」。
+    """
+
+    def __init__(self) -> None:
+        self._disp: Optional[float] = None  # 显示航向（度）：静止冻结、转动累积
+        self._prev: Optional[float] = None  # 上一包的模块航向（度）
+
+    def reset(self) -> None:
+        """重锁参考姿态后调用：基线归零，下一包起 δ=0（显示航向 = 模块航向）。"""
+        self._disp = None
+        self._prev = None
+
+    def update(self, heading_deg: float, still: bool) -> float:
+        """逐包调用。``heading_deg`` = 纯模块显示的航向（``bearing(R_disp0)``）。"""
+        h = float(heading_deg)
+        if self._prev is None:
+            self._prev = h
+            self._disp = h
+            return 0.0
+        if not still:
+            # 转动：把模块航向的真实变化累积进显示航向；静止期攒的漂移不进 _disp
+            self._disp = wrap_pi(self._disp + wrap_pi(h - self._prev))
+        self._prev = h
+        return wrap_pi(self._disp - h)
+
+
 class WitMotionParser:
     """增量解析 0x55 协议字节流。
 

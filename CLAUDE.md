@@ -98,6 +98,13 @@
   方向在「heading 相对参考相减」里被消掉 → 不依赖 IMU 轴方向、不需要任何磁场校准。验证
   看 `[IMU] 磁力计已开启（0x54 收到）` 与锁参考后的 `磁力计航向锚定已启用` 日志；单测
   `test_mag_*` / `test_imu_yaw_lock_*` 在 `tests/test_imu.py`。
+  **⚠️ 实测 WT901BLE67 固件忽略 RRST 写 → 0x54 永不回传 → 磁锚定不启用**（日志
+  `模块未回传磁力计`）。此时走降级：① `WorldHeadingHold` 静止冻结（消「不动也慢漂」：
+  模块真静止时把显示航向冻住，静止期零偏不进显示，转动不跳变）；② `live_control.
+  _maybe_auto_relock` 原点自动重锁（**须开 P 有真实右手腕**：手腕在桌面原点水平 0.45m
+  内 + 平放 + 静止持续 ~1.2s → 重锁参考清零，须先挪开再回原点才再触发）；③ 参考锁定等
+  `ImuReader.on_ready`（配置完成后才锁，避免锁到过渡期低速流——曾见 0.5 包/秒时已锁）。
+  相关单测 `test_world_heading_hold_*` / `test_reader_ready_*` / `test_handle_bearing_*`。
 - `right_wrist_anchor` / `so3_project` / `imu_to_paddle_world` 逻辑可测（`viewer3d.right_wrist_anchor` 按骨架名找 `right_wrist`，halpe26=idx10；锚点默认原点 = 桌面原点 (0,0,0)）。
 - 四元数默认不上报（0x59 需 `FF AA 27 51 00` 寄存器读，当前用角度即可）。
 

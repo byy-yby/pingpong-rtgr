@@ -16,7 +16,9 @@ from tabletennis.imu.reader import (
 from tabletennis.imu.witmotion import (
     MagYawLock,
     WitMotionParser,
+    WorldHeadingHold,
     angle_to_rotmat,
+    handle_bearing,
     imu_to_paddle_world,
     quat_to_rotmat,
     so3_project,
@@ -495,3 +497,90 @@ def test_reader_request_mag_flag_and_snapshot_path():
     assert len(packets) == 3
     assert packets[2]["mag"] == (7.0, 8.0, 9.0)
     assert abs(packets[2]["yaw"] - 45.0) < 1e-6
+
+
+def test_reader_ready_flag_and_on_ready():
+    """配置完成标志：False→True 才触发一次 on_ready；同值不重复触发。
+
+    live_control 靠它把参考锁定挪到速率配置完成后的干净流（修「锁到过渡期低速流」）。
+    """
+    r = ImuReader()
+    calls = []
+    r.on_ready = lambda: calls.append(True)
+    assert not r.is_ready()
+    r._set_ready(False)     # 同值：不触发
+    assert not calls
+    r._set_ready(True)      # False→True：触发一次
+    assert r.is_ready()
+    assert len(calls) == 1
+    r._set_ready(True)      # 同值：不重复触发
+    assert len(calls) == 1
+    r._set_ready(False)     # True→False：只在变 True 时回调
+    assert not r.is_ready()
+    assert len(calls) == 1
+    r._set_ready(True)      # 再次 False→True
+    assert len(calls) == 2
+
+
+def test_handle_bearing_flat_equals_yaw():
+    """水平（roll=pitch=0）时手柄世界方位角 == 模块 yaw。"""
+    for yaw in (-170.0, -90.0, 0.0, 45.0, 135.0, 179.0):
+        h = handle_bearing(angle_to_rotmat(0.0, 0.0, yaw))
+        assert abs(wrap_pi(h - yaw)) < 1e-6, f"yaw={yaw} bearing={h}"
+    # 参考姿态 R_ref=Rz(-90°)：手柄世界方向 = 桌面 −Y
+    assert abs(wrap_pi(handle_bearing(_R_REF) - (-90.0))) < 1e-6
+
+
+def test_rotz_world_rotates_bearing_exactly():
+    """绕世界 +Z 转 delta 后手柄方位角正好平移 delta——航向修正的核心恒等式。"""
+    R = angle_to_rotmat(15.0, -20.0, 40.0)   # 带倾角的拍
+    for delta in (-170.0, -35.0, 0.0, 90.0, 179.0):
+        Rz = _rotz(delta)
+        b0, b1 = handle_bearing(R), handle_bearing(Rz @ R)
+        assert abs(wrap_pi(b1 - b0 - delta)) < 1e-6, f"delta={delta}"
+
+
+def test_world_heading_hold_discards_rest_creep():
+    """核心场景：静止时模块 yaw 零偏积分慢漂 +2°，显示应冻在原处；随后真实转 +30°，
+    显示 = 原处 + 30°（静止期漂移被永久丢弃，转动恢复不跳变）。"""
+    hh = WorldHeadingHold()
+    h = 10.0
+    assert abs(hh.update(h, False)) < 1e-9    # 基线
+    shown = []
+    for _ in range(100):                      # 静止：模块 yaw 每包 creep +0.02°
+        h += 0.02
+        d = hh.update(h, True)
+        shown.append(wrap_pi(h + d))
+    assert all(abs(x - 10.0) < 1e-9 for x in shown), "静止漂移进了显示！"
+    for _ in range(30):                       # 真实旋转 30°/包（h 从 12 涨到 42）
+        h += 1.0
+        d = hh.update(h, False)
+        shown.append(wrap_pi(h + d))
+    assert abs(shown[-1] - 40.0) < 1e-6, f"期望 10+30=40，实际 {shown[-1]}"
+
+
+def test_world_heading_hold_follows_pure_motion():
+    """一直转动 → 修正 0，显示贴模块（真实旋转不被冻结吞掉）。"""
+    hh = WorldHeadingHold()
+    h = 0.0
+    assert abs(hh.update(h, False)) < 1e-9
+    for _ in range(25):
+        h += 1.0
+        d = hh.update(h, False)
+        assert abs(d) < 1e-9, f"转动中 δ 应为 0，实际 {d}"
+    assert abs(wrap_pi(h + d) - h) < 1e-9
+
+
+def test_world_heading_hold_reset():
+    """重锁参考后 reset()：δ 归零，显示重新从当前航向起算。"""
+    hh = WorldHeadingHold()
+    h = 5.0
+    assert abs(hh.update(h, True)) < 1e-9     # 基线锁在 5°
+    for _ in range(10):                       # 静止 + creep 到 6°
+        h += 0.1
+        d = hh.update(h, True)
+    assert abs(wrap_pi(h + d) - 5.0) < 1e-9   # 已冻结在 5°
+    hh.reset()
+    d = hh.update(9.0, False)                 # 新参考下模块航向已是 9°：δ=0
+    assert abs(d) < 1e-9
+    assert abs(wrap_pi(9.0 + d) - 9.0) < 1e-9

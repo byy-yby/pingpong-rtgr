@@ -102,6 +102,11 @@ class ImuReader:
         # 增强回调 ``on_packet(dict)``：每收到含角度/四元数的包触发一次，dict 带最新
         # R(3x3)、roll/pitch/yaw(度)、accel/gyro(组合包)、mag(0x54；无则 None)。
         self.on_packet: Optional[Callable[[dict], None]] = None
+        # 连接完成速率配置（+磁力计请求）后触发一次 ``on_ready()``（每个新连接一次）。
+        # notify 在 start_notify 后立即开流、早于速率配置——调用方要等 ready 才锁参考，
+        # 避免把参考锁到过渡期低速/未稳定的流上。
+        self.on_ready: Optional[Callable[[], None]] = None
+        self._ready = False
 
         # 调试模式（TT_IMU_DEBUG=1）：打印原始 notify（长度 + 十六进制）与解析统计，
         # 用于定位「模块没发够快」还是「模块在发但解析拒了大部分」。
@@ -182,6 +187,7 @@ class ImuReader:
                 async with BleakClient(addr, timeout=12.0) as client:
                     self._connect_t = time.time()
                     self._set_connected(True)
+                    self._set_ready(False)   # 新连接：配置完成前 on_ready 标记无效
                     await client.start_notify(_READ_UUID, self._on_notify)
                     if self.debug:
                         try:
@@ -191,6 +197,7 @@ class ImuReader:
                     await self._configure_output_rate(client)
                     if self.request_mag:
                         await self._request_mag_output(client)
+                    self._set_ready(True)    # 配置完成：此后才是干净的期望速率流
                     print(f"[IMU] 已连接 {name or addr}，等待姿态数据…")
                     while self._running:
                         if not client.is_connected:
@@ -301,6 +308,23 @@ class ImuReader:
             return
         self.connected = v
         print(f"[IMU] {'已连接' if v else '已断开'}")
+
+    def _set_ready(self, v: bool) -> None:
+        """连接就绪标志：False=进入新连接（配置前），True=速率配置(+磁力计请求)完成。
+
+        从 False→True 触发一次 ``on_ready()``，供 live_control 把参考锁定挪到配置
+        完成后的干净流。notify 回调与 asyncio 主流程都在同一后台线程，读写无需加锁。
+        """
+        if self._ready == v:
+            return
+        self._ready = v
+        if v:
+            cb = self.on_ready
+            if cb is not None:
+                try:
+                    cb()
+                except Exception as exc:  # noqa: BLE001 —— 回调失败不影响连接
+                    print(f"[IMU] on_ready 回调异常：{exc}")
 
     def _name_matches(self, name: str) -> bool:
         if self.device_name:
@@ -420,3 +444,7 @@ class ImuReader:
         """实测数据速率（包/秒，EMA；连上并出数后才有意义）。"""
         with self._lock:
             return self._rate_hz
+
+    def is_ready(self) -> bool:
+        """当前连接是否已完成速率配置（此后数据才是干净的期望速率流）。"""
+        return self._ready

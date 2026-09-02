@@ -52,6 +52,8 @@ from tabletennis.vision.ball import ClassicalBallDetector
 from tabletennis.vision.detector import create_detector
 from tabletennis.imu.witmotion import (
     MagYawLock,
+    WorldHeadingHold,
+    handle_bearing,
     imu_to_paddle_world,
     so3_project,
 )
@@ -105,6 +107,25 @@ _IMU_REF_YZ = np.array([
 # 快速倾斜挥拍时冻结修正、回落模块 yaw（单拍内陀螺误差小）。见 witmotion.MagYawLock。
 _MAG_ANCHOR_HINT = ("[IMU] 磁锚定：静止平放时航向自动锚回磁场，摆回原点参考姿态应复位；"
                     "挥拍/倾斜时不锚（回落模块 yaw）。")
+
+# 无磁力计（本固件开不了 0x54）时的降级提示：静止冻结 + 原点自动重锁压漂移
+_NO_MAG_HINT = ("[IMU] 无磁力计数据（0x54 未回传）→ 无绝对航向锚定。已启用：①静止冻结"
+                "（不动时不漂）②开 P 姿态重建后，把球拍摆回桌面原点平放静止约 1s 自动重锁清零。")
+
+# 静止冻结（消「不动时也在慢漂」，见 witmotion.WorldHeadingHold）：
+# 模块真静止（桌面静置）时显示航向冻结，静止期攒的陀螺零偏不进显示；手持抖动
+# (6~12Hz, 数°/s) 平滑后通常超门限，不会误判成静止把慢转也冻掉。
+_IMU_HOLD_STILL_DEG_S = 4.0    # |gyro| EMA 低于此才算「真静止」
+_IMU_GYRO_EMA_A = 0.2          # |gyro| EMA 平滑系数（@100Hz ≈ 50ms 时间常数）
+
+# 摆回原点自动重锁（无磁时的绝对复位，替代磁锚定的「回到同一姿态自动复位」）：
+# 需要 P 姿态重建给出真实右手腕位置（球拍锚点）判「在原点」；平放 + 静止 + 持续一会
+# 才触发，触发后须先离开该姿态（门限外）才能再次触发——每次回到原点静置只重锁一次。
+_IMU_RELOCK_RADIUS_M = 0.45    # 右手腕距桌面原点（水平 XY）上限（米）
+_IMU_RELOCK_TILT_DEG = 15.0    # |roll|/|pitch| 上限（须平放）
+_IMU_RELOCK_STILL_DEG_S = 12.0  # |gyro| 上限（须静止）
+_IMU_RELOCK_HOLD_S = 1.2       # 连续满足多久才触发（@100Hz ≈ 120 包）
+_IMU_RELOCK_COOLDOWN_S = 4.0   # 触发后的冷却（配合 armed 机制，回原点一次只锁一次）
 
 
 def _rotz_world(deg: float) -> np.ndarray:
@@ -218,6 +239,15 @@ class LiveControl:
         self._last_init_hint = 0.0   # 等待参考姿态的提示限频时间戳
         # 磁航向锚定（mag 可用时消模块 yaw 漂移，见模块常量注释）
         self._imu_maglock: Optional[MagYawLock] = None
+        # 无磁时降级：静止冻结 + 原点自动重锁（见模块常量注释）
+        self._imu_ready = False      # reader 是否完成速率配置（on_ready 置 True）
+        self._imu_heading_hold: Optional[WorldHeadingHold] = None
+        self._imu_gyro_ema = 0.0     # |gyro| EMA（判「真静止」，手持抖动不算）
+        self._imu_anchor = None      # 最近一次主循环给的右手腕锚点（世界系，米）
+        self._imu_anchor_t = 0.0     # 该锚点的时间戳（超过 0.5s 不算数）
+        self._relock_since = None    # 连续满足原点静止条件的起始时刻
+        self._relock_armed = False   # 已离开参考姿态（=True）才能再次自动重锁
+        self._imu_last_relock_t = 0.0  # 上次（重）锁参考的时刻（冷却用）
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -566,8 +596,10 @@ class LiveControl:
                 output_rate_hz=self.imu_rate,
                 request_mag=True,   # 让模块补报 0x54 磁力计（自校验，失败不影响读取）
             )
-            self._imu_reader.on_orientation = self._imu_on_orientation
+            # 全部姿态处理走 on_packet（含四元数回退）；不挂 on_orientation，否则每个
+            # 角度包会被回调两次、参考样本翻倍、显示被推两遍。
             self._imu_reader.on_packet = self._imu_on_packet
+            self._imu_reader.on_ready = self._imu_on_ready
             self._imu_reader.start()
         # 重新初始化参考姿态：用户把球拍平放于桌面原点做基准
         self._imu_R_home = None
@@ -575,21 +607,45 @@ class LiveControl:
         self._imu_init_t0 = None
         self._last_init_hint = 0.0
         self._imu_maglock = MagYawLock()   # 重新锁参考时也重新记参考磁航向
+        self._imu_ready = False            # 等 reader 配置完成后（on_ready）才锁参考
+        self._imu_heading_hold = WorldHeadingHold()
+        self._imu_gyro_ema = 0.0
+        self._imu_anchor = None
+        self._imu_anchor_t = 0.0
+        self._relock_since = None
+        self._relock_armed = False
+        self._imu_last_relock_t = 0.0
         print("[IMU] ON——读 WT9011DCL 蓝牙姿态，3D 窗口显示球拍朝向"
               f"（上报率 {self.imu_rate:g}Hz）")
         print("[IMU] 请把球拍平放在桌面原点（正面朝上、点口端朝桌面 −Y，"
               "Y=长边）：保持静止约 0.2s 以锁定参考姿态…")
 
-    def _imu_on_orientation(self, R) -> None:
-        """兼容回调（reader.on_orientation）：只有旋转矩阵，主路径之外的回退。
+    def _imu_on_ready(self) -> None:
+        """reader 完成速率配置（+磁力计请求）后触发：此后数据才是干净的期望速率流。
 
-        四元数包（当前模块不上报）或极少数只含姿态不含 rpy 的场景走这里，行为 =
-        旧版：模块 yaw 直接显示、不做磁锚定。参考锁定逻辑与主路径共用
-        :meth:`_imu_collect_reference`。
+        锁参考前必须等到它——notify 在 start_notify 后立即开流、早于速率配置，若拿
+        过渡期低速/未稳定的流锁 R_home，参考姿态本身就可能带偏差。
+        """
+        self._imu_ready = True
+        if self._imu_R_home is None:
+            self._imu_init_samples = []   # 过渡期若有残留样本，重来
+            self._imu_init_t0 = None
+
+    def _imu_on_orientation(self, R) -> None:
+        """回退路径（四元数包：无 rpy，只推原始朝向，不做航向修正）。
+
+        仅在 :meth:`_imu_on_packet` 收到 ``roll=None`` 的四元数包时被调用；**不直接挂到
+        reader.on_orientation**（否则每个角度包会被回调两次、参考样本翻倍、显示推两遍）。
+        参考锁定共用 :meth:`_imu_collect_reference`，但须等 reader ready
+        （:meth:`_imu_on_ready`）——避免锁到过渡期低速流。
         """
         R = np.asarray(R, dtype=np.float64).reshape(3, 3)
-        if self._imu_R_home is None and not self._imu_collect_reference(R):
-            return
+        if self._imu_R_home is None:
+            if not self._imu_ready:
+                return
+            if not self._imu_collect_reference(R):
+                return
+            self._after_reference_lock(None, None, None, None)
         if self.viewer3d is not None:
             self.viewer3d.set_imu_orientation(
                 imu_to_paddle_world(R, self._imu_R_home, _IMU_REF_YZ))
@@ -631,18 +687,23 @@ class LiveControl:
         return True
 
     def _imu_on_packet(self, pkt) -> None:
-        """notify 线程回调（reader.on_packet）：锁参考 + 磁航向锚定 + 推 3D。
+        """notify 线程回调（reader.on_packet）：锁参考 + 航向修正（磁锚/静止冻结）+ 原点自动重锁。
 
-        主路径：每个含姿态的包触发一次，``pkt`` 已带最新 accel/gyro/mag（见
-        ``reader._handle``）。参考锁定走 :meth:`_imu_collect_reference`；锁定那一刻若
-        磁力计可用（``pkt["mag"]`` 非 None），把该姿态的磁航向记进 ``MagYawLock``——
-        **不需要知道 IMU 轴方向、不需要上位机做磁场校准**：绝对磁场方向在
-        「heading 相对参考相减」里被消掉，只留相对变化。
+        主路径：每个含姿态的包触发一次，``pkt`` 带最新 accel/gyro/mag（见
+        ``reader._handle``）。参考锁定走 :meth:`_imu_collect_reference`（**须等
+        reader ready**，见 :meth:`_imu_on_ready`）；锁定那一刻把当前磁航向记进
+        ``MagYawLock``（若 0x54 可用）——绝对磁场方向在「heading 相对参考相减」里被
+        消掉，不依赖 IMU 轴方向、无需上位机校准。
 
-        之后每包：``delta = MagYawLock.update(...)`` 是绕**世界竖直轴**的修正角，模块
-        **平放且静止**时（权重 1）把显示航向锚回磁场 → 消除「拍面平对、手柄航向漂」
-        的陀螺 yaw 漂移；快速倾斜挥拍/转动时权重 0 → 修正冻结、回落模块 yaw（单拍内
-        陀螺误差可忽略）。修正实现细节见 :class:`tabletennis.imu.witmotion.MagYawLock`。
+        之后每包取一个绕**世界竖直轴**的修正角 ``delta``，优先级：
+        1. **磁锚定**（``MagYawLock``，0x54 可用时）：模块平放且静止时把显示航向锚回
+           磁场 → 消除陀螺 yaw 漂移；快速倾斜挥拍/转动时权重 0、修正冻结回落模块 yaw。
+        2. **静止冻结**（``WorldHeadingHold``，本固件开不了 0x54 时）：模块**真静止**
+           时把显示航向冻住，静止期攒的零偏不进显示；转动时贴合模块。
+        再经 ``R_disp = Rz_world(delta) @ R_disp0`` 推给 3D（Rz 只改世界航向、不动
+        拍面倾角）。最后判**摆回原点自动重锁**（:meth:`_maybe_auto_relock`）——
+        无磁时的绝对复位：P 开着、右手腕在原点附近、拍子平放静止持续一会，就把当前
+        姿态重锁成参考，累计漂移清零。
 
         走回调路径而非主循环逐帧轮询，是为了**绕开主循环帧率钳制**（主循环约 20FPS，
         而 IMU 上报率可到 100Hz——串行推会在 60fps 窗口里仍然顿挫）。
@@ -650,36 +711,119 @@ class LiveControl:
         R = np.asarray(pkt["R"], dtype=np.float64).reshape(3, 3)
         roll, pitch, yaw = pkt["roll"], pkt["pitch"], pkt["yaw"]
         mag, gyro = pkt["mag"], pkt["gyro"]
-        if roll is None:            # 四元数包（无 rpy）→ 回落 on_orientation 逻辑
+        if roll is None:            # 四元数包（无 rpy）→ 回退路径
             self._imu_on_orientation(R)
             return
         if self._imu_R_home is None:
+            if not self._imu_ready:
+                return             # 等 reader 完成速率配置再锁参考（避免锁到过渡流）
             if not self._imu_collect_reference(R):
                 return
-            ml = self._imu_maglock
-            if ml is not None and mag is not None:
-                ml.lock(roll, pitch, yaw, mag)
-                print(_MAG_ANCHOR_HINT)
-            else:
-                print("[IMU] 无磁力计数据（0x54 请求未成功）→ 无法锚定航向；"
-                      "模块 yaw 若漂移请摆回原点按 i 重锁。")
-        delta = 0.0
+            self._after_reference_lock(roll, pitch, yaw, mag)
+        R0 = imu_to_paddle_world(R, self._imu_R_home, _IMU_REF_YZ)
+        delta = self._imu_world_z_correction(roll, pitch, yaw, mag, gyro, R0)
+        R_disp = _rotz_world(delta) @ R0 if delta else R0
+        if self.viewer3d is not None:
+            self.viewer3d.set_imu_orientation(R_disp)
+        self._maybe_auto_relock(roll, pitch, yaw, gyro, mag, R)
+
+    def _after_reference_lock(self, roll, pitch, yaw, mag) -> None:
+        """参考姿态（重新）锁定后的收尾：磁锚定/静止冻结的基线重置 + 冷却。
+
+        ``roll/pitch/yaw/mag`` 来自锁定那一包的模块读数（四元数包路径传 None）。
+        """
+        ml = self._imu_maglock
+        if ml is not None and mag is not None:
+            ml.lock(roll, pitch, yaw, mag)
+            print(_MAG_ANCHOR_HINT)
+        elif ml is not None:
+            print(_NO_MAG_HINT)
+        if self._imu_heading_hold is not None:
+            self._imu_heading_hold.reset()   # 新参考 → 显示航向基线归零
+        self._imu_last_relock_t = time.time()  # 刚锁完：冷却，避免原点回弹反复重锁
+        self._relock_since = None
+        self._relock_armed = False
+
+    def _imu_is_still(self, gyro) -> bool:
+        """|gyro| 的 EMA 是否低于门限（= 真静止，桌面静置；手持 6~12Hz 抖动不算）。
+
+        EMA 平滑让门限不被单包尖峰抖动误判。``gyro`` 为 None（无 gyro 快照，无法确认
+        静止）时按**动**处理，别乱冻结。0x61 组合包总是带 gyro，正常不会走到 None。
+        """
+        if gyro is None:
+            return False
+        g = float(np.linalg.norm(gyro))
+        ema = self._imu_gyro_ema
+        self._imu_gyro_ema = ema + _IMU_GYRO_EMA_A * (g - ema)
+        return self._imu_gyro_ema < _IMU_HOLD_STILL_DEG_S
+
+    def _imu_world_z_correction(self, roll, pitch, yaw, mag, gyro, R0) -> float:
+        """算本包该叠加的绕世界 +Z 修正角（度）：磁锚定优先，无磁则静止冻结。"""
         ml = self._imu_maglock
         if ml is not None and ml.enabled and mag is not None:
             g = 0.0 if gyro is None else float(np.linalg.norm(gyro))
-            delta = ml.update(roll, pitch, yaw, g, mag)
-        R_disp = imu_to_paddle_world(R, self._imu_R_home, _IMU_REF_YZ)
-        if delta:
-            R_disp = _rotz_world(delta) @ R_disp   # 只改世界航向、不动拍面倾角
-        if self.viewer3d is not None:
-            self.viewer3d.set_imu_orientation(R_disp)
+            return ml.update(roll, pitch, yaw, g, mag)
+        hh = self._imu_heading_hold
+        if hh is not None:
+            return hh.update(handle_bearing(R0), self._imu_is_still(gyro))
+        return 0.0
+
+    def _maybe_auto_relock(self, roll, pitch, yaw, gyro, mag, R) -> None:
+        """摆回桌面原点、平放且静止持续一会 → 把当前姿态重锁成参考（清累计漂移）。
+
+        无磁锚定时模块 yaw 只有陀螺积分、无绝对基准，摆回参考姿态不会自动复位；这里用
+        视觉位置做绝对基准：**P 姿态重建开着**（右手腕 3D = 球拍锚点）→ 手腕在桌面原点
+        附近 + 模块平放(|roll|/|pitch| 小) + 静止(|gyro| 小)，持续 ``_IMU_RELOCK_HOLD_S``
+        秒即重锁。P 没开 / 没有有效右手腕时不判（anchor 会退化到固定原点，判了会把任何
+        平放静止当「在原点」，绝不能自动重锁）。
+        """
+        if not self._imu_enabled or self._imu_R_home is None:
+            return
+        if not (self.enable.get("pose") and self._imu_anchor is not None
+                and time.time() - self._imu_anchor_t <= 0.5):
+            self._relock_armed = False   # 没真实手腕位置：永不自动重锁
+            self._relock_since = None
+            return
+        g = 0.0 if gyro is None else float(np.linalg.norm(gyro))
+        anchor_xy = float(np.hypot(self._imu_anchor[0], self._imu_anchor[1]))
+        cond = (abs(roll) <= _IMU_RELOCK_TILT_DEG
+                and abs(pitch) <= _IMU_RELOCK_TILT_DEG
+                and g <= _IMU_RELOCK_STILL_DEG_S
+                and anchor_xy <= _IMU_RELOCK_RADIUS_M)
+        now = time.time()
+        if not cond:
+            self._relock_armed = True    # 已离开参考姿态：下次回到原点可再触发
+            self._relock_since = None
+            return
+        if not self._relock_armed:
+            return
+        if self._relock_since is None:
+            self._relock_since = now
+            return
+        if now - self._relock_since < _IMU_RELOCK_HOLD_S:
+            return
+        if now - self._imu_last_relock_t < _IMU_RELOCK_COOLDOWN_S:
+            return
+        # 触发：把当前姿态锁成新参考（当前 R 已足够准；抖动 <1°）
+        self._relock_armed = False
+        self._relock_since = None
+        self._imu_last_relock_t = now
+        self._imu_R_home = so3_project(R)
+        if self._imu_heading_hold is not None:
+            self._imu_heading_hold.reset()
+        ml = self._imu_maglock
+        if ml is not None and mag is not None:
+            ml.lock(roll, pitch, yaw, mag)
+        print("[IMU] 球拍回到桌面原点平放静止 → 已自动重锁参考姿态（累计漂移清零）。")
 
     def _disable_imu(self) -> None:
         if self._imu_reader is not None:
             self._imu_reader.on_orientation = None
             self._imu_reader.on_packet = None
+            self._imu_reader.on_ready = None
             self._imu_reader.stop()
             self._imu_reader = None
+        self._imu_ready = False
         if self.viewer3d is not None:
             self.viewer3d.set_imu_orientation(None)
         print("[IMU] OFF")
@@ -763,6 +907,10 @@ class LiveControl:
                     anchor = right_wrist_anchor(skeletons, min_conf=_WRIST_MIN_CONF)
                     if anchor is not None:
                         self.viewer3d.set_imu_anchor(anchor)
+                        # 记下最新右手腕锚点给 IMU notify 线程判「摆回原点自动重锁」用
+                        # （notify 线程只读这两项；跨线程写 GIL 原子赋值即可）。
+                        self._imu_anchor = anchor
+                        self._imu_anchor_t = time.time()
             t_recon = time.perf_counter() - t_r0
             # 诊断日志：前 5 帧 + 每 60 帧打印一次，定位骨架不出现的环节
             self._frame_idx += 1
@@ -1366,8 +1514,9 @@ class LiveControl:
                     self._em_pending_viewer = False
 
                 # （3D 球重建已由后台线程 _ball_recon_loop 负责，这里不再调用）
-                # （IMU 朝向由 notify 线程 on_orientation 回调直接推给 3D 场景，
-                #   见 _imu_on_orientation——绕开这里 ~20FPS 的主循环，避免顿挫。）
+                # （IMU 朝向由 notify 线程 on_packet 回调直接推给 3D 场景，
+                #   见 _imu_on_packet——绕开这里 ~20FPS 的主循环，避免顿挫。
+                #   原点自动重锁所需的手腕锚点在 _reconstruct_frame 里记录。）
 
                 canvas = self._compose_canvas()
                 cv2.imshow(MAIN_WIN, canvas)
