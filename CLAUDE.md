@@ -79,8 +79,16 @@
 
 - 默认视角：`up=(0,0,1)`（Z 竖直）、`set_front(front=[1,1,0.9])`——**`set_front` 传的是「从 lookat 指向相机」的方向**，`[1,1,0.9]`（+Z 朝上）= 相机在 +X+Y+Z 斜上方俯瞰球桌（此前 `[-1,-1,-0.9]` 会让相机跑到桌面下方仰视）。R 复位即回此视角。
 - 键盘：`VisualizerWithKeyCallback` + **W/A/S/D 平移、方向键旋转、+/− 缩放、R 复位**。**translate 的 +y 才是「向上」**（W=`translate(0,+step)`、S=`translate(0,-step)`，曾写反）。
-- 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）。
+- 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）、SMPL（`add_smpl_layer`/`set_smpl`）。
+- **SMPL 一片白的根因是法线没重算**：`_update_smpl_geometry` 里 `has_vertex_normals()` 守卫在空网格算出 0 法线后会永久跳过重算 → unlit 平面白。已改成无条件 `compute_vertex_normals()`。
 - 每个方法里自己 `o3d = _o3d()` 惰性 import（`_update_ball_geometry` 曾漏写致渲染线程 NameError 窗口退出）；Open3D 窗口必须在主线程开，后台线程只加载模型。
+
+### 离线重建回放 `recon_player.py` + `scripts/visualize_recon.py`
+
+- `scripts/reconstruct_video.py` 每帧存 `frame_NNNNNN.npz`（vertices/joints/…）时**多写一次 `recon_faces.npy`**（13776×3 SMPL 拓扑，整段一次，`ensure_faces`）。
+- `scripts/visualize_recon.py <recon目录>` 弹出 Open3D 新渲染器窗口逐帧回放（`--watch` 重建进行中追帧；`--render T out.png` EGL 出 PNG；`--root` 指定含标定的项目根）。t 是主时钟帧号：no_person/失败帧清空人体，被 `--stride` 跳过帧保持上一姿态（`ReconTimeline`）。
+- **坑：本机 Filament 太阳定向光不生效**（EGL headless 与屏幕窗口都是 OpenGL 4.1，翻转太阳方向画面像素不变；只剩环境漫反射）→ 人体用 IBL 漫反射着色，接触阴影用**程序化两层半透明椭圆**（`contact_shadow_planes` + `defaultLitTransparency` 混合，脚底按太阳水平方向偏移）。透明材质必须显式 `shader="defaultLitTransparency"`——`base_color` alpha 默认不混合。
+- 键盘：Space 播放/暂停、←/→ 步进、Home/End、R 复位、-/= 调速、Esc 退出。
 
 ### 录像 + 离线重建（EasyMocap 的主路线）
 
@@ -92,6 +100,13 @@
 - **编解码实测**（本机 OpenCV 5.0）：1440×1080 Mono8 下 `mp4v` ~8ms/帧（100fps 预算内可行）；
   MJPG 26ms 太慢；`avc1`(h264) 无 v4l2 设备打不开。`fps` 只写 mp4 头（播放速度），重建读
   帧序号 + ts 副产物，不受影响。
+- **每相机诊断**：`SessionVideoRecorder.stop()` 现在逐相机打印
+  `喂 {n_fed} → 写 {frames} 帧（编码丢 {n_dropped}）· 实测 {fps} fps / 100 目标`，
+  并把 `fed_per_cam` / `encoder_dropped_per_cam` / `measured_period_s` 写进
+  `meta.json`。**帧数不足分两层**：① 生产侧（USB 抓帧，100Hz 触发但主队列丢帧/取帧慢）
+  ② 编码侧（`_CameraWriter` 队列满丢最旧 = `encoder_dropped`）。idle 4 路 mp4v
+  ≈110fps/路，说明单靠编码丢不了那么多——先看每行的「喂」少不少（生产侧）还是
+  「写 < 喂 - 丢」（编码侧）。**离线重建不受影响**：脉冲号对齐天然容忍缺帧。
 - 命名按**逻辑相机号** `cam{cid}.mp4`（cid=标定 `cam_{cid}.yaml` 的号），与在线 EasyMocap
   一致；live_control 按 `v` / 面板「录像」按钮启停（`fps=100` 外部触发 / `30` 自由采集）。
 

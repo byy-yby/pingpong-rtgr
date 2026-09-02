@@ -467,8 +467,10 @@ class SceneViewer3D:
             joints = np.asarray(result["joints"], dtype=np.float64).reshape(-1, 3)
             self._smpl_mesh.vertices = o3d.utility.Vector3dVector(verts)
             self._smpl_mesh.triangles = o3d.utility.Vector3iVector(faces)
-            if self._smpl_mesh.has_vertex_normals():
-                self._smpl_mesh.compute_vertex_normals()
+            # 顶点/面变了就要重算法线——旧逻辑「只在 has_vertex_normals() 时重算」
+            # 会让首帧之后法线保持空（空网格算过 0 条法线，顶点数≠法线数→False），
+            # 于是 SMPL 永远无光照、平涂一片白。这里无条件重算。
+            self._smpl_mesh.compute_vertex_normals()
             self._smpl_bones.points = o3d.utility.Vector3dVector(joints[:24])
             self._smpl_joints.points = o3d.utility.Vector3dVector(joints[:24])
         else:
