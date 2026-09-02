@@ -85,8 +85,8 @@
 - **帧格式 UART≠BLE（本模块最大坑，已实测）**：UART 是 `0x55|Flag|Data|Checksum` 共 21B 带校验（校验和 = 0x55 起到数据末之和低 8 位）；**BLE 流（WT901BLE5.0, MTU 23）0x61 包只有 `0x55|0x61|18B` 共 20B 无校验**，且多包塞进一条 notify（80B=4 包、40B=2 包）。解析器必须 `WitMotionParser(checksum=False)`；按 21B 解析每个包都失败 → 有效包只剩 1/256 运气值 → **实测表现 = 能连上但姿态几乎不动/偶发跳一下**。
 - `reader.py`：`ImuReader` 后台 BLE 线程（`bleak`，已装进 `tt`）。GATT 服务 `0000ffe5` / notify 收数据 `0000ffe4` / 写命令 `0000ffe9`（UUID 来自官方 SDK `WitBluetooth_BWT901BLE5_0` 的 `BleUUID.java`）；扫描广播名含 "WT" 的模块。
 - **坑**：BLE 流**无校验字节**（20B 包，见上）；上报率默认 10Hz 已由 reader 连上后自动提 100Hz（官方 5 字节写命令 `FF AA 69 88 B5` 解锁 → `FF AA 03 <val> 00` RATE → `FF AA 00 00 00` 保存）；模块上电可能被手机/上位机占用（BLE 一般单连接），用 `--imu-mac` 直接指定 MAC 更稳。
-- **参考姿态初始化（已解决安装角问题）**：按 i 后把球拍平放于桌面原点（拍面朝上），live_control 采集 `_IMU_INIT_N=20` 个静止样本（窗内角偏差 ≤5°）锁成 `R_home`，之后输出相对旋转 `R_rel=R_home^T@R_imu`——固定安装角/放置姿态偏差被自动吸收，无需再补硬编码旋转。运动时不锁（滚动窗+限频提示），重按 i 重锁。
-- `right_wrist_anchor` / `so3_project` 逻辑可测（`viewer3d.right_wrist_anchor` 按骨架名找 `right_wrist`，halpe26=idx10）。
+- **参考姿态初始化（已解决安装角问题，无需知道 IMU 轴方向）**：按 i 后把球拍平放于**桌面坐标系原点**（桌角原点标记，正面朝上、点口端/手柄朝桌面 −Y；表系 X=短边/Y=长边 2.74m/Z 向上），live_control 采集 `_IMU_INIT_N=20` 个静止样本（窗内角偏差 ≤5°）锁成 `R_home`，之后每个读数经 `imu_to_paddle_world(R, R_home, R_ref)`（`witmotion.py`，= `R@R_home.T@R_ref`）换算成球拍桌面系世界朝向，`R_ref=_IMU_REF_YZ=Rz(-90°)`（mesh 手柄 +X→桌面 −Y、拍面 +Z→+Z）——固定安装角 A 被消掉、参考时刻输出恰为 `R_ref`，挥拍时贴合真实世界朝向。**⚠️ 别用 `R_home.T@R_imu`（共轭旋转），一般三维运动屏幕朝向会整体错位**（有回归测试 `test_imu_to_paddle_world_*` 锁定）。若实测手柄反了 180° 把 `_IMU_REF_YZ` 反号即可。运动时不锁（滚动窗+限频提示），重按 i 重锁。
+- `right_wrist_anchor` / `so3_project` / `imu_to_paddle_world` 逻辑可测（`viewer3d.right_wrist_anchor` 按骨架名找 `right_wrist`，halpe26=idx10；锚点默认原点 = 桌面原点 (0,0,0)）。
 - 四元数默认不上报（0x59 需 `FF AA 27 51 00` 寄存器读，当前用角度即可）。
 
 ## 标定工具的归属（易混）

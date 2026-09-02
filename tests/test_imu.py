@@ -16,6 +16,7 @@ from tabletennis.imu.reader import (
 from tabletennis.imu.witmotion import (
     WitMotionParser,
     angle_to_rotmat,
+    imu_to_paddle_world,
     quat_to_rotmat,
     so3_project,
 )
@@ -243,6 +244,56 @@ def test_so3_project_average_two_rotations():
     R2 = angle_to_rotmat(0.0, 0.0, 20.0)
     Rm = so3_project((R1 + R2) / 2.0)
     assert np.allclose(Rm, angle_to_rotmat(0.0, 0.0, 10.0), atol=0.05)
+
+
+# ----------------------------------------------------------------------
+# imu_to_paddle_world：IMU 读数 -> 球拍桌面系世界朝向（3D 显示）
+# ----------------------------------------------------------------------
+_R_REF = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])  # Rz(-90°)
+
+
+def test_imu_to_paddle_world_at_reference():
+    """参考时刻输出 == R_ref：拍面平放朝上(+Z)、点口端/手柄朝桌面 −Y。"""
+    for M in (np.eye(3), angle_to_rotmat(15.0, -20.0, 30.0)):  # 任意安装角
+        R_home = _R_REF @ M
+        R_disp = imu_to_paddle_world(R_home, R_home, _R_REF)
+        assert np.allclose(R_disp, _R_REF, atol=1e-9)
+    # mesh 手柄 +X -> 桌面 −Y；拍面法线 +Z 仍朝上（表系 Y=长边）
+    assert np.allclose(_R_REF @ [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], atol=1e-9)
+    assert np.allclose(_R_REF @ [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], atol=1e-9)
+
+
+def test_imu_to_paddle_world_tracks_true_world_pose():
+    """任意世界旋转 Q：显示朝向 == 真实球拍世界朝向 Q@R_ref，与安装角 M 无关。"""
+    for M in (np.eye(3), angle_to_rotmat(10.0, 30.0, -15.0), angle_to_rotmat(120.0, -50.0, 60.0)):
+        R_home = _R_REF @ M
+        for Q in (np.eye(3), angle_to_rotmat(0.0, 0.0, 40.0),  # 纯桌面内偏航
+                  angle_to_rotmat(0.0, 90.0, 0.0),            # 纯前倾
+                  angle_to_rotmat(-30.0, 40.0, 25.0),         # 挥拍复合
+                  angle_to_rotmat(120.0, 55.0, -10.0)):       # 立起+翻转
+            R_imu = Q @ R_home
+            R_disp = imu_to_paddle_world(R_imu, R_home, _R_REF)
+            assert np.allclose(R_disp, Q @ _R_REF, atol=1e-6)
+
+
+def test_imu_to_paddle_world_old_conjugate_is_wrong():
+    """回归：旧公式 R_home.T @ R 是共轭旋转，一般运动下屏幕朝向会整体错位。
+
+    取 M=I、Q=纯绕 Y 前倾 90°（拍面从 +Z 立到 +X）：
+    真值手柄应指向 −Y；旧公式会指向 +X（偏 90°），新公式正确。
+    """
+    R_home = _R_REF
+    Q = angle_to_rotmat(0.0, 90.0, 0.0)
+    truth = Q @ _R_REF
+    old = R_home.T @ (Q @ R_home)
+    new = imu_to_paddle_world(Q @ R_home, R_home, _R_REF)
+    v = np.array([1.0, 0.0, 0.0])
+    h_true = truth @ v
+    h_old = old @ v
+    h_new = new @ v
+    assert np.allclose(h_true, [0.0, -1.0, 0.0], atol=1e-9)      # 真实手柄 -Y
+    assert not np.allclose(h_old, h_true, atol=1e-6)             # 旧公式确实偏
+    assert np.allclose(h_new, h_true, atol=1e-9)                 # 新公式正确
 
 
 # ----------------------------------------------------------------------

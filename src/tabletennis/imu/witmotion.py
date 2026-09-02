@@ -74,6 +74,25 @@ def so3_project(M: np.ndarray) -> np.ndarray:
     return R
 
 
+def imu_to_paddle_world(R_now, R_home, R_ref) -> np.ndarray:
+    """IMU 当前朝向 -> 球拍在桌面系(世界系)里的朝向，3D 显示直接套网格（body->world）。
+
+    IMU rigidly 固定在球拍柄内、安装角未知；参考时刻（用户把球拍平放锁定基准）捕获
+    ``R_home = R_imu(0)``。设 ``A`` = 固定安装角、``R_ref`` = 参考时刻球拍在世界系中的
+    姿态（约定常量，见 ``scripts/live_control._IMU_REF_YZ``），则
+    ``R_imu(t) = R_paddle(t) @ A`` 且 ``R_home = R_ref @ A``，消去 ``A`` 得::
+
+        R_paddle(t) = R_now @ R_home.T @ R_ref
+
+    参考时刻输出恰好等于 ``R_ref``，任意运动都贴合真实世界朝向、与安装角无关。
+    注意不能图省事用 ``R_home.T @ R_now``（共轭旋转，屏幕朝向会整体偏转错位）。
+    """
+    Rn = np.asarray(R_now, dtype=np.float64)
+    Rh = np.asarray(R_home, dtype=np.float64)
+    Rr = np.asarray(R_ref, dtype=np.float64)
+    return Rn @ Rh.T @ Rr
+
+
 def quat_to_rotmat(w: float, x: float, y: float, z: float) -> np.ndarray:
     """四元数 -> 旋转矩阵（body -> world，Hamilton 约定，w 实部）。
 
