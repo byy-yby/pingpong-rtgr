@@ -11,7 +11,7 @@ from .associate import (
     match_people_fixed,
 )
 from .ball import triangulate_ball, undistort_ball_center
-from .easymocap import HALPE26_TO_SMPL24, EasymocapReconstructor
+from .easymocap import HALPE26_TO_BODY25, EasymocapReconstructor
 from .pose_track import PoseTracker
 from .track import BallTracker
 from .triangulate import (
@@ -38,5 +38,5 @@ __all__ = [
     "BallTracker",
     "PoseTracker",
     "EasymocapReconstructor",
-    "HALPE26_TO_SMPL24",
+    "HALPE26_TO_BODY25",
 ]
