@@ -23,8 +23,14 @@ def _i16(v: int) -> bytes:
 
 
 def _pkt(flag: int, payload: bytes) -> bytes:
+    """UART 帧：0x55 | Flag | Data | Checksum（共 2+len+1 字节）。"""
     body = bytes([0x55, flag]) + payload
     return body + bytes([sum(body) & 0xFF])
+
+
+def _ble_pkt(flag: int, payload: bytes) -> bytes:
+    """BLE 帧（WT901BLE5.0 实测）：0x55 | Flag | Data（共 2+len 字节，无校验）。"""
+    return bytes([0x55, flag]) + payload
 
 
 def _angle_payload(roll: float, pitch: float, yaw: float) -> bytes:
@@ -107,16 +113,66 @@ def test_angle_quat_consistent():
 
 
 def test_reader_notify_path():
-    """BLE notify 回调 -> 解析 -> 旋转矩阵；21B 的 0x61 包跨 20+1 拆分也能重组。"""
+    """BLE notify（20B 无校验 0x61 包）-> 解析 -> 旋转矩阵。
+
+    ImuReader 用 checksum=False 建解析器；21B 带校验的 UART 包在这里不是合法输入。
+    """
     r = ImuReader()
     payload = _i16(0) * 3 + _i16(0) * 3 + _angle_payload(0.0, 0.0, 90.0)
-    pkt = _pkt(0x61, payload)
-    assert len(pkt) == 21
-    r._on_notify(None, pkt[:20])   # BLE 单包最多 20B，拆两段
-    r._on_notify(None, pkt[20:])
+    pkt = _ble_pkt(0x61, payload)
+    assert len(pkt) == 20
+    r._on_notify(None, pkt)
     R = r.latest_rotation()
     assert R is not None
     assert np.allclose(R @ np.array([1, 0, 0]), np.array([0, 1, 0]), atol=1e-6)
+
+
+def test_ble_80b_notify_4_packets():
+    """实测 notify 帧：80B = 4 个 20B 无校验 0x61 包，一帧解析出 4 个组合包。
+
+    该 hex 来自真实模块（imu_probe.py 阶段1 抓的原始数据）。
+    """
+    raw = bytes.fromhex(
+        "5561fcffefff110800000000000098ff0d00f831"
+        "5561fdffecff0e0800000000000098ff0d00f831"
+        "5561fdffecff0e0800000000000098ff0d00f831"
+        "5561feffe9ff0f0800000000000098ff0d00f831"
+    )
+    assert len(raw) == 80
+    p = WitMotionParser(checksum=False)
+    out = p.feed(raw)
+    assert len(out) == 4
+    assert all(o["type"] == "combined" for o in out)
+    assert p.stats["checksum_fail"] == 0
+    # 第一包实测读数：Az≈1.008g、yaw≈70.26°（int16/32768×量程）
+    _, _, az = out[0]["accel"]
+    assert abs(az - 1.008) < 0.01
+    _, _, yaw = out[0]["angle"]
+    assert abs(yaw - 70.26) < 0.05
+
+
+def test_ble_40b_notify_2_packets():
+    """实测下发 50Hz 命令后的 notify：40B = 2 个 20B 无校验 0x61 包。"""
+    raw = bytes.fromhex(
+        "5561f3fff3ff0f0800000000000098ff0d00f831"
+        "5561f9fff1ff100800000000000098ff0d00f831"
+    )
+    assert len(raw) == 40
+    p = WitMotionParser(checksum=False)
+    out = p.feed(raw)
+    assert len(out) == 2
+    assert p.stats["checksum_fail"] == 0
+
+
+def test_checksum_true_rejects_ble_stream():
+    """回归测试：旧 checksum=True 对 20B BLE 包解析不出——这就是「卡顿」根因。
+
+    20B 按 21B 长度等待 → partial_wait，永远凑不齐 → 有效包只剩 1/256 运气值。
+    """
+    p = WitMotionParser()   # 默认带校验
+    out = p.feed(bytes.fromhex("5561fcffefff110800000000000098ff0d00f831"))
+    assert out == []
+    assert p.stats["partial_wait"] > 0
 
 
 def test_write_cmd_bytes_official():
@@ -145,7 +201,7 @@ def test_on_orientation_callback():
     got = []
     r.on_orientation = got.append
     payload = _i16(0) * 3 + _i16(0) * 3 + _angle_payload(0.0, 0.0, 90.0)
-    r._on_notify(None, _pkt(0x61, payload))
+    r._on_notify(None, _ble_pkt(0x61, payload))
     assert len(got) == 1
     assert np.allclose(got[0] @ np.array([1, 0, 0]), np.array([0, 1, 0]), atol=1e-6)
 

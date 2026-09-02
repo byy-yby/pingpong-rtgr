@@ -18,13 +18,17 @@ IMU 走 **蓝牙 5.0 (BLE)**，不是串口。GATT 服务 ``ffe5``、notify 收�
 - **on_orientation 回调**：每个有效姿态包直接回调（默认 None），供主线程把朝向
   推给 3D 场景时**绕开主循环帧率钳制**（主循环只有 ~20FPS，串行推会卡顿）。
 
-- BLE 单包最多 20 字节，21 字节的 0x61 组合包会跨 notify 拆分，靠解析器的增量缓冲
-  + 校验和重组（与串口同一套帧格式，解析器复用）。
+- **BLE 流不带校验和（实测坑）**：UART 帧是 ``0x55 | Flag | 18B | 校验`` 共 21B，
+  但 WT901BLE5.0 的 BLE 流里 0x61 组合包只有 ``0x55 | 0x61 | 18B`` 共 **20B，没有校验
+  字节**，模块还把连续多个包塞进同一条 notify（80B=4 包、40B=2 包）。解析器必须以
+  ``checksum=False`` 建（按 20B 解析），否则每个包校验都失败、有效包只剩 1/256 的运气值
+  → 实测就是「能连上但姿态几乎不动 / 偶发跳一下」。
 - 连不上 / 扫描不到不抛异常，只在日志提示，方便按 i 重试。
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from typing import Callable, Optional, Tuple
@@ -86,11 +90,17 @@ class ImuReader:
         self.scan_timeout = scan_timeout
         self.output_rate_hz = _snap_rate(float(output_rate_hz))
         self.retry_delay = retry_delay
-        self.parser = WitMotionParser()
+        self.parser = WitMotionParser(checksum=False)   # BLE 流无校验字节，见模块 docstring
 
         # 每个有效姿态包回调 ``on_orientation(R)``（R 为 3x3，body->world）。
         # 在 notify 线程调用，须尽快返回（只做跨线程写，别做重活）。
         self.on_orientation: Optional[Callable[[np.ndarray], None]] = None
+
+        # 调试模式（TT_IMU_DEBUG=1）：打印原始 notify（长度 + 十六进制）与解析统计，
+        # 用于定位「模块没发够快」还是「模块在发但解析拒了大部分」。
+        self.debug = bool(int(os.environ.get("TT_IMU_DEBUG", "0")))
+        self._dbg_notifies = 0
+        self._dbg_len_counter: dict = {}
 
         self._lock = threading.Lock()
         self._running = False
@@ -158,6 +168,11 @@ class ImuReader:
                     self._connect_t = time.time()
                     self._set_connected(True)
                     await client.start_notify(_READ_UUID, self._on_notify)
+                    if self.debug:
+                        try:
+                            print(f"[IMU DBG] MTU={client.mtu_size}（>20 则 0x61 包单条送达）")
+                        except Exception:  # noqa: BLE001
+                            pass
                     await self._configure_output_rate(client)
                     print(f"[IMU] 已连接 {name or addr}，等待姿态数据…")
                     while self._running:
@@ -245,7 +260,14 @@ class ImuReader:
     # ------------------------------------------------------------------
     def _on_notify(self, _sender, data) -> None:
         try:
-            for pkt in self.parser.feed(bytes(data)):
+            raw = bytes(data)
+            if self.debug:
+                self._dbg_notifies += 1
+                n = len(raw)
+                self._dbg_len_counter[n] = self._dbg_len_counter.get(n, 0) + 1
+                if self._dbg_notifies <= 30 or self._dbg_notifies % 200 == 0:
+                    print(f"[IMU DBG] notify#{self._dbg_notifies} len={n} {raw[:24].hex()}")
+            for pkt in self.parser.feed(raw):
                 self._handle(pkt)
             self._maybe_report_rate()
         except Exception as exc:  # noqa: BLE001 —— 单包异常不打断订阅
@@ -290,6 +312,11 @@ class ImuReader:
             self._rate_hz = rate
         low = " —— 偏低，链路/距离/连接质量问题？" if rate < self.output_rate_hz * 0.6 else ""
         print(f"[IMU] 数据 {rate:.1f} 包/秒（期望 {self.output_rate_hz:g}Hz）{low}")
+        if self.debug:
+            print(f"[IMU DBG] notify总数={self._dbg_notifies} "
+                  f"长度分布={dict(self._dbg_len_counter)} "
+                  f"解析统计={dict(self.parser.stats)}")
+            self._dbg_len_counter = {}
         self._diag_t0 = now
         self._diag_n0 = self._diag_n
 
