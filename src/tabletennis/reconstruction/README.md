@@ -10,6 +10,10 @@
   从 `data/calibration/cam_N.yaml` 与 `data/extrinsics/table_extrinsics.yaml` 读标定。
 - `associate.py` —— 跨视角**实例级**球员匹配（`match_people`）：几何锚点 +
   两两三角化重投影门限 + 并查集合并 + 一致性精化。运动场景队服相同，不用外观。
+- `easymocap.py` —— **EasyMocap SMPL 多视角重建（不依赖三角测量）**：把 SMPL
+  参数化人体模型直接拟合到多视角 2D 关键点的重投影误差上，模型先验补全「只有
+  单视角可见」的部位。基础版单人 / SMPL-24 关节（无手脸细节），依赖 EasyMocap
+  的 `easymocap.bodymodel.smpl.SMPLModel` + SMPL 身体模型文件（见下）。
 
 ## 数据流
 
@@ -47,3 +51,22 @@ for obs in people:
 ```
 
 完整实时入口见 `scripts/reconstruct_pose.py`（`--synthetic` 可无硬件自检）。
+
+## EasyMocap（按 S）
+
+```python
+from tabletennis.reconstruction import EasymocapReconstructor, load_camera_rig
+
+intrinsics, extrinsics = load_camera_rig()
+rec = EasymocapReconstructor()          # 模型路径优先级：SMPL_MODEL_PATH env > 参数 > data/bodymodels/
+result = rec.reconstruct(poses_per_cam, intrinsics, extrinsics)
+# result = {vertices (6890,3), joints (24,3), faces (13776,3)}（桌面系，米）
+```
+
+- **前提**：需 SMPL 身体模型文件（`SMPL_NEUTRAL.npz` 或 `basicmodel_neutral_*.pkl`）。
+  到 smpl.is.tue.mpg.de 注册下载，放进项目 `data/bodymodels/`（推荐 `.npz`，免 chumpy）。
+- **无三角测量**：拟合只重投影 SMPL 关节到各相机 2D 关键点；单视角可见的部位由
+  SMPL 姿态/形状先验 + 骨长结构补全。三角化仅用于给根部平移一个粗略初值。
+- **依赖**：EasyMocap 代码（`easymocap.bodymodel.smpl`，路径 `EASYMOCAP_ROOT` 或默认
+  `/home/yby/projects/EasyMocap`），纯 torch+numpy，无需 smplx/chumpy。
+- 实时入口在 `scripts/live_control.py` 按 S。

@@ -48,6 +48,7 @@ DETECTION_TOGGLES = {
     "pose": ("人体姿态", "p"),
     "ball": ("球", "b"),
     "table": ("球桌", "t"),
+    "easymocap": ("EasyMocap 重建", "s"),
 }
 
 # 三个可调参数：名称 / 范围 / 单位 / 显示格式
@@ -138,6 +139,18 @@ class LiveControl:
         # 球重建独立线程（跑满检测速率，不随 2D 显示降速）
         self._ball_recon_running = False
         self._ball_recon_thread: Optional[threading.Thread] = None
+
+        # EasyMocap SMPL 重建（按 S）：独立姿态检测器 + EasyMocap 拟合器 + 后台线程
+        self._em_pose_detector = None        # 专用 RTMPose 检测器（与 pose 路径隔离）
+        self._em_recon = None                # EasymocapReconstructor（模型加载完成后置位）
+        self._em_ready = False               # 模型+标定已就绪（后台线程置位）
+        self._em_pending_viewer = False      # 就绪但 3D 窗口待主线程开（含 SMPL 层）
+        self._em_load_thread: Optional[threading.Thread] = None
+        self._em_intrinsics: Dict[int, object] = {}
+        self._em_extrinsics: Dict[int, object] = {}
+        self._latest_smpl = None             # 最近一帧 SMPL 拟合结果（含 vertices/faces/joints）
+        self._em_recon_running = False
+        self._em_recon_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -303,6 +316,14 @@ class LiveControl:
                 self._disable_ball_recon()
             return
 
+        # EasyMocap：SMPL 多视角重建（按 S，不依赖三角测量）
+        if kind == "easymocap":
+            if self.enable[kind]:
+                self._enable_easymocap()
+            else:
+                self._disable_easymocap()
+            return
+
         if self.enable[kind] and self.detectors[kind] is None:
             self.detectors[kind] = create_detector(kind)   # 首次开启才加载模型
             if self.detectors[kind] is None:
@@ -311,9 +332,6 @@ class LiveControl:
         print(f"[检测] {label}: {state}")
 
     def handle_key(self, key: int) -> None:
-        if key == ord("s"):
-            self.save_settings()
-            return
         if key == ord("r"):
             self.toggle_record()
             return
@@ -416,6 +434,7 @@ class LiveControl:
         self.viewer3d.build_scene(self._table_detector.table, camera_poses, intrinsics)
         self.viewer3d.add_skeleton_layer(skeleton="halpe26", max_people=8)
         self.viewer3d.add_ball_layer()
+        self.viewer3d.add_smpl_layer()
         self.viewer3d.start()
         print("✓ 已生成 3D 场景窗口（Open3D，可鼠标旋转 / 缩放）。")
 
@@ -705,6 +724,152 @@ class LiveControl:
                 print(f"[球诊断] {len(single)} 视角检出 conf={confs}，三角化失败（视角不足/交会角过小）")
 
     # ------------------------------------------------------------------
+    # EasyMocap SMPL 重建（按 S，不依赖三角测量）
+    # ------------------------------------------------------------------
+    def _enable_easymocap(self) -> None:
+        """按 S 开启 EasyMocap：后台加载专用姿态检测器 + SMPL 模型 + 标定外参。"""
+        if self._em_recon is not None and self._em_ready:
+            self._start_viewer()
+            print("[EasyMocap] ON（SMPL 多视角重建 + Open3D）")
+            return
+        if self._em_load_thread is not None and self._em_load_thread.is_alive():
+            return  # 正在后台加载中
+        self._em_ready = False
+        self._em_load_thread = threading.Thread(
+            target=self._em_load_worker, name="em-loader", daemon=True)
+        self._em_load_thread.start()
+        print("[EasyMocap] 模型后台加载中（首次几秒，窗口不卡）…")
+
+    def _em_load_worker(self) -> None:
+        """后台线程：加载 RTMPose 检测器 + EasyMocap SMPL 模型 + 标定外参。"""
+        try:
+            from tabletennis.reconstruction import load_camera_rig
+            from tabletennis.reconstruction.easymocap import EasymocapReconstructor
+
+            if self._em_pose_detector is None:
+                det = create_detector("pose")
+                if det is None:
+                    print("[EasyMocap] 姿态检测器未就绪（RTMPose halpe26 不可用）")
+                    return
+                self._em_pose_detector = det
+                probe = next((f for f in self._latest.values() if f is not None), None)
+                if probe is not None:
+                    det.detect(probe)
+
+            intrinsics, extrinsics = load_camera_rig()
+            if not extrinsics:
+                print("[EasyMocap] 未找到标定外参（table_extrinsics.yaml）")
+                return
+            self._em_intrinsics = intrinsics
+            self._em_extrinsics = extrinsics
+            self._table_poses = {cid: (e.R, e.t) for cid, e in extrinsics.items()}
+            if self._table_detector is None:
+                self._table_detector = create_detector("table")
+
+            self._em_recon = EasymocapReconstructor()
+            if not self._em_recon.ready:
+                print(f"[EasyMocap] {self._em_recon.error}")
+                return
+
+            self._em_ready = True
+            self._em_pending_viewer = True  # 主循环检测到后从主线程开 3D 窗口
+            print(f"[EasyMocap] ON（{type(self._em_pose_detector).__name__} + SMPL 拟合 + Open3D）")
+        except Exception as exc:  # noqa: BLE001
+            self._em_ready = False
+            print(f"[EasyMocap] 加载失败（{exc}）——按 S 关闭后再按 S 重试")
+
+    def _disable_easymocap(self) -> None:
+        self._stop_em_recon_thread()
+        self._latest_smpl = None
+        if self.viewer3d is not None:
+            self.viewer3d.set_smpl(None)
+        print("[EasyMocap] OFF")
+
+    # ------------------------------------------------------------------
+    # EasyMocap 重建独立线程（读取最新帧，跑姿态检测 + SMPL 拟合）
+    # ------------------------------------------------------------------
+    def _start_em_recon_thread(self) -> None:
+        """启动（幂等）后台 EasyMocap 重建线程。"""
+        if self._em_recon_thread is not None and self._em_recon_thread.is_alive():
+            return
+        self._em_recon_running = True
+        self._em_recon_thread = threading.Thread(
+            target=self._em_recon_loop, name="em-recon", daemon=True)
+        self._em_recon_thread.start()
+
+    def _stop_em_recon_thread(self) -> None:
+        """停止后台 EasyMocap 重建线程（幂等）。"""
+        self._em_recon_running = False
+        if self._em_recon_thread is not None:
+            self._em_recon_thread.join(timeout=1.0)
+            self._em_recon_thread = None
+
+    def _em_recon_loop(self) -> None:
+        """后台 EasyMocap 重建循环：只读 ``self._latest``（主循环/球线程持续刷新），
+        跑检测 + SMPL 拟合并更新 3D 窗口。基础版未做加速，拟合一帧约 1~2s。
+        """
+        n = 0
+        t0 = time.time()
+        fit_ms = 0.0
+        while self._em_recon_running:
+            if not self._latest:
+                time.sleep(0.005)
+                continue
+            t = time.perf_counter()
+            try:
+                self._reconstruct_easymocap()
+            except Exception:  # noqa: BLE001 —— 单帧异常不影响下一帧
+                pass
+            fit_ms += (time.perf_counter() - t) * 1000
+            n += 1
+            if time.time() - t0 >= 5.0:
+                rate = n / (time.time() - t0)
+                avg = fit_ms / max(n, 1)
+                print(f"[EasyMocap] 拟合 {rate:.2f} Hz | 单次检测+SMPL 拟合 {avg:.0f} ms")
+                n = 0
+                t0 = time.time()
+                fit_ms = 0.0
+
+    def _reconstruct_easymocap(self) -> None:
+        """各相机 halpe26 检测 -> SMPL 拟合 -> Open3D 网格/骨架（无三角测量）。"""
+        if self._em_recon is None or self._em_pose_detector is None:
+            return
+        frames_items = [
+            (cid, f) for cid, f in sorted(self._latest.items()) if f is not None
+        ]
+        if not frames_items:
+            return
+        cids = [c for c, _ in frames_items]
+        frames = [f for _, f in frames_items]
+        det = self._em_pose_detector
+        try:
+            poses_list = det.detect_batch(frames)
+        except AttributeError:
+            poses_list = [det.detect(f) for f in frames]
+        poses_per_cam = dict(zip(cids, poses_list))
+        self._last_poses = poses_per_cam  # 供 2D 叠加显示
+
+        # 基础版：每相机取置信度最高的人（单人场景）
+        best = {cid: max(pl, key=lambda p: p.score) for cid, pl in poses_per_cam.items() if pl}
+        if not best:
+            self._latest_smpl = None
+            if self.viewer3d is not None:
+                self.viewer3d.set_smpl(None)
+            return
+
+        result = self._em_recon.reconstruct(
+            best, self._em_intrinsics, self._em_extrinsics
+        )
+        if result is not None:
+            self._latest_smpl = result
+            if self.viewer3d is not None:
+                self.viewer3d.set_smpl(result)
+        else:
+            self._latest_smpl = None
+            if self.viewer3d is not None:
+                self.viewer3d.set_smpl(None)
+
+    # ------------------------------------------------------------------
     # 鼠标：拖拽滑块
     # ------------------------------------------------------------------
     def on_mouse(self, event, x, y, flags, param) -> None:
@@ -735,8 +900,8 @@ class LiveControl:
         bgr = gray_to_bgr(gray)
 
         if frame is not None:
-            if self.enable["pose"]:
-                # 姿态由 _reconstruct_frame 批处理检测，这里只画缓存结果
+            if self.enable["pose"] or self.enable["easymocap"]:
+                # 姿态由 _reconstruct_frame / _reconstruct_easymocap 批处理检测，这里只画缓存结果
                 for i, pose in enumerate(self._last_poses.get(cid, [])):
                     draw_pose(bgr, pose, scale=scale, draw_bbox=True, index=i)
             if self.enable["ball"]:
@@ -875,7 +1040,7 @@ class LiveControl:
         elif time.time() < self._save_flash_until:
             cv2.putText(hint, "已保存 ✓", (w - 110, 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [r]录制 [s]保存  退出:[q]/ESC/X",
+        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [s]EasyMocap [r]录制 保存=按钮  退出:[q]/ESC/X",
                     (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
         return hint
 
@@ -932,6 +1097,12 @@ class LiveControl:
                 if self.enable["pose"] and self.detectors["pose"] is not None:
                     self._reconstruct_frame()
 
+                # EasyMocap 重建（按 S）：后台线程跑检测 + SMPL 拟合，主循环只负责开关线程
+                if self.enable["easymocap"] and self._em_ready:
+                    self._start_em_recon_thread()
+                else:
+                    self._stop_em_recon_thread()
+
                 # 球模型后台加载完成：主线程开 3D 窗口（Open3D 需保持主线程创建/轮询）
                 if self._ball_pending_viewer:
                     if (self.viewer3d is not None and self.viewer3d.is_running()
@@ -939,6 +1110,14 @@ class LiveControl:
                         self._close_viewer()   # 先按 T/P 开的窗口没球层，重建带上
                     self._start_viewer()
                     self._ball_pending_viewer = False
+
+                # EasyMocap 模型后台加载完成：主线程开 3D 窗口（含 SMPL 层）
+                if self._em_pending_viewer:
+                    if (self.viewer3d is not None and self.viewer3d.is_running()
+                            and not self.viewer3d.has_smpl_layer()):
+                        self._close_viewer()   # 先按 T/P/B 开的窗口没 SMPL 层，重建带上
+                    self._start_viewer()
+                    self._em_pending_viewer = False
 
                 # （3D 球重建已由后台线程 _ball_recon_loop 负责，这里不再调用）
 
@@ -951,6 +1130,7 @@ class LiveControl:
                 self.handle_key(key)
         finally:
             self._stop_ball_recon_thread()
+            self._stop_em_recon_thread()
             self._close_viewer()
             cv2.destroyAllWindows()
 

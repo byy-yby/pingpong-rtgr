@@ -44,6 +44,19 @@ _SKELETON_COLORS = [
     [1.00, 0.80, 0.30],  # 金
 ]
 
+# SMPL 24 关节（LSP 顺序）的骨骼连线（由 kinematic tree 推导）。
+# 顺序与 easymocap.py 的 SMPL24 一致：0 pelvis, 1/2 hip, 3/4 knee, 5/6 ankle,
+# 7/8 foot, 9/10/11 spine, 12 neck, 13 head, 14/15 collar, 16/17 shoulder,
+# 18/19 elbow, 20/21 wrist, 22/23 hand。
+_SMPL_EDGES = [
+    (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6), (5, 7), (6, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12), (12, 13),
+    (9, 14), (9, 15), (14, 16), (15, 17),
+    (16, 18), (17, 19), (18, 20), (19, 21), (20, 22), (21, 23),
+]
+_SMPL_MESH_COLOR = [0.82, 0.71, 0.60]   # 肤色
+_SMPL_BONE_COLOR = [0.95, 0.60, 0.25]   # 橙
+
 # 默认视角与键盘控制步长
 _DEFAULT_ZOOM = 0.65   # 初始缩放（配合 reset_view_point 的包围盒，给出舒服的取景）
 _PAN_STEP = 60.0       # W/A/S/D 平移步长（像素）
@@ -149,6 +162,14 @@ class SceneViewer3D:
         self._ball_sphere = None
         self._latest_ball = None
         self._ball_dirty = False
+
+        # EasyMocap SMPL 层：人体网格 + 关节骨架，跨线程传递最新拟合结果
+        self._smpl_lock = threading.Lock()
+        self._smpl_mesh = None
+        self._smpl_bones = None
+        self._smpl_joints = None
+        self._latest_smpl = None   # dict{vertices, faces, joints} 或 None
+        self._smpl_dirty = False
 
     # ------------------------------------------------------------------
     # 场景构建（主线程，start 前调用一次）
@@ -381,6 +402,80 @@ class SceneViewer3D:
         vis.update_geometry(self._ball_sphere)
 
     # ------------------------------------------------------------------
+    # 实时 SMPL 层（EasyMocap 重建结果）
+    # ------------------------------------------------------------------
+    def has_smpl_layer(self) -> bool:
+        """SMPL 层是否已加入场景（上层据此判断已运行的 3D 窗口是否需重建）。"""
+        return self._smpl_mesh is not None
+
+    def add_smpl_layer(self) -> None:
+        """预分配 SMPL 网格 + 关节骨架几何，须在 ``start()`` 前调用。
+
+        网格用空 TriangleMesh（逐帧更新顶点/面），关节骨架用 LineSet（点按
+        ``_SMPL_EDGES`` 连线）+ PointCloud（关节点）。渲染线程内更新。
+        """
+        o3d = _o3d()
+        self._smpl_mesh = o3d.geometry.TriangleMesh()
+        self._smpl_mesh.paint_uniform_color(_SMPL_MESH_COLOR)
+        self._smpl_mesh.compute_vertex_normals()
+        self._geometries.append(self._smpl_mesh)
+
+        self._smpl_bones = o3d.geometry.LineSet()
+        self._smpl_bones.lines = o3d.utility.Vector2iVector(
+            np.asarray(_SMPL_EDGES, dtype=np.int32)
+        )
+        self._smpl_bones.colors = o3d.utility.Vector3dVector(
+            np.tile(np.asarray(_SMPL_BONE_COLOR, dtype=np.float64), (len(_SMPL_EDGES), 1))
+        )
+        self._geometries.append(self._smpl_bones)
+
+        self._smpl_joints = o3d.geometry.PointCloud()
+        self._smpl_joints.paint_uniform_color(_SMPL_BONE_COLOR)
+        self._geometries.append(self._smpl_joints)
+
+    def set_smpl(self, result) -> None:
+        """线程安全写入最新一帧 SMPL 拟合结果；None 表示本帧无结果。
+
+        Args:
+            result: ``{vertices (N,3), faces (M,3), joints (24,3)}``（桌面系，米）。
+        """
+        with self._smpl_lock:
+            self._latest_smpl = None if result is None else result
+            self._smpl_dirty = True
+
+    def _update_smpl_geometry(self, vis) -> None:
+        """渲染线程内调用：把最新 SMPL 网格/关节写进几何并 ``update_geometry``。"""
+        with self._smpl_lock:
+            if not self._smpl_dirty:
+                return
+            result = self._latest_smpl
+            self._smpl_dirty = False
+
+        if self._smpl_mesh is None or self._smpl_bones is None:
+            return
+
+        o3d = _o3d()
+        if result is not None:
+            verts = np.asarray(result["vertices"], dtype=np.float64).reshape(-1, 3)
+            faces = np.asarray(result["faces"], dtype=np.int64).reshape(-1, 3)
+            joints = np.asarray(result["joints"], dtype=np.float64).reshape(-1, 3)
+            self._smpl_mesh.vertices = o3d.utility.Vector3dVector(verts)
+            self._smpl_mesh.triangles = o3d.utility.Vector3iVector(faces)
+            if self._smpl_mesh.has_vertex_normals():
+                self._smpl_mesh.compute_vertex_normals()
+            self._smpl_bones.points = o3d.utility.Vector3dVector(joints[:24])
+            self._smpl_joints.points = o3d.utility.Vector3dVector(joints[:24])
+        else:
+            self._smpl_mesh.vertices = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+            self._smpl_mesh.triangles = o3d.utility.Vector3iVector(np.zeros((0, 3), dtype=np.int32))
+            self._smpl_bones.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+            self._smpl_joints.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+
+        vis.update_geometry(self._smpl_mesh)
+        vis.update_geometry(self._smpl_bones)
+        vis.update_geometry(self._smpl_joints)
+
+    # ------------------------------------------------------------------
     # 渲染线程
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -430,6 +525,7 @@ class SceneViewer3D:
                     break
                 self._update_skeleton_geometry(vis)
                 self._update_ball_geometry(vis)
+                self._update_smpl_geometry(vis)
                 vis.update_renderer()
                 time.sleep(0.01)
         except Exception as exc:  # noqa: BLE001 —— 3D 窗口失败不影响 2D 主流程
