@@ -93,20 +93,14 @@ def camera_kwargs_from_config(config: dict) -> dict:
 class LiveControl:
     """交互式控制：单窗口，视频在上、自绘滑块在中、提示在下。"""
 
-<<<<<<< HEAD
     # 固定相机分组（姿态重建）：cam0/cam2 看球桌一边的人、cam1/cam3 看另一边的人。
     # 组顺序即身份 ID（0/1）；换机位/换边时改这里。
     PERSON_GROUPS = [[0, 2], [1, 3]]
-
-    def __init__(self, mgr: CameraManager, *, exposure_us, gain_db, gamma, trigger_mode, max_width):
-=======
     def __init__(self, mgr: CameraManager, *, exposure_us, gain_db, gamma, trigger_mode,
                  max_width, imu_name=None, imu_mac=None):
->>>>>>> worktree-imu-3d-pose
         self.mgr = mgr
         self.trigger_mode = trigger_mode
         self.max_width = max_width
-
         self.values = {"exposure": float(exposure_us), "gain": float(gain_db), "gamma": float(gamma)}
         self.enable: Dict[str, bool] = {k: False for k in DETECTION_TOGGLES}
         # 惰性创建：首次开启某项检测时才实例化（避免启动时下载/加载模型）
@@ -155,7 +149,6 @@ class LiveControl:
         self._ball_recon_running = False
         self._ball_recon_thread: Optional[threading.Thread] = None
 
-<<<<<<< HEAD
         # EasyMocap SMPL 重建（按 S）：独立姿态检测器 + EasyMocap 拟合器 + 后台线程
         self._em_pose_detector = None        # 专用 RTMPose 检测器（与 pose 路径隔离）
         self._em_recon = None                # EasymocapReconstructor（模型加载完成后置位）
@@ -168,9 +161,7 @@ class LiveControl:
         self._em_recon_running = False
         self._em_recon_thread: Optional[threading.Thread] = None
         # IMU 朝向显示（按 i）：维特智能 WT9011DCL 串口读取 + 3D 球拍朝向
-=======
         # IMU 朝向显示（按 i）：维特智能 WT9011DCL 蓝牙(BLE)读取 + 3D 球拍朝向
->>>>>>> worktree-imu-3d-pose
         self._imu_reader = None
         self._imu_enabled = False
         self.imu_name = imu_name
