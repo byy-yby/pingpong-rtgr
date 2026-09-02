@@ -40,6 +40,8 @@ from tabletennis.visualization.overlay2d import (
 )
 from tabletennis.vision.ball import ClassicalBallDetector
 from tabletennis.vision.detector import create_detector
+from tabletennis.imu.witmotion import so3_project
+from tabletennis.visualization.viewer3d import right_wrist_anchor
 
 MAIN_WIN = "Cameras"
 
@@ -57,6 +59,13 @@ PARAM_SPECS = [
     {"key": "gamma", "label": "伽马", "min": 0.0, "max": 4.0, "unit": "", "fmt": "{:>5.2f}"},
 ]
 PARAM_BY_KEY = {s["key"]: s for s in PARAM_SPECS}
+
+# IMU 参考姿态初始化：用户初次连接时把球拍平放于桌面原点（拍面朝上），采集一小段
+# 静止样本锁成 R_home，之后所有朝向都相对它输出（消除 IMU 安装角 + 放置姿态的固定偏差）。
+_IMU_INIT_N = 20              # 参考姿态采样数（@100Hz 约 0.2s）
+_IMU_INIT_MAX_DEG = 5.0       # 窗内最大角偏差（度），超过则视为用户还在动，滚动窗继续采
+_IMU_INIT_HINT_S = 2.0        # 等待参考姿态期间的限频提示间隔（秒）
+_WRIST_MIN_CONF = 0.3         # 右手腕锚点的最低三角化置信度（低于视为无效）
 
 GRID_COLS = 2
 DEFAULT_MAX_WIDTH = 1920          # 视频网格目标宽度（越大窗口越大）
@@ -142,6 +151,11 @@ class LiveControl:
         self.imu_name = imu_name
         self.imu_mac = imu_mac
         self.imu_rate = imu_rate     # 期望上报率（Hz，连接后自动下发命令提上去）
+        # IMU 参考姿态（初次连接锁定的 R_home）与初始化状态
+        self._imu_R_home = None      # 参考姿态（3x3，body->world）；None = 未锁定
+        self._imu_init_samples = []  # 参考姿态采样缓冲（锁定前暂存）
+        self._imu_init_t0 = None     # 开始采样时刻
+        self._last_init_hint = 0.0   # 等待参考姿态的提示限频时间戳
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -443,6 +457,12 @@ class LiveControl:
         else:
             self._disable_imu()
 
+    @staticmethod
+    def _rot_angle(Ra, Rb) -> float:
+        """两旋转矩阵之间的夹角（度）：``trace(Ra^T @ Rb) = 1 + 2 cosθ``。"""
+        cos = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
+        return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
     def _imu_anchor(self) -> np.ndarray:
         """IMU 球拍朝向的锚点（世界系 = 桌面系，米）：桌面中心上方。"""
         if self._table_detector is not None:
@@ -477,17 +497,54 @@ class LiveControl:
             )
             self._imu_reader.on_orientation = self._imu_on_orientation
             self._imu_reader.start()
+        # 重新初始化参考姿态：用户把球拍平放于桌面原点做基准
+        self._imu_R_home = None
+        self._imu_init_samples = []
+        self._imu_init_t0 = None
+        self._last_init_hint = 0.0
         print("[IMU] ON——读 WT9011DCL 蓝牙姿态，3D 窗口显示球拍朝向"
               f"（上报率 {self.imu_rate:g}Hz）")
+        print("[IMU] 请把球拍平放在桌面原点（拍面朝上、手柄朝+X），保持静止以锁定参考姿态…")
 
     def _imu_on_orientation(self, R) -> None:
-        """notify 线程回调：直接把最新朝向推给 3D 场景。
+        """notify 线程回调：锁定参考姿态，再把相对朝向推给 3D 场景。
 
-        走这条路径而非主循环逐帧轮询，是为了**绕开主循环帧率钳制**（主循环约
-        20FPS，而 IMU 上报率可到 100Hz——串行推会在 60fps 窗口里仍然顿挫）。
+        首次连接时用户把球拍平放在桌面原点（拍面朝上），这里采集一小段静止样本锁成
+        ``R_home``，之后所有朝向都输出「相对参考姿态」的旋转 ``R_rel = R_home^T @ R``
+        ——既消除了 IMU 安装角与放置姿态的固定偏差，也让初始化那一刻球拍正好「平放朝上」。
+
+        走回调路径而非主循环逐帧轮询，是为了**绕开主循环帧率钳制**（主循环约 20FPS，
+        而 IMU 上报率可到 100Hz——串行推会在 60fps 窗口里仍然顿挫）。
         """
+        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        if self._imu_R_home is None:
+            self._imu_init_samples.append(R)
+            if self._imu_init_t0 is None:
+                self._imu_init_t0 = time.time()
+            if len(self._imu_init_samples) < _IMU_INIT_N:
+                return  # 样本没凑齐，继续采（初始化完成前不推）
+            R_home = so3_project(np.mean(self._imu_init_samples, axis=0))
+            stable = all(
+                self._rot_angle(R_home, R) <= _IMU_INIT_MAX_DEG
+                for R in self._imu_init_samples
+            )
+            if not stable:
+                # 用户还在动：丢掉最早的样本继续采（滚动窗），保持静止约 0.2s 即锁定；
+                # 不设硬超时——动个不停就永远不锁，避免锁到运动中的模糊均值。
+                self._imu_init_samples = self._imu_init_samples[-_IMU_INIT_N // 2:]
+                self._imu_init_t0 = time.time()
+                now = time.time()
+                if now - self._last_init_hint >= _IMU_INIT_HINT_S:
+                    self._last_init_hint = now
+                    print("[IMU] 还在等参考姿态…请把球拍平放静止（拍面朝上）")
+                return
+            self._imu_R_home = R_home
+            self._imu_init_samples = []
+            print("[IMU] 参考姿态已锁定（球拍平放于桌面原点）。"
+                  "按 P 开启姿态重建后，球拍将绑定到右手腕位置。")
+        R_rel = self._imu_R_home.T @ R
         if self.viewer3d is not None:
-            self.viewer3d.set_imu_orientation(R)
+            self.viewer3d.set_imu_orientation(R_rel)
 
     def _disable_imu(self) -> None:
         if self._imu_reader is not None:
@@ -570,6 +627,11 @@ class LiveControl:
             skeletons = self._pose_tracker.update(skeletons)
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)
+                # IMU 球拍绑到右手腕（=IMU 位置）：选离桌面原点最近的右手腕，逐帧跟手
+                if self._imu_enabled:
+                    anchor = right_wrist_anchor(skeletons, min_conf=_WRIST_MIN_CONF)
+                    if anchor is not None:
+                        self.viewer3d.set_imu_anchor(anchor)
             t_recon = time.perf_counter() - t_r0
             # 诊断日志：前 5 帧 + 每 60 帧打印一次，定位骨架不出现的环节
             self._frame_idx += 1
