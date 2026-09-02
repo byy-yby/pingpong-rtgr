@@ -80,12 +80,14 @@
 
 ### IMU 姿态（维特智能 WT9011DCL-BT5.0，按 i）
 
-`scripts/live_control.py` 按 **i** 读插在拍柄里的 IMU，在 3D 窗口显示球拍朝向（**纯朝向，无绝对位置**，锚在桌面中心上方 0.35m；`viewer3d.add_imu_layer`/`set_imu_orientation`）。代码在 `src/tabletennis/imu/`：
+`scripts/live_control.py` 按 **i** 读插在拍柄末端的 IMU：3D 窗口里球拍**朝向来自 IMU**（notify 线程 100Hz 直接推 `viewer3d.set_imu_orientation`，绕开主循环 ~20FPS），**位置绑到检测到的右手腕**（主循环每帧 `right_wrist_anchor` 选「离桌面原点最近的有效右手腕」→ `set_imu_anchor`，两人时即按 i 放拍在原点那一侧）。代码在 `src/tabletennis/imu/`：
 - `witmotion.py`：0x55 协议解析 + 角度/四元数 -> 旋转矩阵（纯 numpy，无 I/O）。WT9011DCL 走**蓝牙 5.0 (BLE)**，默认 **0x61 组合包**（加速度6B+角速度6B+角度6B）@10Hz（可 0.2~200Hz），角度 int16/32768×180°、欧拉 Z-Y-X；兼容经典 0x53 角度 / 0x59 四元数。
 - **帧格式 UART≠BLE（本模块最大坑，已实测）**：UART 是 `0x55|Flag|Data|Checksum` 共 21B 带校验（校验和 = 0x55 起到数据末之和低 8 位）；**BLE 流（WT901BLE5.0, MTU 23）0x61 包只有 `0x55|0x61|18B` 共 20B 无校验**，且多包塞进一条 notify（80B=4 包、40B=2 包）。解析器必须 `WitMotionParser(checksum=False)`；按 21B 解析每个包都失败 → 有效包只剩 1/256 运气值 → **实测表现 = 能连上但姿态几乎不动/偶发跳一下**。
 - `reader.py`：`ImuReader` 后台 BLE 线程（`bleak`，已装进 `tt`）。GATT 服务 `0000ffe5` / notify 收数据 `0000ffe4` / 写命令 `0000ffe9`（UUID 来自官方 SDK `WitBluetooth_BWT901BLE5_0` 的 `BleUUID.java`）；扫描广播名含 "WT" 的模块。
 - **坑**：BLE 流**无校验字节**（20B 包，见上）；上报率默认 10Hz 已由 reader 连上后自动提 100Hz（官方 5 字节写命令 `FF AA 69 88 B5` 解锁 → `FF AA 03 <val> 00` RATE → `FF AA 00 00 00` 保存）；模块上电可能被手机/上位机占用（BLE 一般单连接），用 `--imu-mac` 直接指定 MAC 更稳。
-- **未完成**：IMU 安装角（IMU 轴 vs 拍面朝向的固定偏移）默认按「拍面法线=+Z、手柄=+X」假设，实物需校准补固定旋转；四元数默认不上报（0x59 需 `FF AA 27 51 00` 寄存器读，当前用角度即可）。
+- **参考姿态初始化（已解决安装角问题）**：按 i 后把球拍平放于桌面原点（拍面朝上），live_control 采集 `_IMU_INIT_N=20` 个静止样本（窗内角偏差 ≤5°）锁成 `R_home`，之后输出相对旋转 `R_rel=R_home^T@R_imu`——固定安装角/放置姿态偏差被自动吸收，无需再补硬编码旋转。运动时不锁（滚动窗+限频提示），重按 i 重锁。
+- `right_wrist_anchor` / `so3_project` 逻辑可测（`viewer3d.right_wrist_anchor` 按骨架名找 `right_wrist`，halpe26=idx10）。
+- 四元数默认不上报（0x59 需 `FF AA 27 51 00` 寄存器读，当前用角度即可）。
 
 ## 标定工具的归属（易混）
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -94,6 +94,51 @@ def _segments_line_set(segs, color):
     pts = segs.reshape(-1, 3)
     lines = [[2 * i, 2 * i + 1] for i in range(len(segs))]
     return _line_set(pts, lines, color)
+
+
+# 右手腕关键点名称（halpe26 / coco17 都有；索引由骨架定义动态查，不写死）
+_WRIST_NAME = "right_wrist"
+
+
+def right_wrist_anchor(
+    skeletons: List[Skeleton3D],
+    min_conf: float = 0.3,
+    origin: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    """在多人骨架里选「最靠近桌面原点的右手腕」作为 IMU 球拍锚点。
+
+    IMU 装在球拍拍柄末端，球拍要绑到握着它的右手腕上；但场景里可能有多个球员，
+    得确定哪个是「拿拍的人」。用户按 i 初次连接时把球拍平放在桌面原点做参考姿态，
+    所以拿拍的人就站在原点那一侧——选右手腕 3D 位置离桌面原点最近的那个人。
+
+    Args:
+        skeletons: 本帧 3D 骨架（已按 ID 排序，见 :class:`PoseTracker`）。
+        min_conf: 右手腕三角化置信度下限，低于视为无效（防虚假点）。
+        origin: 参照原点（世界系=桌面系，米），默认桌面原点 ``(0,0,0)``。
+
+    Returns:
+        右手腕世界坐标 ``(3,)``（米）；没有任何有效右手腕时返回 None。
+    """
+    o = np.zeros(3) if origin is None else np.asarray(origin, dtype=np.float64).reshape(3)
+    best: Optional[Tuple[float, np.ndarray]] = None
+    for skel in skeletons:
+        kp = np.asarray(skel.keypoints, dtype=np.float64)
+        names = get_skeleton(skel.skeleton)["names"]
+        if _WRIST_NAME not in names:
+            continue
+        idx = names.index(_WRIST_NAME)
+        if idx >= len(kp):
+            continue
+        w = kp[idx]
+        if not np.isfinite(w).all():
+            continue
+        if skel.confidence is not None and idx < len(skel.confidence):
+            if float(skel.confidence[idx]) < min_conf:
+                continue
+        d = float(np.linalg.norm(w - o))
+        if best is None or d < best[0]:
+            best = (d, np.asarray(w, dtype=np.float64).reshape(3))
+    return None if best is None else best[1]
 
 
 def _conf_color(conf: float) -> List[float]:
@@ -214,6 +259,7 @@ class SceneViewer3D:
         self._latest_ball = None
         self._ball_dirty = False
 
+<<<<<<< HEAD
         # EasyMocap SMPL 层：人体网格 + 关节骨架，跨线程传递最新拟合结果
         self._smpl_lock = threading.Lock()
         self._smpl_mesh = None
@@ -222,6 +268,10 @@ class SceneViewer3D:
         self._latest_smpl = None   # dict{vertices, faces, joints} 或 None
         self._smpl_dirty = False
         # 实时 IMU 层：球拍网格 + 坐标架，按最新旋转矩阵朝向（无绝对位置，锚点固定）
+=======
+        # 实时 IMU 层：球拍网格 + 坐标架，按最新旋转矩阵朝向；锚点 = 右手腕位置
+        # （跨线程写入：朝向来自 IMU notify 线程，位置来自主循环姿态重建）
+>>>>>>> worktree-imu-3d-pose
         self._imu_lock = threading.Lock()
         self._imu_anchor = None
         self._imu_axes = None
@@ -546,9 +596,10 @@ class SceneViewer3D:
     def add_imu_layer(self, anchor=None) -> None:
         """预分配 IMU 球拍几何（拍面 + 手柄 + 坐标架），须在 ``start()`` 前调用。
 
-        IMU 只有朝向没有绝对位置，球拍锚定在 ``anchor``（世界系=桌面系，米）处只做
-        旋转；默认锚在原点上方 0.4m。初始为空（隐藏），``set_imu_orientation`` 写入
-        朝向后才显示。
+        IMU 只有朝向没有绝对位置：朝向由 ``set_imu_orientation`` 写入，锚点位置由
+        ``set_imu_anchor`` 逐帧更新（= 姿态重建的右手腕 3D 位置）；``anchor`` 只是
+        初始锚点（世界系=桌面系，米），姿态重建还没出数时球拍停在这里。初始为空
+        （隐藏），写入朝向后才显示。
         """
         o3d = _o3d()
         self._imu_anchor = np.asarray(
@@ -580,18 +631,29 @@ class SceneViewer3D:
             )
             self._imu_dirty = True
 
+    def set_imu_anchor(self, pos) -> None:
+        """线程安全更新 IMU 球拍锚点（= 右手腕 3D 位置，世界系=桌面系，米）。
+
+        由主循环姿态重建每帧写入；None 表示无有效手腕（忽略，保持上一锚点）。
+        """
+        with self._imu_lock:
+            if pos is None:
+                return
+            self._imu_anchor = np.asarray(pos, dtype=np.float64).reshape(3)
+            self._imu_dirty = True
+
     def _update_imu_geometry(self, vis) -> None:
-        """渲染线程内调用：按最新旋转矩阵更新球拍 + 坐标架朝向。"""
+        """渲染线程内调用：按最新旋转矩阵 + 锚点更新球拍 + 坐标架朝向/位置。"""
         with self._imu_lock:
             if not self._imu_dirty:
                 return
             R = None if self._latest_imu_R is None else self._latest_imu_R.copy()
+            a = self._imu_anchor
             self._imu_dirty = False
 
         if self._imu_paddle is None or self._imu_axes is None:
             return
         o3d = _o3d()
-        a = self._imu_anchor
         if R is None:
             empty3 = np.zeros((0, 3))
             self._imu_axes.points = o3d.utility.Vector3dVector(empty3)

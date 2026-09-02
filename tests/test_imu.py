@@ -1,10 +1,12 @@
 """IMU 协议解析单元测试（合成字节流，无需硬件 / Open3D）。
 
 覆盖：0x61 组合包（角度）、经典 0x53 角度 / 0x59 四元数、校验和校验与重同步、
-跨 chunk 分帧，以及角度/四元数 -> 旋转矩阵的正确性与一致性。
+跨 chunk 分帧、旋转矩阵数学（so3_project），以及 IMU 球拍绑定到右手腕的选人逻辑
+（right_wrist_anchor——模块本身不触发 open3d 延迟 import）。
 """
 import numpy as np
 
+from tabletennis.core.types import Skeleton3D
 from tabletennis.imu.reader import (
     ImuReader,
     _SAVE_CMD,
@@ -15,6 +17,11 @@ from tabletennis.imu.witmotion import (
     WitMotionParser,
     angle_to_rotmat,
     quat_to_rotmat,
+    so3_project,
+)
+from tabletennis.visualization.viewer3d import (
+    SceneViewer3D,
+    right_wrist_anchor,
 )
 
 
@@ -213,3 +220,75 @@ def test_on_orientation_callback_not_called_on_garbage():
     r.on_orientation = got.append
     r._on_notify(None, b"\x00\x01\x02\x03")   # 纯垃圾
     assert got == []
+
+
+# ----------------------------------------------------------------------
+# 旋转矩阵数学（so3_project：多个朝向样本取均值时投影回 SO(3)）
+# ----------------------------------------------------------------------
+def test_so3_project_identity():
+    """单位矩阵投影后仍是单位阵。"""
+    assert np.allclose(so3_project(np.eye(3)), np.eye(3), atol=1e-9)
+
+
+def test_so3_project_reflection_to_rotation():
+    """反射矩阵（det=-1）投影后变成纯旋转（det=+1）。"""
+    R = so3_project(np.diag([1.0, -1.0, 1.0]))
+    assert np.allclose(R @ R.T, np.eye(3), atol=1e-9)
+    assert np.isclose(np.linalg.det(R), 1.0)
+
+
+def test_so3_project_average_two_rotations():
+    """两个相差 20° 的旋转逐元素均值投影 ≈ 中间的 10°。"""
+    R1 = angle_to_rotmat(0.0, 0.0, 0.0)
+    R2 = angle_to_rotmat(0.0, 0.0, 20.0)
+    Rm = so3_project((R1 + R2) / 2.0)
+    assert np.allclose(Rm, angle_to_rotmat(0.0, 0.0, 10.0), atol=0.05)
+
+
+# ----------------------------------------------------------------------
+# IMU 球拍绑到右手腕：right_wrist_anchor（不触发 open3d 延迟 import）
+# ----------------------------------------------------------------------
+def _skel26(wrist_pos, wrist_conf=0.9):
+    """构造一张 halpe26 骨架：只填右手腕（索引 10），其余全 NaN。"""
+    kps = np.full((26, 3), np.nan)
+    conf = np.zeros(26)
+    if wrist_pos is not None:
+        kps[10] = wrist_pos
+        conf[10] = wrist_conf
+    return Skeleton3D(keypoints=kps, confidence=conf, skeleton="halpe26")
+
+
+def test_right_wrist_anchor_picks_nearest_origin():
+    """多人里选右手腕离桌面原点最近的人（用户初次连接把拍放在原点那一侧）。"""
+    me = _skel26([0.1, 0.3, 0.8])        # 原点侧 = 拿拍的人
+    other = _skel26([1.0, 2.4, 0.8])     # 球桌远端
+    anchor = right_wrist_anchor([me, other])
+    assert anchor is not None
+    assert np.allclose(anchor, [0.1, 0.3, 0.8], atol=1e-9)
+
+
+def test_right_wrist_anchor_respects_min_conf():
+    """右手腕置信度过低视为无效：跳过近处低置信，选远处合格的人。"""
+    low = _skel26([0.1, 0.3, 0.8], wrist_conf=0.1)
+    ok = _skel26([1.0, 2.4, 0.8], wrist_conf=0.9)
+    assert right_wrist_anchor([low], min_conf=0.3) is None
+    anchor = right_wrist_anchor([low, ok], min_conf=0.3)
+    assert anchor is not None
+    assert np.allclose(anchor, [1.0, 2.4, 0.8], atol=1e-9)
+
+
+def test_right_wrist_anchor_no_valid_wrist():
+    """无骨架 / 右手腕 NaN 时返回 None（调用方保持上一锚点）。"""
+    assert right_wrist_anchor([]) is None
+    assert right_wrist_anchor([_skel26(None)]) is None
+
+
+def test_set_imu_anchor_threadsafe_state():
+    """set_imu_anchor 线程安全更新锚点；None 忽略（保持上一值）。"""
+    v = SceneViewer3D()   # __init__ 不触碰 open3d
+    v.set_imu_anchor([0.2, 0.5, 1.0])
+    with v._imu_lock:
+        assert np.allclose(v._imu_anchor, [0.2, 0.5, 1.0])
+    v.set_imu_anchor(None)
+    with v._imu_lock:
+        assert np.allclose(v._imu_anchor, [0.2, 0.5, 1.0])  # None 被忽略

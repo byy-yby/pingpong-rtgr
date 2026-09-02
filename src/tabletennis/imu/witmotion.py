@@ -60,6 +60,20 @@ def _i16s(buf, off: int, n: int, scale: float) -> np.ndarray:
     return np.asarray([_i16(buf, off + 2 * i) * scale for i in range(n)], dtype=np.float64)
 
 
+def so3_project(M: np.ndarray) -> np.ndarray:
+    """把任意 3x3 矩阵投影到最近的正交旋转矩阵（SVD + 反射修正）。
+
+    用于对多个朝向样本取均值：样本旋转矩阵逐元素求平均后一般不再是纯旋转
+    （含缩放/形变），直接当旋转用会出错；先投影回 SO(3) 再返回。
+    """
+    U, _, Vt = np.linalg.svd(np.asarray(M, dtype=np.float64))
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1.0
+        R = U @ Vt
+    return R
+
+
 def quat_to_rotmat(w: float, x: float, y: float, z: float) -> np.ndarray:
     """四元数 -> 旋转矩阵（body -> world，Hamilton 约定，w 实部）。
 
