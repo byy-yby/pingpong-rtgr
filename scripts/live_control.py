@@ -24,6 +24,16 @@ from typing import Dict, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+# NVBLAS 段错误修复：CUDA 12.9 的 libcublas 初始化时会 dlopen libnvblas（nvidia-cublas-cu12
+# 自带），libnvblas 是 BLAS 符号拦截器，缺 CPU 回退库（无有效 nvblas.conf）时，进程内
+# 任意一个走 CPU 回退的 BLAS 调用都会打印 "CPU Blas library need to be provided" 并段错误
+# （实测按 P 创建 RTMPose+TensorRT 检测器后崩溃，退出码 139）。这里在加载任何 CUDA 库
+# 之前把 NVBLAS_CONFIG_FILE 指到 config/nvblas.conf（回退到 conda env tt 的 OpenBLAS）。
+_nvblas_conf = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "config", "nvblas.conf")
+if os.path.exists(_nvblas_conf):
+    os.environ.setdefault("NVBLAS_CONFIG_FILE", _nvblas_conf)
+
 import cv2
 import numpy as np
 
