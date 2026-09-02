@@ -82,7 +82,8 @@ def camera_kwargs_from_config(config: dict) -> dict:
 class LiveControl:
     """交互式控制：单窗口，视频在上、自绘滑块在中、提示在下。"""
 
-    def __init__(self, mgr: CameraManager, *, exposure_us, gain_db, gamma, trigger_mode, max_width):
+    def __init__(self, mgr: CameraManager, *, exposure_us, gain_db, gamma, trigger_mode,
+                 max_width, imu_name=None, imu_mac=None):
         self.mgr = mgr
         self.trigger_mode = trigger_mode
         self.max_width = max_width
@@ -135,9 +136,11 @@ class LiveControl:
         self._ball_recon_running = False
         self._ball_recon_thread: Optional[threading.Thread] = None
 
-        # IMU 朝向显示（按 i）：维特智能 WT9011DCL 串口读取 + 3D 球拍朝向
+        # IMU 朝向显示（按 i）：维特智能 WT9011DCL 蓝牙(BLE)读取 + 3D 球拍朝向
         self._imu_reader = None
         self._imu_enabled = False
+        self.imu_name = imu_name
+        self.imu_mac = imu_mac
 
     # ------------------------------------------------------------------
     # 参数应用
@@ -467,9 +470,9 @@ class LiveControl:
 
         from tabletennis.imu.reader import ImuReader
         if self._imu_reader is None:
-            self._imu_reader = ImuReader()
+            self._imu_reader = ImuReader(device_name=self.imu_name, mac=self.imu_mac)
             self._imu_reader.start()
-        print("[IMU] ON——读 WT9011DCL 串口姿态，3D 窗口显示球拍朝向")
+        print("[IMU] ON——读 WT9011DCL 蓝牙姿态，3D 窗口显示球拍朝向")
 
     def _disable_imu(self) -> None:
         if self._imu_reader is not None:
@@ -1030,6 +1033,8 @@ def main() -> None:
     ap.add_argument("--gain", type=float, default=None, help="初始增益(dB)")
     ap.add_argument("--gamma", type=float, default=None, help="初始伽马")
     ap.add_argument("--max-width", type=int, default=DEFAULT_MAX_WIDTH, help="视频网格目标宽度（越大窗口越大）")
+    ap.add_argument("--imu-name", default=None, help="IMU 蓝牙广播名子串（默认自动找名字含 'WT' 的模块）")
+    ap.add_argument("--imu-mac", default=None, help="IMU 蓝牙 MAC 地址（如 AA:BB:CC:DD:EE:FF，跳过扫描）")
     args = ap.parse_args()
 
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -1062,6 +1067,8 @@ def main() -> None:
                 gamma=gamma,
                 trigger_mode=trigger_mode,
                 max_width=args.max_width,
+                imu_name=args.imu_name,
+                imu_mac=args.imu_mac,
             )
             ui.run()
     except KeyboardInterrupt:

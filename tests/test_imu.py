@@ -5,6 +5,7 @@
 """
 import numpy as np
 
+from tabletennis.imu.reader import ImuReader
 from tabletennis.imu.witmotion import (
     WitMotionParser,
     angle_to_rotmat,
@@ -98,3 +99,16 @@ def test_angle_quat_consistent():
     R_angle = angle_to_rotmat(0.0, 0.0, 90.0)
     R_quat = quat_to_rotmat(np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5))
     assert np.allclose(R_angle, R_quat, atol=1e-9)
+
+
+def test_reader_notify_path():
+    """BLE notify 回调 -> 解析 -> 旋转矩阵；21B 的 0x61 包跨 20+1 拆分也能重组。"""
+    r = ImuReader()
+    payload = _i16(0) * 3 + _i16(0) * 3 + _angle_payload(0.0, 0.0, 90.0)
+    pkt = _pkt(0x61, payload)
+    assert len(pkt) == 21
+    r._on_notify(None, pkt[:20])   # BLE 单包最多 20B，拆两段
+    r._on_notify(None, pkt[20:])
+    R = r.latest_rotation()
+    assert R is not None
+    assert np.allclose(R @ np.array([1, 0, 0]), np.array([0, 1, 0]), atol=1e-6)
