@@ -17,16 +17,25 @@ numpy 2.x 下没法直接加载；本项目已有的 ``SMPL_NEUTRAL.npz`` 是从
 （``load_model(skel_type='body25')`` 需要 ``<model_path>/J_regressor_body25.npy``）。
 官方文件在 ``$EASYMOCAP_ROOT/data/smplx/J_regressor_body25.npy``，用
 ``EASYMOCAP_ROOT`` 环境变量可覆盖。
+
+实现复用 ``tabletennis.reconstruction.easymocap.convert_npz_to_pkl``（运行时
+自动生成与 CLI 走同一份代码，不会漂移）。
 """
 from __future__ import annotations
 
 import argparse
 import os
-import pickle
-import shutil
 import sys
 
-import numpy as np
+_THIS = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.join(os.path.dirname(_THIS), "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from tabletennis.reconstruction.easymocap import (  # noqa: E402
+    DEFAULT_EASYMOCAP_ROOT,
+    convert_npz_to_pkl,
+)
 
 
 def main() -> None:
@@ -37,29 +46,10 @@ def main() -> None:
                     help="load_model 的 model_path（= pkl 上级的上级，放 J_regressor_body25.npy）")
     args = ap.parse_args()
 
-    d = np.load(args.input)
-    keys = ["f", "J_regressor", "v_template", "weights", "posedirs",
-            "shapedirs", "kintree_table"]
-    out = {k: np.ascontiguousarray(d[k]) for k in keys}
-    for k, v in out.items():
-        print(f"  {k}: shape={v.shape} dtype={v.dtype}")
-
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    with open(args.output, "wb") as f:
-        pickle.dump(out, f, protocol=4)
-    print(f"[npz->pkl] 写入 {args.output} ({os.path.getsize(args.output)} 字节)")
-
-    # J_regressor_body25.npy（body25 顶点->关节回归器，load_model 依赖）
-    em_root = os.environ.get("EASYMOCAP_ROOT", "/home/yby/projects/EasyMocap")
-    src_reg = os.path.join(em_root, "data", "smplx", "J_regressor_body25.npy")
-    dst_reg = os.path.join(args.model_path, "J_regressor_body25.npy")
-    if os.path.exists(src_reg):
-        os.makedirs(args.model_path, exist_ok=True)
-        shutil.copyfile(src_reg, dst_reg)
-        print(f"[npz->pkl] 拷贝 {src_reg} -> {dst_reg}")
-    else:
-        print(f"[npz->pkl] 警告：找不到 {src_reg}（J_regressor_body25.npy），"
-              f"body25 关节将不可用", file=sys.stderr)
+    em_root = os.environ.get("EASYMOCAP_ROOT", DEFAULT_EASYMOCAP_ROOT)
+    convert_npz_to_pkl(args.input, args.model_path, em_root)
+    print(f"[npz->pkl] 写入 {args.output} "
+          f"({os.path.getsize(args.output)} 字节) + J_regressor_body25.npy")
 
 
 if __name__ == "__main__":
