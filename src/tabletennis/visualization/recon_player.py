@@ -897,12 +897,79 @@ def render_still(tl: ReconTimeline, t: int, width: int = 1280, height: int = 720
 
 
 # ----------------------------------------------------------------------
+# 2D 检测叠加：把重建时的球框 + 姿态关键点叠回四路视频（供回放对比排查）
+# ----------------------------------------------------------------------
+class Recon2DOverlay:
+    """把离线重建时的 2D 观测（球检测框 + 姿态关键点）叠回四路视频画面。
+
+    从 ``pose2d.json`` / ``ball2d.json``（``reconstruct_video.py`` 检测阶段存盘）读
+    2D 检测结果，用 ``VideoSource`` 读主时钟帧对应的四路视频，逐相机画球框 + 关键点，
+    拼成 2×2 平铺图（RGB uint8），供回放窗口里的 ``gui.ImageWidget`` 显示——方便对比
+    排查「人物动作 / 球检测」问题。视频在首次取图时惰性打开，``close()`` 释放。
+    """
+
+    def __init__(self, out_dir: str, session_dir: str,
+                 per_cam_size: tuple = (480, 360)):
+        from ..reconstruction.obs2d import load_ball2d, load_pose2d
+        self.pose2d = load_pose2d(out_dir)
+        self.ball2d = load_ball2d(out_dir)
+        self.session_dir = session_dir
+        self.per_cam_size = tuple(per_cam_size)
+        self._src = None
+
+    @property
+    def available(self) -> bool:
+        return bool(self.pose2d or self.ball2d)
+
+    def _source(self):
+        if self._src is None:
+            from ..reconstruction.video_source import VideoSource
+            try:
+                self._src = VideoSource(self.session_dir)
+            except Exception:  # noqa: BLE001 —— session 无视频则整个叠加不可用
+                self._src = None
+        return self._src
+
+    def tile(self, t: int) -> "Optional[np.ndarray]":
+        """主时钟 t 帧的四路画面 2×2 平铺（RGB uint8）；无画面返回 None。"""
+        import cv2
+
+        from ..reconstruction.obs2d import dict_to_ball, dict_to_pose
+        from .overlay2d import draw_ball, draw_pose, gray_to_bgr, tile_images
+
+        src = self._source()
+        if src is None:
+            return None
+        frames = src.frames_for_ref(int(t))
+        if not frames:
+            return None
+        tw, th = self.per_cam_size
+        images = []
+        for cid in sorted(frames):
+            bgr = gray_to_bgr(frames[cid].image)
+            for pd in self.pose2d.get(str(int(t)), {}).get(str(cid), []):
+                draw_pose(bgr, dict_to_pose(pd, camera_id=cid), draw_bbox=True)
+            for bd in self.ball2d.get(str(int(t)), {}).get(str(cid), []):
+                draw_ball(bgr, dict_to_ball(bd, camera_id=cid))
+            if (bgr.shape[1], bgr.shape[0]) != (tw, th):
+                bgr = cv2.resize(bgr, (tw, th), interpolation=cv2.INTER_AREA)
+            images.append(bgr)
+        tile = tile_images(images, cols=2)
+        return cv2.cvtColor(tile, cv2.COLOR_BGR2RGB)
+
+    def close(self) -> None:
+        if self._src is not None:
+            self._src.close()
+            self._src = None
+
+
+# ----------------------------------------------------------------------
 # 交互回放窗口（gui.Application + SceneWidget，须主线程）
 # ----------------------------------------------------------------------
 class _PlayerApp:
     def __init__(self, tl: ReconTimeline, faces: Optional[np.ndarray],
                  scene_b: ReconScene, width: int, height: int, fps: float,
-                 watch: bool = False):
+                 watch: bool = False, overlay: "Optional[Recon2DOverlay]" = None):
         import open3d.visualization.gui as gui
         self.gui = gui
         self.tl = tl
@@ -917,6 +984,9 @@ class _PlayerApp:
         self._watch_last = 0.0
         self._watch_prev_n = tl.n_ref
         self._watch_prev_ok = tl.n_ok()
+        self.overlay = overlay              # 2D 检测叠加（可为 None）
+        self._2d_win = None
+        self._2d_img_widget = None
 
         self.app = gui.Application.instance
         self.app.initialize()
@@ -990,6 +1060,8 @@ class _PlayerApp:
               f"显示若跟不上会自动掉帧；- / + 半速/倍速可调。")
         print("[回放] 鼠标拖=旋转/平移/滚轮缩放；Space=暂停/继续，←/→=步进，"
               "Home/End=首/尾，R=复位视角，Esc=退出")
+        if self.overlay is not None and self.overlay.available:
+            print("[回放] V=开关 2D 检测叠加窗口（四路视频 + 球框 + 关键点）")
 
     def _advance(self, dt: float) -> None:
         if not self.playing:
@@ -1017,6 +1089,47 @@ class _PlayerApp:
                           f"  |  {'● 人物' if person else '— 无人'}"
                           f"  |  {'● 球' if has_ball else ''}"
                           f"  |  x{self.speed:.1f} ≈{rate:.0f}帧/秒")
+        self._refresh_2d()
+
+    # -- 2D 检测叠加窗口（V 开关）--------------------------------------
+    def _toggle_2d(self) -> None:
+        if self.overlay is None or not self.overlay.available:
+            print("[回放] 无 2D 检测数据（缺 pose2d.json / ball2d.json），先重跑重建")
+            return
+        if self._2d_win is None:
+            self._open_2d()
+        else:
+            self._close_2d()
+
+    def _open_2d(self) -> None:
+        w = self.app.create_window("2D 检测叠加（V 开关）", 960, 720)
+        iw = self.gui.ImageWidget()
+        w.add_child(iw)
+        w.set_on_close(self._on_2d_close)
+        self._2d_win = w
+        self._2d_img_widget = iw
+        self._refresh_2d()
+        print("[回放] 2D 检测叠加 开")
+
+    def _close_2d(self) -> None:
+        if self._2d_win is not None:
+            self._2d_win.close()
+        self._2d_win = None
+        self._2d_img_widget = None
+        print("[回放] 2D 检测叠加 关")
+
+    def _on_2d_close(self) -> None:
+        self._2d_win = None
+        self._2d_img_widget = None
+
+    def _refresh_2d(self) -> None:
+        if self._2d_img_widget is None or self.overlay is None:
+            return
+        tile = self.overlay.tile(int(self.t))
+        if tile is None:
+            return
+        img = _o3d().geometry.Image(np.ascontiguousarray(tile))
+        self._2d_img_widget.update_image(img)
 
     def _on_key(self, ev) -> bool:
         k = ev.key
@@ -1037,6 +1150,8 @@ class _PlayerApp:
             self.playing = False
         elif k == ord("R"):
             self.widget.setup_camera(50.0, self.scene_b.bounds(), self.scene_b.center())
+        elif k == ord("V") or k == ord("v"):
+            self._toggle_2d()
         elif k == ord("-"):
             self.speed = max(0.25, self.speed * 0.5)
         elif k == ord("=") or k == ord("+"):
@@ -1054,7 +1169,8 @@ class _PlayerApp:
 def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
              height: int = 720, fps: float = 0.0, watch: bool = False,
              root: Optional[str] = None, hold_gaps: int = 0,
-             cast_shadow: bool = True, ball_trail: bool = True) -> None:
+             cast_shadow: bool = True, ball_trail: bool = True,
+             show_2d: bool = True) -> None:
     """在主线程弹出 Open3D 回放窗口并阻塞到关闭。``fps``<=0 用真实出帧率。
 
     ``hold_gaps``：连续 no_person ≤ 该帧数时播放保持上一姿态（见
@@ -1076,4 +1192,7 @@ def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
     if tl.n_ref <= 1 and not watch:
         print("[回放] 没有任何已重建帧，无事可播。")
         return
-    _PlayerApp(tl, faces, scene_b, width, height, fps, watch=watch).run()
+    session_dir = (tl.meta or {}).get("session_dir") or os.path.dirname(os.path.abspath(out_dir))
+    overlay = Recon2DOverlay(out_dir, session_dir) if show_2d else None
+    _PlayerApp(tl, faces, scene_b, width, height, fps, watch=watch,
+               overlay=overlay).run()

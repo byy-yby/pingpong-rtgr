@@ -169,6 +169,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     时间平滑；单视角关节由相邻帧约束 + 模型先验补全。
     """
     from tabletennis.reconstruction.associate import match_people_fixed
+    from tabletennis.reconstruction.obs2d import pose_to_dict, save_pose2d
     from tabletennis.reconstruction.triangulate import MultiViewTriangulator
 
     # 过滤掉未标定的相机，组内相机数 <2 则该身份无法三角化（后面跳过）
@@ -184,6 +185,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     # ---- Pass 1：检测 + 分组匹配，按身份（组下标）收集每帧观测 ----
     frames_obs_by_pid = {g: [] for g in range(n_people)}   # pid -> [ {cid:Pose2D} per frame ]
     n_seen_by_pid = {g: 0 for g in range(n_people)}
+    pose2d_by_frame = {}                                    # 全部检出 2D 姿态（存盘供回放叠加）
     t_global0 = time.time()
     t0 = time.time()
     for k in indices:
@@ -202,6 +204,10 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             poses_per_cam = {cid: pl for (cid, _f), pl in zip(items, plist) if pl}
         else:
             poses_per_cam = {}
+        if poses_per_cam:
+            pose2d_by_frame[str(k)] = {
+                str(cid): [pose_to_dict(p) for p in pl] for cid, pl in poses_per_cam.items()
+            }
         for g, group in enumerate(person_groups):
             matched = match_people_fixed(poses_per_cam, triangulator, groups=[group])
             obs = matched[0] if matched else {}
@@ -211,6 +217,9 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     det_wall = time.time() - t0
     print(f"  检测 {len(indices)} 帧耗时 {det_wall:.1f}s | 各身份被看到帧数："
           + ", ".join(f"p{g}={n_seen_by_pid[g]}" for g in range(n_people)))
+    if pose2d_by_frame:
+        save_pose2d(out_dir, pose2d_by_frame)
+        print(f"  2D 姿态检测已存 pose2d.json（{len(pose2d_by_frame)} 帧）")
 
     # ---- Pass 2：逐人批量拟合 ----
     t0 = time.time()
@@ -316,6 +325,7 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
     （每帧 ``ref_frame`` + 3D 球心 ``X``，失败帧 ``X=NaN``），供 visualize_recon.py 回放渲染。
     """
     from tabletennis.reconstruction.ball import triangulate_ball
+    from tabletennis.reconstruction.obs2d import ball_to_dict, save_ball2d
     from tabletennis.reconstruction.triangulate import MultiViewTriangulator
     from tabletennis.vision.ball import ClassicalBallDetector, YoloBallDetector
     from tabletennis.vision.detector import create_detector
@@ -351,11 +361,13 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
 
     ref_arr, X_arr = [], []
     conf_arr, err_arr, nv_arr, ang_arr = [], [], [], []
+    ball2d_by_frame = {}
     t0 = time.time()
     n_ball = 0
     for k in indices:
         frames_k = {cid: f for cid, f in src.frames_for_ref(k).items() if cid in cids}
         balls = {}
+        ball2d_k = {}
         if frames_k:
             if ball_det is not None:
                 items = sorted(frames_k.items())
@@ -366,11 +378,15 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
                 for (cid, _f), bl in zip(items, outs):
                     if bl:
                         balls[cid] = bl[0]  # 单球，取最高置信者（YOLO 已按 conf 排序）
+                        ball2d_k[str(cid)] = [ball_to_dict(b) for b in bl]
             else:
                 for cid, f in frames_k.items():
                     d = dets[cid].detect(f)
                     if d:
                         balls[cid] = d[0]
+                        ball2d_k[str(cid)] = [ball_to_dict(b) for b in d]
+        if ball2d_k:
+            ball2d_by_frame[str(k)] = ball2d_k
         res = triangulate_ball(balls, triangulator, min_conf=args.ball_min_conf) if balls else None
         ref_arr.append(k)
         if res is not None:
@@ -398,6 +414,8 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
         n_views=np.asarray(nv_arr, np.int32),
         angle_deg=np.asarray(ang_arr, np.float64),
     )
+    if ball2d_by_frame:
+        save_ball2d(out_dir, ball2d_by_frame)
     with open(os.path.join(out_dir, "ball_meta.json"), "w", encoding="utf-8") as fh:
         json.dump({
             "detector": "yolo" if ball_det is not None else "classical",
