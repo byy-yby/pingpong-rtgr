@@ -145,6 +145,25 @@ def _make_args(verbose: bool = True) -> SimpleNamespace:
     return SimpleNamespace(verbose=verbose, model="smpl", robust3d=False, opts={})
 
 
+def _pose_to_body25_view(kp: np.ndarray, K: np.ndarray, dist, min_conf: float):
+    """单视角 halpe26 -> body25（去畸变 + 置信度阈值 + 脚部降权）。
+
+    返回 ``(25, 3)`` 的 ``[x, y, conf]``；有效关键点 < 3 时返回 None（该视角丢弃）。
+    """
+    from .triangulate import undistort_keypoints
+
+    undist = undistort_keypoints(kp, K, dist)
+    out = np.zeros((25, 3), dtype=np.float32)
+    for halpe_idx, b25_idx in HALPE26_TO_BODY25:
+        x, y, c = undist[halpe_idx]
+        if not np.isfinite(x) or not np.isfinite(y) or c < min_conf:
+            continue
+        out[b25_idx] = (x, y, float(c) * _HALPE_WEIGHTS.get(halpe_idx, 1.0))
+    if (out[:, 2] > 0).sum() < 3:
+        return None
+    return out
+
+
 class EasymocapReconstructor:
     """EasyMocap 官方多视角 SMPL 重建器。
 
@@ -229,7 +248,6 @@ class EasymocapReconstructor:
             Pall (nViews, 3, 4)：``K @ [R|t]`` 投影矩阵（顺序与 kp2d 一致）。
             视角不足 2 个返回 (None, None, None)。
         """
-        from .triangulate import undistort_keypoints
         from easymocap.estimator.wrapper_base import bbox_from_keypoints
 
         kp2d_list: List[np.ndarray] = []
@@ -244,15 +262,8 @@ class EasymocapReconstructor:
             kp = np.asarray(pose.keypoints, dtype=np.float32)
             if kp.ndim != 2 or kp.shape[0] < 26:
                 continue
-            # 去畸变（与三角化同款，得到线性投影可直接用的像素坐标）
-            undist = undistort_keypoints(kp, K.K, K.dist)
-            out = np.zeros((25, 3), dtype=np.float32)
-            for halpe_idx, b25_idx in HALPE26_TO_BODY25:
-                x, y, c = undist[halpe_idx]
-                if not np.isfinite(x) or not np.isfinite(y) or c < min_conf:
-                    continue
-                out[b25_idx] = (x, y, float(c) * _HALPE_WEIGHTS.get(halpe_idx, 1.0))
-            if (out[:, 2] > 0).sum() < 3:  # 有效关键点太少，该视角丢弃
+            out = _pose_to_body25_view(kp, K.K, K.dist, min_conf)
+            if out is None:
                 continue
             kp2d_list.append(out)
             bbox_list.append(np.asarray(bbox_from_keypoints(out), dtype=np.float32))
@@ -348,3 +359,153 @@ class EasymocapReconstructor:
             "faces": self._faces,
             "params": {k: np.asarray(v) for k, v in params.items()},
         }
+
+    # ------------------------------------------------------------------
+    # 批量多帧拟合（官方视频管线：一次拟合 T 帧，激活时间平滑损失）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _obs_to_body25_fixed(
+        poses_per_cam: Dict[int, Pose2D],
+        intrinsics: Dict[int, CameraIntrinsics],
+        extrinsics: Dict[int, CameraExtrinsics],
+        min_conf: float,
+        view_ids: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """单帧观测 → 固定视角序的 ``(kp2d (nViews,25,3), bbox (nViews,5))``。
+
+        与 :meth:`_to_body25_2d` 的唯一区别：视角序固定为 ``view_ids``，缺失/无效视角
+        填零（kp2d 全 0、bbox conf=0），保证整批帧共享同一投影矩阵 Pall 与视角数——
+        这是官方批量拟合 ``smpl_from_keypoints3d2d`` 的硬性要求。
+        """
+        from easymocap.estimator.wrapper_base import bbox_from_keypoints
+
+        kp2d = np.zeros((len(view_ids), 25, 3), dtype=np.float32)
+        bbox = np.zeros((len(view_ids), 5), dtype=np.float32)
+        for i, cid in enumerate(view_ids):
+            pose = poses_per_cam.get(cid)
+            K = intrinsics.get(cid)
+            ext = extrinsics.get(cid)
+            if pose is None or K is None or ext is None:
+                continue
+            kp = np.asarray(pose.keypoints, dtype=np.float32)
+            if kp.ndim != 2 or kp.shape[0] < 26:
+                continue
+            view = _pose_to_body25_view(kp, K.K, K.dist, min_conf)
+            if view is None:
+                continue
+            kp2d[i] = view
+            bbox[i] = np.asarray(bbox_from_keypoints(view), dtype=np.float32)
+        return kp2d, bbox
+
+    def reconstruct_batch(
+        self,
+        frames_obs: List[Dict[int, Pose2D]],
+        intrinsics: Dict[int, CameraIntrinsics],
+        extrinsics: Dict[int, CameraExtrinsics],
+        *,
+        min_conf: float = DEFAULT_MIN_CONF,
+        view_ids: Optional[List[int]] = None,
+    ) -> Optional[List[dict]]:
+        """官方多帧批量 SMPL 拟合（视频管线）。
+
+        与单帧 :meth:`reconstruct` 的区别：把整段（或一个窗口的）帧**一次性**喂给官方
+        ``smpl_from_keypoints3d2d``（``nFrames=T``），让 ``smooth_body``/``smooth_poses``/
+        ``smooth_Rh`` 时间平滑损失真正生效——单视角关节不再只靠一条 2D 射线约束，而是
+        由相邻帧平滑 + 模型先验补全，帧间动作自然连贯。
+
+        Args:
+            frames_obs: 每帧一个 ``{cid: Pose2D}``；空 dict 表示该帧无人（官方管线会对
+                完全无观测的帧做相邻帧插值，输出仍连续）。
+            view_ids: 固定相机顺序（投影矩阵 Pall 的行序）。默认 ``sorted(所有出现过的 cid)``。
+
+        Returns:
+            ``List[dict]``，与 :meth:`reconstruct` 单帧返回格式一致（每帧一份
+            vertices/joints/joints_body25/params）。拟合失败返回 None。
+        """
+        if self._model is None:
+            print(f"[EasyMocap] {self._error}")
+            return None
+
+        from easymocap.dataset import CONFIG
+        from easymocap.mytools.triangulator import batch_triangulate
+        from easymocap.pipeline import smpl_from_keypoints3d2d
+        from easymocap.pipeline.weight import load_weight_pose, load_weight_shape
+        from easymocap.smplmodel.body_param import check_keypoints, select_nf
+
+        T = len(frames_obs)
+        if view_ids is None:
+            seen: set = set()
+            for obs in frames_obs:
+                seen.update(obs.keys())
+            view_ids = sorted(seen)
+        view_ids = sorted(view_ids)
+        if len(view_ids) < 2:
+            print("[EasyMocap] 批量拟合需要 ≥2 个标定视角。")
+            return None
+
+        # 固定投影矩阵（nViews, 3, 4）
+        Pall = np.stack([
+            intrinsics[cid].K
+            @ np.hstack([extrinsics[cid].R, extrinsics[cid].t.reshape(3, 1)])
+            for cid in view_ids
+        ])
+
+        # 观测 → 对齐数组
+        kp2ds_list: List[np.ndarray] = []
+        bboxes_list: List[np.ndarray] = []
+        kp3ds_list: List[np.ndarray] = []
+        for obs in frames_obs:
+            kp2d, bbox = self._obs_to_body25_fixed(
+                obs, intrinsics, extrinsics, min_conf, view_ids)
+            kp3d = batch_triangulate(kp2d, Pall, min_view=2)      # (25, 4)
+            kp3d = check_keypoints(kp3d, 1, min_conf=min_conf)
+            kp2ds_list.append(kp2d)
+            bboxes_list.append(bbox)
+            kp3ds_list.append(kp3d)
+        kp2ds = np.stack(kp2ds_list)        # (T, nViews, 25, 3)
+        bboxes = np.stack(bboxes_list)      # (T, nViews, 5)
+        kp3ds = np.stack(kp3ds_list)        # (T, 25, 4)
+
+        n_valid_max = int((kp3ds[..., 3] > 0).sum(axis=1).max())
+        print(f"[EasyMocap] 批量拟合 {T} 帧 × {len(view_ids)} 视角，"
+              f"单帧有效 3D 关节最多 {n_valid_max}/25")
+
+        args = _make_args(verbose=self._verbose)
+        weight_shape = load_weight_shape("smpl", args.opts)
+        weight_pose = load_weight_pose("smpl", args.opts)
+        params = smpl_from_keypoints3d2d(
+            self._model,
+            kp3ds,          # (T, 25, 4)
+            kp2ds,          # (T, nViews, 25, 3)
+            bboxes,         # (T, nViews, 5)
+            Pall,           # (nViews, 3, 4)
+            config=CONFIG["body25"],
+            args=args,
+            weight_shape=weight_shape,
+            weight_pose=weight_pose,
+        )
+        if params is None:
+            print("[EasyMocap] 官方批量拟合返回空。")
+            return None
+
+        # 一次前向出整批顶点/关节，再按帧切分
+        import torch
+        with torch.no_grad():
+            verts_all = self._model(return_verts=True, return_tensor=False, **params)  # (T, 6890, 3)
+            j25_all = self._model(return_verts=False, return_tensor=False, **params)   # (T, 25, 3)
+            j24_all = self._model(
+                return_verts=False, return_tensor=False,
+                return_smpl_joints=True, **params
+            )                                                                          # (T, 24, 3)
+
+        results: List[dict] = []
+        for t in range(T):
+            p = select_nf(params, t)
+            results.append({
+                "vertices": np.asarray(verts_all[t], dtype=np.float64),
+                "joints": np.asarray(j24_all[t], dtype=np.float64),
+                "joints_body25": np.asarray(j25_all[t], dtype=np.float64),
+                "faces": self._faces,
+                "params": {k: np.asarray(v) for k, v in p.items()},
+            })
+        return results
