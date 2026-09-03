@@ -87,6 +87,21 @@ class Camera:
         self._soft_trigger_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._image_control: Optional[ImageControl] = None
+        # 抓帧诊断（录到一半四路齐停时，用来区分「进程/线程冻结」vs「相机/总线停供」）
+        self._grab_timeouts = 0          # GetImageBuffer 返回非 OK（超时/错误）次数
+        self._grab_err_codes: dict = {}  # 非普通超时的错误码计数（排错用）
+        self._grab_timeout_wall: list = []  # 每次超时的墙钟时刻（单调秒）
+
+    # -- 抓帧诊断 ----------------------------------------------------------
+    @property
+    def grab_timeouts(self) -> int:
+        """GetImageBuffer 超时/错误累计次数。诊断读用，无需加锁（GIL 下 int 读安全）。"""
+        return self._grab_timeouts
+
+    @property
+    def grab_timeout_wall(self) -> list:
+        """每次超时的墙钟时刻（``time.perf_counter`` 单调秒）。供录制 stop 关联静默窗口。"""
+        return list(self._grab_timeout_wall)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -244,7 +259,14 @@ class Camera:
         while not self._stop_event.is_set():
             ret = self._cam.MV_CC_GetImageBuffer(st_frame, self.frame_timeout_ms)
             if ret != MV_OK:
-                # 超时（0x8000000A 之类）在软触发/外部触发下是正常的，继续等
+                # 超时（MV_E_NODATA 0x8000000A 之类）在软触发/外部触发下是正常的，继续等。
+                # 记下次数与墙钟时刻：若四路在录到一半同时出现一段「无帧」，
+                # 看这段里有没有超时——有=相机/总线停供（GetImageBuffer 在轮询超时），
+                # 没有=进程/线程被冻结根本没来取（GIL/阻塞调用）。
+                self._grab_timeouts += 1
+                if ret not in (0x8000000A,):
+                    self._grab_err_codes[ret] = self._grab_err_codes.get(ret, 0) + 1
+                self._grab_timeout_wall.append(time.perf_counter())
                 continue
 
             frame = extract_frame(st_frame, self.logical_id, self.serial)
