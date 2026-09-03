@@ -223,6 +223,50 @@ def test_tracker_tracks_fast_ball_with_correct_dt():
     assert abs(last[0] - speed * 0.05 * 19) < 0.2   # 位置跟上了球
 
 
+def test_tracker_gravity_coast_follows_ballistic_arc():
+    """重力模型下，coast 按抛物线外推而非直线（回归「球击高后一直往上飞」）。"""
+    g = 9.81
+    dt = 0.02
+    tr = BallTracker(dt=dt, process_noise=50.0, meas_noise_m=0.001,
+                     gravity=(0.0, 0.0, -g), max_coast=50)
+
+    def true_pos(i):
+        t = i * dt
+        return np.array([3.0 * t, 0.0, 1.0 + 5.0 * t - 0.5 * g * t * t])
+
+    for i in range(15):                 # 前 15 帧喂测量，建立位置+速度
+        tr.update(true_pos(i), conf=0.9)
+    errs = []
+    for i in range(15, 35):             # 20 帧 coast（无测量）
+        out = tr.update(None, conf=0.0)
+        errs.append(float(np.linalg.norm(out - true_pos(i))))
+    assert tr.initialized               # coast 20 帧 ≤ max_coast 50，未失联
+    assert np.mean(errs) < 0.2          # 抛物线贴合真实（直线外推到 0.4s 会差 ~0.8m）
+
+
+def test_tracker_gravity_decelerates_on_coast():
+    """coast 时重力应使竖直速度持续减小（不会笔直往上飞）。"""
+    g = 9.81
+    tr = BallTracker(dt=0.02, process_noise=1.0, meas_noise_m=0.001,
+                     gravity=(0.0, 0.0, -g), max_coast=100)
+    for i in range(5):
+        tr.update(np.array([0.0, 0.0, 1.0 + 5.0 * 0.02 * i]), conf=0.9)
+    vz0 = float(tr.velocity[2])
+    assert vz0 > 0.5                    # 已建立向上的速度
+    for _ in range(5):
+        tr.update(None, conf=0.0)       # coast
+    assert float(tr.velocity[2]) < vz0 - 0.5   # 重力减速（≈ g·dt·5 ≈ 0.98）
+
+
+def test_tracker_mahalanobis_rejects_clear_outlier():
+    """马氏门限：明显的离群点（远超不确定度）仍应被拒，且计 coast。"""
+    tr = BallTracker(dt=0.01, meas_noise_m=0.002, gate_sigma=3.0, max_coast=5)
+    tr.update(np.array([0.0, 0.0, 1.5]), conf=0.9)
+    out = tr.update(np.array([100.0, 0.0, 1.5]), conf=0.9)
+    assert out is not None              # 预测返回（不更新）
+    assert tr.coast == 1                # 判为外点
+
+
 # ----------------------------------------------------------------------
 # classical detector
 # ----------------------------------------------------------------------

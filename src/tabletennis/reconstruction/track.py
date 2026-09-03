@@ -1,11 +1,13 @@
-"""球轨迹滤波：numpy 常速度卡尔曼（6 态 3D）+ 门限外点剔除。
+"""球轨迹滤波：numpy 常速度/弹道卡尔曼（6 态 3D）+ 门限外点剔除。
 
 作用：单帧三角化的毫米级误差偏大且含离群点（误检 / 视角不足），对平滑的乒乓轨迹
 用卡尔曼做时序平滑，能显著压低误差、剔除跳变。状态 ``[px,py,pz,vx,vy,vz]``（世界系，
 米），观测为三角化 3D 球心。
 
-纯 numpy 实现（项目环境无 filterpy）。过程噪声用「离散白噪声加速度」(DWNA) 模型，
-适应球受重力 / 击球导致的非匀速。
+可选把重力 ``g`` 作为已知控制输入加入状态转移（弹道模型，见 ``BallTracker(gravity=…)``），
+这样补帧时按 ``p += v·dt + ½g·dt²`` 外推——球被击高后 coast 走真实抛物线，而不是沿速度
+方向直线外推上天。纯 numpy 实现（项目环境无 filterpy）。过程噪声用「离散白噪声加速度」
+(DWNA) 模型，适应重力以外未建模的加速度（空气阻力 / 马格努斯 / 击球）。
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ __all__ = ["BallTracker"]
 
 
 class BallTracker:
-    """3D 球轨迹卡尔曼滤波器（常速度模型）。"""
+    """3D 球轨迹卡尔曼滤波器（常速度模型，可选已知重力 → 弹道模型）。"""
 
     def __init__(
         self,
@@ -27,6 +29,8 @@ class BallTracker:
         gate_m: float = 0.5,
         min_conf: float = 0.3,
         max_coast: Optional[int] = None,
+        gravity: Optional[np.ndarray] = None,
+        gate_sigma: Optional[float] = None,
     ) -> None:
         """
         Args:
@@ -34,10 +38,17 @@ class BallTracker:
             process_noise: 加速度强度 q（≈最大加速度平方，m²/s³）。越大越跟得上急变，
                 但平滑越弱。球受重力 ~10、击球 ~100 m/s²，默认取 (30)²。
             meas_noise_m: 单轴观测噪声标准差（米）。毫米级目标取 2mm 起步。
-            gate_m: 门限（米）。观测与预测的欧氏距离超过该值判为离群点，只预测不更新。
+            gate_m: 门限（米）。``gate_sigma`` 为 None 时用欧氏距离门限：观测与预测的
+                欧氏距离超过该值判为离群点，只预测不更新。
             min_conf: 观测置信度下限，低于此视为无观测（只预测）。
             max_coast: 连续无观测（缺测 / 门限外点）的最大帧数；超过则判为失联
                 （reset + 返回 None）。None 表示永不失联（旧行为，无限外推）。
+            gravity: 已知恒定加速度（世界系，m/s²，如 ``[0,0,-9.81]``）作为控制输入
+                加入状态转移（弹道模型：``p += v·dt + ½g·dt²``、``v += g·dt``）。
+                None = 纯常速度模型（旧行为）。球被击高后 coast 才不致直线外推上天。
+            gate_sigma: 马氏距离门限（σ 数）。非 None 时用 ``innovᵀ S⁻¹ innov``（S 为
+                新息协方差）判离群点，门限随 coast 期间不确定性增长自动放宽，球重新
+                出现时更不易被误拒。None = 用固定欧氏 ``gate_m``。
         """
         self.dt = float(dt)
         self.q = float(process_noise)
@@ -45,6 +56,8 @@ class BallTracker:
         self.gate_m = float(gate_m)
         self.min_conf = float(min_conf)
         self.max_coast = None if max_coast is None else int(max_coast)
+        self.gravity = None if gravity is None else np.asarray(gravity, dtype=np.float64).reshape(3)
+        self.gate_sigma = None if gate_sigma is None else float(gate_sigma)
 
         self.x = np.zeros(6, dtype=np.float64)   # [px,py,pz,vx,vy,vz]
         self.P = np.eye(6, dtype=np.float64) * 1.0
@@ -70,6 +83,10 @@ class BallTracker:
     def _predict(self, dt: float) -> None:
         F = self._transition(dt)
         self.x = F @ self.x
+        if self.gravity is not None:
+            # 已知重力作为控制输入（弹道模型）：位置 += ½g·dt²、速度 += g·dt
+            self.x[0:3] += self.gravity * (0.5 * dt * dt)
+            self.x[3:6] += self.gravity * dt
         self.P = F @ self.P @ F.T + self._process_cov(dt)
 
     def _update(self, z: np.ndarray) -> None:
@@ -122,9 +139,16 @@ class BallTracker:
         self._predict(dt)
         H = np.hstack([np.eye(3), np.zeros((3, 3))])
         innov = z - H @ self.x
-        # 门限外点：欧氏距离超限（米）→ 只预测（coast），不更新；外点同样计缺测
-        # （误检 / 球突然飞离会在累计 max_coast 后失联，避免一直挂在旧位置）。
-        if float(np.linalg.norm(innov)) > self.gate_m:
+        S = H @ self.P @ H.T + self.R
+        # 门限外点：只预测（coast），不更新；外点同样计缺测（误检 / 球突然飞离会在
+        # 累计 max_coast 后失联，避免一直挂在旧位置）。
+        if self.gate_sigma is not None:
+            # 马氏距离门限（新息协方差归一化）：coast 越久 P 越大 → 门限自动放宽
+            d2 = float(innov @ np.linalg.solve(S, innov))
+            reject = d2 > self.gate_sigma ** 2
+        else:
+            reject = float(np.linalg.norm(innov)) > self.gate_m
+        if reject:
             self._coast += 1
             if self.max_coast is not None and self._coast > self.max_coast:
                 self.reset()
