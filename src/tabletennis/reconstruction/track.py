@@ -26,6 +26,7 @@ class BallTracker:
         meas_noise_m: float = 0.002,
         gate_m: float = 0.5,
         min_conf: float = 0.3,
+        max_coast: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -35,16 +36,20 @@ class BallTracker:
             meas_noise_m: 单轴观测噪声标准差（米）。毫米级目标取 2mm 起步。
             gate_m: 门限（米）。观测与预测的欧氏距离超过该值判为离群点，只预测不更新。
             min_conf: 观测置信度下限，低于此视为无观测（只预测）。
+            max_coast: 连续无观测（缺测 / 门限外点）的最大帧数；超过则判为失联
+                （reset + 返回 None）。None 表示永不失联（旧行为，无限外推）。
         """
         self.dt = float(dt)
         self.q = float(process_noise)
         self.R = np.eye(3) * float(meas_noise_m) ** 2
         self.gate_m = float(gate_m)
         self.min_conf = float(min_conf)
+        self.max_coast = None if max_coast is None else int(max_coast)
 
         self.x = np.zeros(6, dtype=np.float64)   # [px,py,pz,vx,vy,vz]
         self.P = np.eye(6, dtype=np.float64) * 1.0
         self.initialized = False
+        self._coast = 0   # 自上次有效观测以来的连续缺测帧数
 
     # ------------------------------------------------------------------
     def _transition(self, dt: float) -> np.ndarray:
@@ -90,14 +95,20 @@ class BallTracker:
             dt: 与上一帧的间隔（秒），None 用默认值。
 
         Returns:
-            平滑后位置 (3,)；未初始化且无观测时返回 None。
+            平滑后位置 (3,)；未初始化且无观测，或连续缺测超过 ``max_coast``
+            （判失联，已 reset）时返回 None。
         """
         dt = float(dt) if dt is not None else self.dt
 
+        # 无观测：只预测（coast）。连续缺测超过 max_coast 即失联（球落桌/打飞）。
         if X is None or not np.isfinite(X).all() or conf < self.min_conf:
             if not self.initialized:
                 return None
             self._predict(dt)
+            self._coast += 1
+            if self.max_coast is not None and self._coast > self.max_coast:
+                self.reset()
+                return None
             return self.x[0:3].copy()
 
         z = np.asarray(X, dtype=np.float64).reshape(3)
@@ -105,16 +116,23 @@ class BallTracker:
             self.x[0:3] = z
             self.x[3:6] = 0.0
             self.initialized = True
+            self._coast = 0
             return z.copy()
 
         self._predict(dt)
         H = np.hstack([np.eye(3), np.zeros((3, 3))])
         innov = z - H @ self.x
-        # 门限外点：欧氏距离超限（米）→ 只预测（coast），不更新
+        # 门限外点：欧氏距离超限（米）→ 只预测（coast），不更新；外点同样计缺测
+        # （误检 / 球突然飞离会在累计 max_coast 后失联，避免一直挂在旧位置）。
         if float(np.linalg.norm(innov)) > self.gate_m:
+            self._coast += 1
+            if self.max_coast is not None and self._coast > self.max_coast:
+                self.reset()
+                return None
             return self.x[0:3].copy()
 
         self._update(z)
+        self._coast = 0
         return self.x[0:3].copy()
 
     @property
@@ -125,7 +143,13 @@ class BallTracker:
     def velocity(self) -> np.ndarray:
         return self.x[3:6].copy()
 
+    @property
+    def coast(self) -> int:
+        """自上次有效观测以来的连续缺测帧数（含门限外点）。"""
+        return self._coast
+
     def reset(self) -> None:
         self.x = np.zeros(6, dtype=np.float64)
         self.P = np.eye(6, dtype=np.float64) * 1.0
         self.initialized = False
+        self._coast = 0

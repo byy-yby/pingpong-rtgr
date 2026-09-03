@@ -258,6 +258,7 @@ class SceneViewer3D:
         self._ball_sphere = None
         self._latest_ball = None
         self._ball_dirty = False
+        self._ball_visible = False   # 小球当前是否已加入场景（懒加载显隐）
 
         # EasyMocap SMPL 层：人体网格 + 关节骨架，跨线程传递最新拟合结果
         self._smpl_lock = threading.Lock()
@@ -482,12 +483,14 @@ class SceneViewer3D:
     def add_ball_layer(self, trail_len: int = 0) -> None:
         """预分配球几何（当前位置小球，无轨迹），须在 ``start()`` 前调用。
 
+        小球**不**在启动时加入场景——首次 ``set_ball`` 非 None 才懒加载显示
+        （``_update_ball_geometry`` 里 add_geometry），避免开机在桌面原点出现一个红球。
+
         ``trail_len`` 参数保留兼容（历史轨迹已废弃，恒为 0）。
         """
         o3d = _o3d()
         self._ball_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
         self._ball_sphere.paint_uniform_color([1.0, 0.30, 0.20])
-        self._geometries.append(self._ball_sphere)
 
     def set_ball(self, X) -> None:
         """线程安全写入最新 3D 球心（世界系=桌面系，米）；None 表示本帧无球。"""
@@ -498,15 +501,24 @@ class SceneViewer3D:
             self._ball_dirty = True
 
     def _update_ball_geometry(self, vis) -> None:
-        """渲染线程内调用：更新小球位置（无轨迹）。"""
+        """渲染线程内调用：更新小球位置；X 为 None 时隐藏（真正消失，而非留在原位）。"""
         with self._ball_lock:
             if not self._ball_dirty:
                 return
             X = None if self._latest_ball is None else self._latest_ball.copy()
             self._ball_dirty = False
 
-        if self._ball_sphere is None or X is None:
+        if self._ball_sphere is None:
             return
+        if X is None:
+            # 无球 → 从场景移除（否则会一直留在上一次出现的位置）
+            if self._ball_visible:
+                vis.remove_geometry(self._ball_sphere, reset_bounding_box=False)
+                self._ball_visible = False
+            return
+        if not self._ball_visible:
+            vis.add_geometry(self._ball_sphere, reset_bounding_box=False)
+            self._ball_visible = True
         cur = np.asarray(self._ball_sphere.get_center(), dtype=np.float64)
         self._ball_sphere.translate(X - cur)
         vis.update_geometry(self._ball_sphere)

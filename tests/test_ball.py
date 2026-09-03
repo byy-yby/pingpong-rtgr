@@ -144,6 +144,85 @@ def test_tracker_uninitialized_returns_none():
     assert tr.update(None, conf=0.0) is None
 
 
+def _tracker_with_track(max_coast):
+    """初始化一条已跟踪的轨迹（沿 X 匀速 +Z 恒定），返回 tracker。"""
+    tr = BallTracker(dt=0.01, process_noise=10.0, meas_noise_m=0.002,
+                     gate_m=0.5, max_coast=max_coast)
+    for i in range(5):
+        tr.update(np.array([0.2 * i, 0.0, 1.5]), conf=0.9)
+    assert tr.initialized
+    return tr
+
+
+def test_tracker_coasts_through_short_occlusion():
+    """短遮挡（缺测 ≤ max_coast）应外推预测、不失联，仍返回位置。"""
+    tr = _tracker_with_track(max_coast=10)
+    for _ in range(5):
+        out = tr.update(None, conf=0.0)
+        assert out is not None          # 补帧：仍给位置
+    assert tr.initialized
+    assert tr.coast == 5
+
+
+def test_tracker_loses_track_after_long_occlusion():
+    """长遮挡（缺测 > max_coast）应失联：返回 None 且 reset。"""
+    tr = _tracker_with_track(max_coast=5)
+    results = [tr.update(None, conf=0.0) for _ in range(6)]
+    assert all(r is not None for r in results[:5])   # 前 5 帧还在 coast
+    assert results[5] is None                        # 第 6 帧失联
+    assert not tr.initialized
+    assert tr.coast == 0
+
+
+def test_tracker_reinitializes_after_loss():
+    """失联后再出现测量应从新位置重新初始化（不跨断点连轨迹）。"""
+    tr = _tracker_with_track(max_coast=3)
+    for _ in range(4):
+        tr.update(None, conf=0.0)
+    assert not tr.initialized
+    new = np.array([2.0, 2.0, 0.5])
+    out = tr.update(new, conf=0.9)
+    assert tr.initialized
+    assert np.allclose(out, new)
+
+
+def test_tracker_outlier_counts_as_coast():
+    """门限外点只预测不更新，且计入 coast（连续外点最终失联）。"""
+    tr = _tracker_with_track(max_coast=3)
+    far = np.array([10.0, 10.0, 10.0])
+    out = tr.update(far, conf=0.9)
+    assert out is not None                    # 预测返回
+    assert np.linalg.norm(out - far) > 1.0    # 位置没被外点拉走（仍沿原轨迹预测）
+    assert tr.coast == 1                      # 外点计 coast
+    for _ in range(3):
+        tr.update(far, conf=0.9)
+    assert not tr.initialized                 # 连续外点 → 失联
+
+
+def test_tracker_max_coast_none_never_loses():
+    """max_coast=None（旧行为）：初始化后永不因缺测失联。"""
+    tr = _tracker_with_track(max_coast=None)
+    for _ in range(50):
+        out = tr.update(None, conf=0.0)
+        assert out is not None
+    assert tr.initialized
+
+
+def test_tracker_tracks_fast_ball_with_correct_dt():
+    """回归老 bug：用真实 dt 时快速球应被跟随，不被门限误判冻结。"""
+    tr = BallTracker(dt=0.05, process_noise=1000.0, meas_noise_m=0.002,
+                     gate_m=0.5, max_coast=5)
+    tr.update(np.array([0.0, 0.0, 1.5]), conf=0.9)
+    speed = 8.0                 # 8 m/s；dt=0.05 → 每帧 0.4m < gate 0.5m
+    last = None
+    for i in range(1, 20):
+        x = np.array([speed * 0.05 * i, 0.0, 1.5])
+        last = tr.update(x, conf=0.9)
+    assert tr.initialized
+    assert tr.coast == 0                        # 从未被判离群
+    assert abs(last[0] - speed * 0.05 * 19) < 0.2   # 位置跟上了球
+
+
 # ----------------------------------------------------------------------
 # classical detector
 # ----------------------------------------------------------------------
