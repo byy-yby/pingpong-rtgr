@@ -5,15 +5,16 @@
 - live_control 的主循环 / 球 / EasyMocap 线程都在消费相机帧队列；录像若挂在主循环上，
   会随显示 / 重建节奏丢帧。这里每台相机独立一个后台编码线程，帧在**采集线程**里通过
   ``Camera.set_frame_sink`` 直达录制队列——不受主循环 / 重建线程影响，抓多少录多少。
-- 若 CPU 编码跟不上出帧率，录制线程会**丢最旧未写帧**（不阻塞抓帧、不阻塞主线程）。
-  写成文件的每一帧都记下设备时间戳（``cam{cid}_ts.npy``），离线脚本
-  ``scripts/reconstruct_video.py`` 靠时间戳把 4 路视频重新对齐到同一触发脉冲，
-  所以个别丢帧不影响重建正确性。
+- 编码在 **ffmpeg 子进程**里做（主路径 GPU ``h264_nvenc``，见 ``_resolve_encoder``），
+  编码线程只把灰度帧转 yuv420p 喂管道；若编码跟不上出帧率，录制线程会**丢最旧未写帧**
+  （不阻塞抓帧、不阻塞主线程）。写成文件的每一帧都记下设备时间戳
+  （``cam{cid}_ts.npy``），离线脚本 ``scripts/reconstruct_video.py`` 靠时间戳把 4 路视频
+  重新对齐到同一触发脉冲，所以个别丢帧不影响重建正确性。
 
 产物布局（一个 session 一个文件夹）
 -----------------------------------
 ``data/video/<YYYYmmdd_HHMMSS>/``
-    cam0.mp4 .. cam3.mp4      四段灰度视频（mp4v 编码，逻辑相机号 = 标定里的 cid）
+    cam0.mp4 .. cam3.mp4      四段灰度视频（H.264，逻辑相机号 = 标定里的 cid）
     cam0_ts.npy ..            ``uint64`` 设备时间戳数组，与 mp4 帧一一对应（长度 = 写入帧数）
     meta.json                 相机→序列号、fps、起止墙钟、各相机帧数 + 供帧停顿诊断
                               ``feed_diag_per_cam``（入队墙钟空档 + GetImageBuffer 超时，
@@ -21,12 +22,16 @@
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import queue
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -34,10 +39,16 @@ import numpy as np
 from ..core.config import project_root
 from ..core.types import Frame
 
-# 本机实测：1440×1080 Mono8 下 mp4v ~8ms/帧（≈100fps 预算内）；MJPG 26ms 太慢、
-# avc1(h264) 无 v4l2 设备直接打不开。故统一写 mp4v → .mp4。
+# 编码器：默认走 ffmpeg 子进程的 GPU h264_nvenc（本机实测 1440×1080 灰度 4 路并发
+# ~168fps/路，远超 100fps 目标）；h264_nvenc 不可用 → libx264；再不可用才退回 cv2 mp4v
+# （本机 mp4v 在噪声内容上只有 ~44fps/路，跟不上 100fps 会丢帧——纯兜底）。
+# 详见 _resolve_encoder / _FfmpegWriter。
 _FOURCC = "mp4v"
 _MAX_QUEUE = 128
+
+# 本机自编的 NVENC ffmpeg（源码+头文件见 tools/；也可用 TT_FFMPEG 环境变量覆盖，
+# 或把任意带 h264_nvenc 的 ffmpeg 放进 PATH）。
+_TOOLS_FFMPEG = "/home/yby/tools/ffmpeg-nvenc/bin/ffmpeg"
 
 
 def default_session_dir(root: Optional[str] = None) -> str:
@@ -86,8 +97,191 @@ def _feed_gap_report(wall: List[float], t0: float, t1: float,
     return diag
 
 
+# ---------------------------------------------------------------------------
+# 编码器解析：ffmpeg(h264_nvenc → libx264) → cv2 mp4v 兜底
+# ---------------------------------------------------------------------------
+# 编码器候选（codec, 附加参数）。顺序即优先级；nvenc 与 libx264 的差异参数在
+# _ffmpeg_encode_ok 里用「真实小编码」验证（存在 ≠ 能在本驱动上打开）。
+_CODEC_CANDIDATES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("h264_nvenc", ("-preset", "p4", "-cq", "20")),
+    ("libx264", ("-preset", "veryfast", "-crf", "18")),
+)
+
+
+def _find_ffmpeg_bin() -> Optional[str]:
+    """找可用的 ffmpeg：TT_FFMPEG 环境变量 > 本机自编 NVENC 版 > PATH。"""
+    forced = os.environ.get("TT_FFMPEG", "")
+    if forced and os.path.isfile(forced):
+        return forced
+    if os.path.isfile(_TOOLS_FFMPEG):
+        return _TOOLS_FFMPEG
+    return shutil.which("ffmpeg")
+
+
+def _ffmpeg_has_encoder(ffmpeg: str, codec: str) -> bool:
+    """ffmpeg -encoders 里是否注册了该编码器（不保证能在本驱动上打开）。"""
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return False
+    return f" {codec} " in out
+
+
+@functools.lru_cache(maxsize=None)
+def _ffmpeg_encode_ok(ffmpeg: str, codec: str, args: Tuple[str, ...]) -> bool:
+    """跑一次真实小编码：编码器能打开 + mp4 能落盘才算数。
+
+    BtbN「latest」的 h264_nvenc 就是反例：-encoders 里在，但驱动 580 只支持
+    nvenc API 13.0、它要 13.1 → 一打开就报错。所以必须实测，不能只看清单。
+    """
+    # yuv420p 3 帧小图（内容无关，只验证能开）；直接 feed 文件头里 160x120。
+    frame = bytearray(160 * 120)          # Y = 灰渐变（任意值即可）
+    for i in range(160 * 120):
+        frame[i] = i & 0xFF
+    frame += bytes([128]) * (160 * 120 // 2)   # U/V = 128
+    frame = bytes(frame) * 3
+    with tempfile.TemporaryDirectory(prefix="tt_enc_probe_") as td:
+        cmd = [ffmpeg, "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "yuv420p", "-video_size", "160x120",
+               "-r", "30", "-i", "pipe:0", "-c:v", codec, *args,
+               os.path.join(td, "probe.mp4")]
+        try:
+            p = subprocess.run(cmd, input=frame, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30)
+            return p.returncode == 0
+        except Exception:
+            return False
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_encoder() -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+    """一次性解析用哪个编码器 → (ffmpeg, codec, args)；None = 走 cv2 mp4v 兜底。
+
+    可用 ``TT_RECORDER_CODEC=auto|nvenc|x264|cv2`` 强制指定（默认 auto：
+    有 h264_nvenc 且能打开就用它，否则 libx264，再否则 cv2）。
+    """
+    force = os.environ.get("TT_RECORDER_CODEC", "auto").strip().lower()
+    if force == "cv2":
+        return None
+    ffmpeg = _find_ffmpeg_bin()
+    if not ffmpeg:
+        return None
+    only = {"nvenc": "h264_nvenc", "x264": "libx264"}.get(force)  # None = auto
+    for codec, args in _CODEC_CANDIDATES:
+        if only is not None and codec != only:
+            continue
+        if not _ffmpeg_has_encoder(ffmpeg, codec):
+            continue
+        if _ffmpeg_encode_ok(ffmpeg, codec, args):
+            return (ffmpeg, codec, args)
+    return None
+
+
+class _FfmpegWriter:
+    """ffmpeg 子进程编码（nvenc/x264）。灰度帧在 Python 侧转成 yuv420p 直接喂。
+
+    为什么喂 yuv420p 而不是 gray：gray 会让 ffmpeg 每帧做一次软件上采样
+    （swscale gray→yuv420p）——本机实测正是这堵墙把 4 路压到 ~93fps/路；
+    改喂 yuv420p（灰度图没有颜色，U/V 恒 128=中性灰，逐帧只变 Y 平面）后
+    4 路飙到 ~168fps/路。Python 侧代价只是一次 Y 拷贝 + 两个 os.write。
+    """
+    ok = False
+
+    def __init__(self, ffmpeg: str, codec: str, args: Tuple[str, ...],
+                 path: str, fps: float, w: int, h: int) -> None:
+        # w/h 必须偶数（yuv420p / nvenc 要求）；调用方保证偶数才进 ffmpeg 分支
+        self._fd = None
+        self.path = path
+        self._chroma = bytes([128]) * (w * h // 2)   # U+V 两平面恒 128，只建一次
+        self._proc = subprocess.Popen(
+            [ffmpeg, "-y", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "yuv420p",
+             "-video_size", f"{w}x{h}", "-r", str(int(fps)),
+             "-i", "pipe:0",
+             "-c:v", codec, *args, path],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self._fd = self._proc.stdin.fileno()
+        self.ok = self._proc.poll() is None
+
+    def write(self, gray: np.ndarray) -> bool:
+        """写一帧灰度图。返回 False = 编码进程已死（丢帧/中断）。"""
+        try:
+            os.write(self._fd, gray.tobytes())       # Y 平面（1.55MB @1080p）
+            os.write(self._fd, self._chroma)         # U/V 平面（0.78MB @1080p）
+            return True
+        except (BrokenPipeError, OSError):
+            return False
+
+    def close(self) -> None:
+        """关 stdin → 等 ffmpeg 收尾写 moov → 报退出码。"""
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        except Exception:      # 进程已死时可能 ValueError/BrokenPipe，忽略
+            pass
+        try:
+            rc = self._proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+            rc = self._proc.returncode
+        if rc != 0:
+            try:
+                err = (self._proc.stderr.read() or b"").decode("utf-8", "replace")
+            except Exception:
+                err = ""
+            print(f"[录像] ⚠ {os.path.basename(self.path)} 编码进程退出码 {rc}"
+                  f"：{err[-300:] if err else '无 stderr'}")
+
+
+class _Cv2Writer:
+    """兜底：OpenCV mp4v（本机 1440×1080 噪声内容 ~44fps/路，跟不上 100fps，
+    正常情况不该走到这里——只有机器上没有可用 ffmpeg 时才用）。"""
+
+    def __init__(self, path: str, fps: float, w: int, h: int) -> None:
+        self.path = path
+        self._vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*_FOURCC), fps, (w, h))
+        self._ok = self._vw.isOpened()
+
+    def write(self, gray: np.ndarray) -> bool:
+        if not self._ok:
+            return False
+        bgr = gray if gray.ndim == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        self._vw.write(bgr)
+        return True
+
+    def close(self) -> None:
+        if self._ok:
+            self._vw.release()
+
+
+def _open_writer(path: str, fps: float, w: int, h: int, gray2d: bool = True):
+    """按机器能力开一个 writer；全失败返回 None（文件作废）。
+
+    ffmpeg 分支只吃 2D 灰度（yuv420p 直喂按 Y 平面拷）；彩色帧走 cv2 兜底。
+    """
+    plan = _resolve_encoder()
+    if plan is not None and gray2d and w % 2 == 0 and h % 2 == 0:
+        try:
+            wr = _FfmpegWriter(*plan, path, fps, w, h)
+            if wr.ok:
+                return wr
+            wr.close()
+        except Exception as e:
+            print(f"[录像] ✗ ffmpeg 启动失败，回退 cv2：{e}")
+    try:
+        wr = _Cv2Writer(path, fps, w, h)
+        if wr._ok:
+            return wr
+        wr.close()
+    except Exception:
+        pass
+    return None
+
+
 class _CameraWriter(threading.Thread):
-    """一台相机一个编码线程：消费有界队列里的灰度帧 → BGR mp4v + 攒设备时间戳。"""
+    """一台相机一个编码线程：消费有界队列里的灰度帧 → 编码落盘 + 攒设备时间戳。"""
 
     def __init__(self, cam, path: str, fps: float, max_queue: int = _MAX_QUEUE) -> None:
         super().__init__(name=f"rec-cam{cam.logical_id}", daemon=True)
@@ -138,29 +332,29 @@ class _CameraWriter(threading.Thread):
 
     # -- 编码线程侧 -----------------------------------------------------------
     def run(self) -> None:
-        vw: Optional[cv2.VideoWriter] = None
+        enc = None  # _FfmpegWriter / _Cv2Writer，首个有图帧才开（需要 w/h）
         try:
             while True:
                 frame = self._q.get()
                 if frame is None:
                     break
                 gray = frame.image
-                if vw is None:
+                if enc is None:
                     h, w = gray.shape[:2]
-                    vw = cv2.VideoWriter(
-                        self.path, cv2.VideoWriter_fourcc(*_FOURCC), self.fps, (w, h))
-                    if not vw.isOpened():
+                    enc = _open_writer(self.path, self.fps, w, h, gray.ndim == 2)
+                    if enc is None:
                         print(f"[录像] ✗ 打不开编码器，文件作废：{self.path}")
                         break
                     self._first_ts = int(frame.device_timestamp)
-                bgr = gray if gray.ndim == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                vw.write(bgr)
+                if not enc.write(gray):
+                    print(f"[录像] ✗ 编码线程写入失败，中断：{self.path}")
+                    break
                 self._ts.append(int(frame.device_timestamp))
                 self.count += 1
                 self._last_ts = int(frame.device_timestamp)
         finally:
-            if vw is not None:
-                vw.release()
+            if enc is not None:
+                enc.close()
             self._first_ts = self._first_ts if self._first_ts is not None else 0
             self._last_ts = self._last_ts if self._last_ts is not None else 0
 
