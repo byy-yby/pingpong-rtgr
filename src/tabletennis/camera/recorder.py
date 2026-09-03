@@ -401,6 +401,11 @@ class SessionVideoRecorder:
         """开录：建目录、给每台相机开编码线程并挂上帧 sink。"""
         if self._started:
             return
+        # 提前解析编码器（含一次冷 NVENC 实测，见 _ffmpeg_encode_ok）。必须在这跑、
+        # 不能等首帧：若留到编码线程收到第一帧才触发，探测耗时会让 4 个线程全堵在
+        # lru_cache 锁上、队列溢出——实测第一次录像开头四路各丢 ~44 帧（20260903_141311）。
+        # sink 还没挂上 = 没帧在流 = 这段冷启动代价无害。
+        _resolve_encoder()
         os.makedirs(self.session_dir, exist_ok=True)
         # mp4 头标称帧率（只影响播放速度）。构造时由调用方按触发模式给 100/30。
         fps = self.fps if self.fps is not None else 100.0
