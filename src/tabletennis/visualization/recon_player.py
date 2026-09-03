@@ -125,6 +125,7 @@ class ReconTimeline:
         self.ball_X = np.zeros((0, 3), dtype=np.float64)
         self.ball_valid = np.zeros(0, dtype=bool)
         self.ball_pos: Dict[int, np.ndarray] = {}
+        self._people_cache: Dict[str, List[dict]] = {}
         self.reload()
 
     # ------------------------------------------------------------------
@@ -250,15 +251,22 @@ class ReconTimeline:
         """读 t 处 npz：返回 ``[{vertices (6890,3), joints (24,3)}, ...]``（多人）。
 
         旧单帧格式（无 ``n_people``）当作 1 人；新格式 person 0 无后缀、p≥1 用 ``_p``。
-        读失败返回空列表。
+        读失败返回空列表。结果按文件路径缓存（同一帧被 hold_gaps/stride 复用时不再解压）。
         """
         path = self.person_path_at(t)
         if path is None:
             return []
+        return self._load_people_path(path)
+
+    def _load_people_path(self, path: str) -> List[dict]:
+        """按路径读一帧（带内存缓存）；失败不缓存，下次可重试（watch 半截文件）。"""
+        cached = self._people_cache.get(path)
+        if cached is not None:
+            return cached
+        out: List[dict] = []
         try:
             with np.load(path) as z:
                 n_people = int(z["n_people"]) if "n_people" in z else 1
-                out = []
                 for p in range(n_people):
                     suf = "" if p == 0 else f"_{p}"
                     verts = np.asarray(z[f"vertices{suf}"], np.float32).reshape(-1, 3)
@@ -266,10 +274,21 @@ class ReconTimeline:
                     if f"joints{suf}" in z:
                         joints = np.asarray(z[f"joints{suf}"], np.float32).reshape(-1, 3)
                     out.append({"vertices": verts, "joints": joints})
-                return out
         except Exception as exc:  # noqa: BLE001 —— 重建正在写/文件半截
-            print(f"[recon_player] ⚠ t={t} 读帧失败：{exc}")
+            print(f"[recon_player] ⚠ 读帧失败：{exc}")
             return []
+        self._people_cache[path] = out
+        return out
+
+    def preload(self) -> None:
+        """把已存在的成功帧全部读进内存（回放前预热）。
+
+        逐帧 ``np.load`` + 解压 ~1.1ms，100fps 下占掉一帧预算的 1/10 且带磁盘 I/O
+        抖动；预热后回放不再碰磁盘。内存 ≈ 帧数 × 人数 × (6890+24)×3×4B
+        （本例 713 帧 2 人 ≈ 118MB），短视频完全可接受。watch 模式别用（帧还在写）。
+        """
+        for path in self.files.values():
+            self._load_people_path(path)
 
     # ------------------------------------------------------------------
     # 球轨迹（ball_trajectory.npz）：ball_pos_at 取当前/coast 位置，
@@ -449,7 +468,7 @@ def bake_body_shading(normals, skin=_SMPL_SKIN, ambient=_BAKE_AMBIENT,
 
 
 def convex_hull2d(points) -> Optional[np.ndarray]:
-    """二维凸包（Andrew monotone chain，纯 numpy/Python，CCW 有序）。
+    """二维凸包（CCW 有序）：优先 ``cv2.convexHull``（C 速度），缺 cv2 回退纯 numpy。
 
     为什么不用 open3d ``PointCloud.compute_convex_hull``：投影点全落在同一个
     ``z=const`` 平面上，3D qhull 会因退化输入抛精度错（QH6154）或每帧往 stderr
@@ -462,6 +481,22 @@ def convex_hull2d(points) -> Optional[np.ndarray]:
     arr = np.asarray(points, np.float64).reshape(-1, 2)
     if len(arr) < 3:
         return None
+    # 快路径：cv2.convexHull（Sklansky，C 实现）。回放每帧都要算整身投影软影的凸包，
+    # 纯 numpy 的 monotone chain 在 ~2300 点上要 ~2ms/人（实测），cv2 只要 ~0.1ms
+    # （~17×），是播放流畅的关键一环。clockwise=False 在数学 xy 坐标下恰好返回 CCW
+    # （实测单位正方形 shoelace 面积 +1），可直接当三角扇用；全共线时返回 2 点，
+    # 由下方 <3 判断兜成 None。
+    try:
+        import cv2
+        hull = cv2.convexHull(arr.astype(np.float32),
+                              clockwise=False, returnPoints=True)
+        hull = np.asarray(hull, np.float64).reshape(-1, 2)
+        if len(hull) < 3:
+            return None                        # 全共线
+        return hull
+    except Exception:  # noqa: BLE001 —— cv2 不可用则回退纯 numpy（下）
+        pass
+    # 回退：纯 numpy monotone chain（无 cv2 依赖时仍可用；本段为旧实现原样保留）。
     # 一次 C 速度 lexsort 得到按 x/y 有序的 tuple 列表。别用 `for x,y in arr` 迭代
     # numpy 2D 行（每行造 view，2300 行 ~10ms，cast 每帧调用会拖垮播放）；
     # monotone chain 的 cross<=0 会把重复/共线点 pop 掉，无需显式去重。
@@ -540,6 +575,7 @@ class ReconScene:
         self._mat_ball.shader = "defaultUnlit"   # 小球不参与光照，保证 2cm 红球始终醒目
         self._last_t = None
         self._last_n_people = 0
+        self._applied_path: Optional[str] = None   # 上一帧显示的人体 npz 路径（复用则跳过重建）
         self.n_added = 0
 
     # ------------------------------------------------------------------
@@ -760,6 +796,9 @@ class ReconScene:
 
     def apply_people(self, scene, t: int) -> bool:
         """把 t 处的（可能多个）人体喂给场景。返回 True 表示本帧有人体被显示。"""
+        path = self.tl.person_path_at(t)
+        if path is not None and path == self._applied_path and self._last_n_people > 0:
+            return True        # 与上一帧同一份结果（hold_gaps/stride 复用）→ 几何已就位
         people = self.tl.load_people(t)
         o3d = self.o3d
         # 总是先移除上一帧的人体几何，再按当前状态重建（简单且无残留）
@@ -771,6 +810,7 @@ class ReconScene:
                 except Exception:  # noqa: BLE001
                     pass
         self._last_n_people = len(people)
+        self._applied_path = path
         if not people:
             self._last_t = None
             return False
@@ -997,26 +1037,28 @@ class _PlayerApp:
 
     def run(self) -> None:
         self._setup()
-        last = time.perf_counter()
+        next_due = time.perf_counter()
+        was_playing = self.playing
         while self.app.run_one_tick():
             now = time.perf_counter()
-            dt = now - last
-            last = now
             if self.watch:
                 self._watch_poll(now)
-            self._advance(dt)
-            self._show()
-            if self.watch:
-                time.sleep(0.005)
-            elif self.playing:
-                # 按内容帧边界 pacing：t 走到下一个整数帧所需时间就是理想的休眠
-                # （渲染跟得上时 dt 均匀、丢帧由「整数帧变化才画」决定而非抖动）；
-                # 渲染慢则 wait<=0 不睡 → 自然追赶，保持实时语义。
-                rate = max(1.0, self.speed * self.fps)
-                wait = (int(self.t) + 1 - self.t) / rate
-                time.sleep(min(wait, 0.02) if wait > 0 else 0.0)
+            if self.playing:
+                if not was_playing:
+                    next_due = now          # 暂停→播放：重置调度，不连补欠账
+                self._show()
+                self._step_forward()
+                budget = 1.0 / max(1.0, self.speed * self.fps)
+                next_due += budget
+                if next_due < now:
+                    next_due = now          # 渲染慢于目标：不睡，逐帧追（不掉帧）
+                delay = next_due - time.perf_counter()
+                if delay > 0:
+                    time.sleep(min(delay, 0.02))
             else:
+                self._show()
                 time.sleep(0.02)
+            was_playing = self.playing
         self.win.close()
 
     # -- watch：重建进行中，周期性重扫输出目录，追新帧 ----------------------
@@ -1058,21 +1100,26 @@ class _PlayerApp:
         w.set_view_controls(self.gui.SceneWidget.Controls.ROTATE_CAMERA)  # 左拖旋转/右拖平移/滚轮缩放
         w.set_on_key(self._on_key)
         print(f"[回放] 目标 ≈{self.fps * self.speed:.0f} 帧/秒（录制 {self.fps:.0f}fps 实时）。"
-              f"显示若跟不上会自动掉帧；- / + 半速/倍速可调。")
+              f"每帧都渲染（跟得上=实时，跟不上=平滑慢放不跳帧）；- / + 半速/倍速可调。")
         print("[回放] 鼠标：左拖=旋转/右拖=平移/滚轮=缩放；Space=暂停/继续，←/→=步进，"
               "Home/End=首/尾，R=复位视角，Esc=退出")
         if self.overlay is not None and self.overlay.available:
             print("[回放] V=开关 2D 检测叠加窗口（四路视频 + 球框 + 关键点）")
 
-    def _advance(self, dt: float) -> None:
-        if not self.playing:
-            return
+    def _step_forward(self) -> None:
+        """前进一帧：每帧都渲染（不按墙钟跳帧），保证动作连续不顿。
+
+        目标速度 = ``speed * fps``；渲染快于目标时靠 ``run`` 里的调度休眠对齐实时，
+        渲染慢于目标时逐帧渲染、自然慢放（宁慢勿跳）。到末尾自动暂停。
+        """
         n = max(0, self.tl.n_ref - 1)
-        if n <= 0:
+        if n <= 0 or self.t >= n:
+            self.t = float(n)
+            self.playing = False
             return
-        self.t += dt * self.speed * self.fps
-        if self.t > n:
-            self.t = n
+        self.t += 1.0
+        if self.t >= n:
+            self.t = float(n)
             self.playing = False
 
     def _show(self) -> None:
@@ -1188,6 +1235,8 @@ def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
                          cast_shadow=cast_shadow, ball_trail=ball_trail)
     if fps <= 0:
         fps = tl.ref_rate_hz
+    if not watch:
+        tl.preload()   # 预热：把全部成功帧读进内存，免回放时逐帧解压磁盘 I/O
     if tl.n_ref > 1 or not watch:
         print(f"[回放] {os.path.basename(out_dir)}：主时钟 {tl.n_ref} 帧，成功 {tl.n_ok()}，"
               f"faces={'有' if faces is not None else '缺'}"
