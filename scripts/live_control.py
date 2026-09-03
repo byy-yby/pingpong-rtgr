@@ -220,6 +220,11 @@ class LiveControl:
         # 球重建独立线程（跑满检测速率，不随 2D 显示降速）
         self._ball_recon_running = False
         self._ball_recon_thread: Optional[threading.Thread] = None
+        # 球轨迹滤波（按 F）：卡尔曼平滑 + 短遮挡补帧 + 长遮挡消失
+        self.ball_filter = False
+        self._ball_tracker = None      # BallTracker（滤波 ON 时实例化，OFF 时 None）
+        self._ball_last_t = None       # 上一帧滤波时刻（秒），算真实 dt
+        self._filter_rect = (0, 0, 0, 0)   # 滤波按钮命中区域（画布坐标）
 
         # EasyMocap SMPL 重建（按 S）：独立姿态检测器 + EasyMocap 拟合器 + 后台线程
         self._em_pose_detector = None        # 专用 RTMPose 检测器（与 pose 路径隔离）
@@ -464,6 +469,9 @@ class LiveControl:
             self.toggle_imu()
         if key == ord("v"):
             self.toggle_record_video()
+            return
+        if key == ord("f"):
+            self.toggle_ball_filter()
             return
         for kind, (_, k) in DETECTION_TOGGLES.items():
             if key == ord(k):
@@ -1026,9 +1034,34 @@ class LiveControl:
         self._ball3d = None
         self._ball_ready = False
         self._ball_pending_viewer = False
+        self._ball_tracker = None
+        self._ball_last_t = None
         if self.viewer3d is not None:
             self.viewer3d.set_ball(None)
         print("[检测] 球: OFF")
+
+    def toggle_ball_filter(self) -> None:
+        """按 F 开关球轨迹滤波：卡尔曼平滑 + 短遮挡补帧 + 长遮挡（连续 >10 帧无球）消失。
+
+        滤波 OFF 时走原「逐帧纯 DLT」；ON 时用 BallTracker 用真实帧间隔 dt 做平滑，
+        无测量（<2 视角 / 三角化失败）就沿速度外推补帧，连续缺测超过 max_coast 判失联
+        （reset + 返回 None → 3D 球消失）。切 OFF 再 ON 会新建 tracker，不继承旧状态。
+        """
+        if not self.ball_filter:
+            from tabletennis.reconstruction import BallTracker
+            # 先建 tracker 再置 ball_filter：重建线程见 True 时 tracker 已就绪（无空窗）
+            self._ball_tracker = BallTracker(
+                dt=0.01, process_noise=1000.0, meas_noise_m=0.002,
+                gate_m=0.3, min_conf=0.0, max_coast=10,
+            )
+            self._ball_last_t = None
+            self.ball_filter = True
+            print("[球] 滤波 ON：卡尔曼平滑 + 短遮挡补帧 + 连续 >10 帧无球则消失")
+        else:
+            self.ball_filter = False
+            self._ball_tracker = None
+            self._ball_last_t = None
+            print("[球] 滤波 OFF：逐帧纯 DLT")
 
     # ------------------------------------------------------------------
     # 球重建独立线程（跑满检测速率，不随 2D 显示降速）
@@ -1085,7 +1118,11 @@ class LiveControl:
                 detect_ms = 0.0
 
     def _reconstruct_ball_frame(self) -> None:
-        """各相机球检测（每帧一次）→ 置信度加权 DLT 三角化 → Open3D 球层（无卡尔曼）。"""
+        """各相机球检测（每帧一次）→ 置信度加权 DLT 三角化 → Open3D 球层。
+
+        滤波 OFF：逐帧纯 DLT（无卡尔曼）。滤波 ON：BallTracker 用真实帧间隔 dt 平滑，
+        <2 视角/三角化失败就沿速度外推补帧，连续 >max_coast 帧失联则球消失。
+        """
         detector = self.detectors["ball"]
         frames_items = [
             (cid, f) for cid, f in sorted(self._latest.items()) if f is not None
@@ -1126,21 +1163,51 @@ class LiveControl:
         # conf 0.25~0.3 的球（2D 已显示）滤掉 → 3D 不渲染。降到低于检测器阈值，
         # 由几何校验（重投影误差/交会角）兜底。
         res = triangulate_ball(single, self._triangulator, min_conf=0.15) if len(single) >= 2 else None
-        if res is not None:
-            X, conf, err, n_views, ang = res
-            # 逐帧直接用 DLT 结果（无卡尔曼预测），每一帧 3D 都来自视觉系统
-            self._ball3d = X
-            if self.viewer3d is not None:
-                self.viewer3d.set_ball(X)
-        else:
+
+        # 诊断：检测到球但三角化失败（限频 1s，定位 3D 不显示原因）
+        def _diag_triang_fail() -> None:
+            if not single or (
+                self._ball_diag_t is not None and time.time() - self._ball_diag_t < 1.0
+            ):
+                return
+            self._ball_diag_t = time.time()
+            confs = {cid: f"{b[0].confidence:.2f}" for cid, b in balls_per_cam.items() if b}
+            print(f"[球诊断] {len(single)} 视角检出 conf={confs}，三角化失败（视角不足/交会角过小）")
+
+        if not self.ball_filter:
+            # 滤波 OFF：逐帧纯 DLT，每一帧 3D 都来自视觉系统
+            if res is not None:
+                X, _conf, _err, _nv, _ang = res
+                self._ball3d = X
+                if self.viewer3d is not None:
+                    self.viewer3d.set_ball(X)
+            else:
+                self._ball3d = None
+                if self.viewer3d is not None:
+                    self.viewer3d.set_ball(None)
+                _diag_triang_fail()
+            return
+
+        # 滤波 ON：卡尔曼平滑（真实 dt）+ 短遮挡补帧 + 长遮挡消失
+        if self._ball_tracker is None:   # 防御：toggle 建 tracker 前的极短窗口
+            return
+        now = time.time()
+        dt = (now - self._ball_last_t) if self._ball_last_t is not None else None
+        self._ball_last_t = now
+        if dt is not None and not (0.002 <= dt <= 0.1):
+            dt = 0.01   # 帧间隔异常（重复处理/卡顿）→ 回退默认，防预测爆炸
+        X_meas = res[0] if res is not None else None
+        Xf = self._ball_tracker.update(X_meas, 1.0, dt=dt)
+        if Xf is None:
+            # 失联（连续 >max_coast 帧无球，球落桌/打飞）→ 球消失，不再渲染
             self._ball3d = None
             if self.viewer3d is not None:
                 self.viewer3d.set_ball(None)
-            # 诊断：检测到球但三角化失败（限频 1s，定位 3D 不显示原因）
-            if single and (self._ball_diag_t is None or time.time() - self._ball_diag_t >= 1.0):
-                self._ball_diag_t = time.time()
-                confs = {cid: f"{b[0].confidence:.2f}" for cid, b in balls_per_cam.items() if b}
-                print(f"[球诊断] {len(single)} 视角检出 conf={confs}，三角化失败（视角不足/交会角过小）")
+            _diag_triang_fail()
+        else:
+            self._ball3d = Xf
+            if self.viewer3d is not None:
+                self.viewer3d.set_ball(Xf)
 
     # ------------------------------------------------------------------
     # EasyMocap SMPL 重建（按 S，不依赖三角测量）
@@ -1312,6 +1379,12 @@ class LiveControl:
             self.toggle_record_video()
             return
 
+        # 滤波按钮
+        fx0, fx1, fy0, fy1 = self._filter_rect
+        if fx0 <= x <= fx1 and fy0 <= y <= fy1:
+            self.toggle_ball_filter()
+            return
+
         # 保存按钮
         bx0, bx1, by0, by1 = self._save_rect
         if bx0 <= x <= bx1 and by0 <= y <= by1:
@@ -1468,6 +1541,19 @@ class LiveControl:
         cv2.putText(panel, txt, (rx0 + 8, ry0 + 24), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (255, 255, 255), 1, cv2.LINE_AA)
         self._record_rect = (rx0, rx1, y_offset + ry0, y_offset + ry1)
+
+        # 滤波按钮（录像按钮左侧；绿=ON，灰=OFF）
+        fx0, fx1 = w - 490, w - 334
+        fy0, fy1 = by0, by1
+        filt_on = self.ball_filter
+        fill = (40, 110, 40) if filt_on else (60, 60, 60)
+        edge = (0, 255, 0) if filt_on else (120, 120, 120)
+        cv2.rectangle(panel, (fx0, fy0), (fx1, fy1), fill, -1, cv2.LINE_AA)
+        cv2.rectangle(panel, (fx0, fy0), (fx1, fy1), edge, 1, cv2.LINE_AA)
+        txt = "滤波 ON [f]" if filt_on else "滤波 off [f]"
+        cv2.putText(panel, txt, (fx0 + 8, fy0 + 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        self._filter_rect = (fx0, fx1, y_offset + fy0, y_offset + fy1)
         return panel
 
     def _draw_hint(self, w: int) -> np.ndarray:
@@ -1488,7 +1574,7 @@ class LiveControl:
         elif time.time() < self._save_flash_until:
             cv2.putText(hint, "已保存 ✓", (w - 110, 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [t]球桌+3D [s]EasyMocap [i]imu [r]录制 [v]录像4路 保存=按钮  退出:[q]/ESC/X",
+        cv2.putText(hint, "拖滑块调参  [p]姿态 [b]球 [f]滤波 [t]球桌+3D [s]EasyMocap [i]imu [r]录制 [v]录像4路 保存=按钮  退出:[q]/ESC/X",
                     (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
         return hint
 
