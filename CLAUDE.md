@@ -82,7 +82,17 @@
 - 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）。
 - 每个方法里自己 `o3d = _o3d()` 惰性 import（`_update_ball_geometry` 曾漏写致渲染线程 NameError 窗口退出）；Open3D 窗口必须在主线程开，后台线程只加载模型。
 
+<<<<<<< HEAD
 ### IMU 姿态（维特智能 WT9011DCL-BT5.0，按 i）
+=======
+### 离线重建回放 `recon_player.py` + `scripts/visualize_recon.py`
+
+- `scripts/reconstruct_video.py` 每帧存 `frame_NNNNNN.npz`（vertices/joints/…）时**多写一次 `recon_faces.npy`**（13776×3 SMPL 拓扑，整段一次，`ensure_faces`）。
+- `scripts/visualize_recon.py <recon目录>` 弹出 Open3D 新渲染器窗口逐帧回放（`--watch` 重建进行中追帧；`--render T out.png` EGL 出 PNG；`--root` 指定含标定的项目根）。t 是主时钟帧号：no_person/失败帧清空人体，被 `--stride` 跳过帧保持上一姿态（`ReconTimeline`）。
+- **播放观感（三处曾踩的坑，2026-09）**：① 播放速度按**内容帧边界 pacing**——目标 = 录像真实出帧率（meta 里 period 反推，100fps 录制=实时），标题栏实时显示 `≈N帧/秒`；渲染跟不上自动掉帧不慢放，别用固定 sleep。② **必须 `widget.force_redraw()`**（每次换帧后）——否则场景变了事件流不保证重绘，观感一卡一卡/跳帧。③ 100Hz 拟合常单帧/两三帧 no_person 抖动 → `--hold-gaps`（默认 3≈30ms）：连续 no_person ≤N 帧保持上一姿态不清空（`ReconTimeline.hold_gaps`），否则人体高频闪没。
+- **坑：本机 Filament 太阳定向光不生效**（EGL headless 与屏幕窗口都是 OpenGL 4.1，翻转太阳方向画面像素不变；只剩环境漫反射）→ 人体用 IBL 漫反射着色，假影用 `defaultLitTransparency` 混合。**影子两层都画在地板平面 `floor_z`（不是脚平面）**：重建 SMPL 脚底常悬空几 cm（142020 实测 median -0.713 vs floor -0.76），贴脚画盘会悬在地板上方成脱开深斑。① 接触椭圆 `contact_shadow_planes`（脚底核心深影）② 整身投影软影 `project_floor_shadow`+`convex_hull2d`（**纯 numpy 2D monotone-chain**，投影点全在同平面——open3d `compute_convex_hull` 会因退化抛 QH6154/每帧打 QH7089 精度告警刷屏；质心 apex 三角扇 CCW → 法线 +Z）——垂直俯视桌顶时人影被桌面挡住看不见（取景限制，侧视/低视角可见），这是物理遮挡不是 bug。透明材质必须显式 `shader="defaultLitTransparency"`——`base_color` alpha 默认不混合。
+- 键盘：Space 播放/暂停、←/→ 步进、Home/End、R 复位、-/= 调速、Esc 退出。
+>>>>>>> worktree-easymocap-recon
 
 `scripts/live_control.py` 按 **i** 读插在拍柄末端的 IMU：3D 窗口里球拍**朝向来自 IMU**（notify 线程 100Hz 直接推 `viewer3d.set_imu_orientation`，绕开主循环 ~20FPS），**位置绑到检测到的右手腕**（主循环每帧 `right_wrist_anchor` 选「离桌面原点最近的有效右手腕」→ `set_imu_anchor`，两人时即按 i 放拍在原点那一侧）。代码在 `src/tabletennis/imu/`：
 - `witmotion.py`：0x55 协议解析 + 角度/四元数 -> 旋转矩阵（纯 numpy，无 I/O）。WT9011DCL 走**蓝牙 5.0 (BLE)**，默认 **0x61 组合包**（加速度6B+角速度6B+角度6B）@10Hz（可 0.2~200Hz），角度 int16/32768×180°、欧拉 Z-Y-X；兼容经典 0x53 角度 / 0x59 四元数。

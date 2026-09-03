@@ -7,10 +7,13 @@
 - 场景 = 桌面系（与重建/在线 3D 一致）：桌面（z=0）+ 地面（z=-height）+ 相机视锥。
 - 人体 = 每帧一个 SMPL 网格（13776 面，肤色，PBR），**逐帧重建网格 + 计算法线按环境
   光着色**——不是一片白（旧 ``Visualizer`` 的坑是法线没重算，渲染成 unlit 平面白）。
-- 阴影 = 本机 Filament 的**太阳定向光不生效**（实测 EGL 与屏幕窗口翻转太阳方向像素
-  不变，只剩环境漫反射），故用程序化**接触软影**：按太阳水平方向在人物脚下画两层
-  半透明椭圆（``defaultLitTransparency``）。Filament 窗口本身走 ``SOFT_SHADOWS``
-  提供环境光；在太阳光可用的机器上会额外叠加真实阴影，二者方向一致。
+- 阴影 = 本机 Filament 的**太阳定向光不生效**（实测 EGL 与屏幕窗口翻转太阳方向画面
+  像素不变，只剩环境漫反射），故用程序化假影（``defaultLitTransparency`` 透明混合，
+  **两层都画在地板平面 ``floor_z`` 上**——重建的 SMPL 脚底常悬空几 cm，贴脚画盘会
+  悬在地板上方）：① 两片脚下接触椭圆（核心深影，把足底到地板的空间感压实）；
+  ② **整身投影软影**：把所有 SMPL 顶点沿光水平方向投到地面 → 凸包填充盘，带身形
+  且随姿态伸长——合起来才是肉眼看得出的影子。Filament 窗口走 ``SOFT_SHADOWS``
+  提供环境光；太阳光可用的机器上会额外叠加真实阴影，二者方向一致。
 
 两个入口共用同一套 ``ReconScene``（把几何加进任意 ``Open3DScene``）：
 
@@ -84,9 +87,12 @@ class ReconTimeline:
                （该显示时刻之前最近一次成功帧，中间 no_person 会清空）。
         index_ready: recon_index.npz 是否存在（决定 empty 空窗是否精确）。
         ref_rate_hz: 参考相机出帧率（由 meta 里 period_s 反推，回放真实速度用）。
+        hold_gaps: 播放观感参数——连续 no_person ≤ hold_gaps 帧时不清空人体
+                   （保持上一成功帧），超过才清空。100Hz 下拟合常单帧/两三帧抖动
+                   掉点，直接清空会让人体高频闪没；默认 0 = 语义精确（与 index 一致）。
     """
 
-    def __init__(self, out_dir: str):
+    def __init__(self, out_dir: str, hold_gaps: int = 0):
         self.out_dir = out_dir
         self.meta = self._load_json("recon_meta.json")
         self.index_ready = os.path.exists(self._p("recon_index.npz"))
@@ -95,6 +101,7 @@ class ReconTimeline:
         self.n_ref = 0
         self.state = np.zeros(0, dtype=np.int64)
         self.ref_rate_hz = 100.0
+        self.hold_gaps = int(hold_gaps)
         self.reload()
 
     # ------------------------------------------------------------------
@@ -180,17 +187,27 @@ class ReconTimeline:
 
     # ------------------------------------------------------------------
     def _rebuild_state(self) -> None:
-        """state[t] = 该显示的 file 下标（最近一次成功帧，遇 empty 清空）。"""
+        """state[t] = 该显示的 file 下标（最近一次成功帧，遇 empty 清空）。
+
+        empty（no_person/fail）连续帧数 ≤ ``self.hold_gaps`` 时保持上一成功帧
+        （短抖动不闪没）；超过才清空，且清空后持续到下一成功帧。hold_gaps=0 时
+        与旧语义一致（一遇 empty 立刻清空）。非 empty 的 stride 跳过帧天然保持。
+        """
         state = np.full(max(1, self.n_ref), -1, dtype=np.int64)
         file_idx = {t: i for i, t in enumerate(sorted(self.files))}
         file_order = sorted(self.files)
         file_list = [self.files[t] for t in file_order]
         empty_set = set(self.empty_ts)
         latest = -1
+        empties = 0
         for t in range(len(state)):
-            if t in file_idx:
-                latest = file_idx[t]
             if t in empty_set:
+                empties += 1
+            else:
+                empties = 0
+                if t in file_idx:
+                    latest = file_idx[t]
+            if empties > self.hold_gaps:
                 latest = -1
             state[t] = latest
         self.state = state
@@ -248,7 +265,11 @@ def contact_shadow_planes(verts: np.ndarray, floor_z: float,
         return []
     verts = np.asarray(verts, np.float64)
     min_z = float(verts[:, 2].min())
-    z = max(min_z, floor_z) + 0.004            # 略高于所在平面防 z-fight
+    # 盘心 z 钉在地板平面上（与整身投影软影同层，见 _add_cast_shadow）：重建的
+    # SMPL 脚底常悬在地板上方几 cm（median ~-0.71 vs floor -0.76），若盘子贴脚
+    # 平面就会悬在地板上方，低视角看是一块脱开的深斑；画在地板才是真「地上
+    # 影子」，脚底那几 cm 空隙远看不可辨。盘心 xy 仍是立足点 + 沿影方向偏移。
+    z = floor_z + 0.004                 # 略高于地板防 z-fight
     feet = verts[verts[:, 2] <= min_z + 0.06]  # 脚底附近顶点 → 立足点
     if len(feet) == 0:
         fc = verts[:1, :2].mean(axis=0)
@@ -273,6 +294,77 @@ def contact_shadow_planes(verts: np.ndarray, floor_z: float,
 
 
 # ----------------------------------------------------------------------
+# 整身软影（cast shadow）：把整个人体顶点沿光水平方向投到地面，做一个
+# 「带身形的拉长影子」——两片小椭圆只有 ~0.3m，真场景里几乎看不见（实测
+# 1280×720 只影响 ~200px）；投影整身轮廓才看得出人在空间里有影子。
+# ----------------------------------------------------------------------
+_CAST_K = 0.5            # 每米高度沿影方向的伸长系数（太阳 ~63° 俯角的感觉）
+_CAST_ALPHA = 0.26       # 软影透明度（比接触盘淡，覆盖更大范围）
+_CAST_SUBSAMPLE = 3      # 顶点抽稀（6890→~2300，凸包足够；省建包时间）
+
+
+def convex_hull2d(points) -> Optional[np.ndarray]:
+    """二维凸包（Andrew monotone chain，纯 numpy/Python，CCW 有序）。
+
+    为什么不用 open3d ``PointCloud.compute_convex_hull``：投影点全落在同一个
+    ``z=const`` 平面上，3D qhull 会因退化输入抛精度错（QH6154）或每帧往 stderr
+    打 QH7089 精度告警（100fps 回放会刷屏），还得 ``joggle_inputs=True`` 才能跑。
+    直接对 ``(N,2)`` 做 2D 凸包没有这些坑，输出即 CCW 多边形。
+
+    Returns:
+        ``(M,2)`` 凸包顶点（CCW）；退化输入（<3 个不共线点 / 全共线）返回 None。
+    """
+    arr = np.asarray(points, np.float64).reshape(-1, 2)
+    if len(arr) < 3:
+        return None
+    # 一次 C 速度 lexsort 得到按 x/y 有序的 tuple 列表。别用 `for x,y in arr` 迭代
+    # numpy 2D 行（每行造 view，2300 行 ~10ms，cast 每帧调用会拖垮播放）；
+    # monotone chain 的 cross<=0 会把重复/共线点 pop 掉，无需显式去重。
+    xs = arr[:, 0]
+    ys = arr[:, 1]
+    order = np.lexsort((ys, xs))
+    pts = list(zip(xs[order].tolist(), ys[order].tolist()))
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]              # 首尾不重复，CCW
+    if len(hull) < 3:
+        return None                             # 全共线
+    return np.asarray(hull, np.float64)
+
+
+def project_floor_shadow(verts, floor_z: float, sun_dir=None, k: float = _CAST_K):
+    """把每个顶点沿光水平方向投影到地面，返回地面足迹 ``(N,2)``。
+
+    ``sun_dir`` 语义与 :func:`contact_shadow_planes` 一致：归一化光传播方向，
+    只用它的水平分量当「影子伸长方向」。头顶更高 → ``(z - floor_z)*k`` 越长的
+    影尾；脚底 z≈floor → 基本贴脚。纯 numpy，可单测。
+    """
+    if verts is None:
+        return np.empty((0, 2), np.float64)
+    verts = np.asarray(verts, np.float64)
+    n = len(verts)
+    if n == 0:
+        return np.empty((0, 2), np.float64)
+    sd = np.asarray(_SUN_DIR if sun_dir is None else sun_dir, np.float64)
+    h = sd[:2]
+    nh = float(np.linalg.norm(h))
+    e = np.array([1.0, 0.0]) if nh < 1e-6 else h / nh
+    tail = np.clip(verts[:, 2] - floor_z, 0.0, None) * k
+    return verts[:, :2] + tail[:, None] * e[None, :]
+
+
+# ----------------------------------------------------------------------
 # 场景：把桌面/地面/相机 + 人体几何喂给任意 Open3DScene
 # ----------------------------------------------------------------------
 class ReconScene:
@@ -280,7 +372,8 @@ class ReconScene:
 
     def __init__(self, tl: ReconTimeline, faces: Optional[np.ndarray],
                  table: Optional[Table3D] = None,
-                 camera_rig: Optional[tuple] = None):
+                 camera_rig: Optional[tuple] = None,
+                 cast_shadow: bool = True):
         o3d = _o3d()
         self.o3d = o3d
         self.tl = tl
@@ -288,6 +381,7 @@ class ReconScene:
         self.floor_z = -self.table.height
         self.intrinsics, self.extrinsics = (camera_rig or (None, None))
         self.faces = faces                       # (13776,3) int；None 则只画关节
+        self.cast_shadow = cast_shadow           # 脚下整身投影软影（默认开）
         self._mat_smpl = self._make_material(_SMPL_SKIN, roughness=0.62)
         self._mat_bones = self._make_material(_BONE_COLOR, roughness=0.8)
         self._last_t = None
@@ -407,6 +501,39 @@ class ReconScene:
         mr.base_color = [0.0, 0.0, 0.0, float(alpha)]
         scene.add_geometry(name, m, mr)
 
+    def _add_cast_shadow(self, scene, verts: np.ndarray) -> None:
+        """在人物脚下画整身投影软影：顶点沿光水平方向投到地面 → 凸包填充盘。
+
+        两片小接触椭圆（~0.3m）在真场景里小到几乎看不见；投影整身轮廓才能给出
+        一个「带身形、随姿态伸长」的影子，把 SMPL 人明显锚定在地面上。
+        """
+        o3d = self.o3d
+        v = np.asarray(verts, np.float64)
+        if len(v) < 8:
+            return
+        # 影平面固定在大地板上（不是脚平面）：重投影的人体可能因重建浮空几厘米，
+        # 影盘若贴脚平面就会悬在地板上方；画在 floor_z 才是真「影子在地上」。
+        z = self.floor_z + 0.004
+        proj = project_floor_shadow(v[::_CAST_SUBSAMPLE], self.floor_z)
+        hull = convex_hull2d(proj)               # 2D CCW 凸包（同平面，勿用 3D qhull）
+        if hull is None or len(hull) < 3:
+            return
+        # 质心 apex 三角扇填满凸多边形（凸包 CCW → 三角全 CCW → 法线 +Z 朝上）
+        c = hull.mean(axis=0)
+        ring = np.column_stack([hull, np.full(len(hull), z)])
+        verts3 = np.vstack([np.append(c, z), ring])
+        m0, m = 1, len(ring)
+        tris = np.array([[0, i, i + 1] for i in range(m0, m)] + [[0, m, m0]],
+                        np.int64)
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts3)
+        mesh.triangles = o3d.utility.Vector3iVector(tris)
+        mesh.compute_vertex_normals()
+        mr = o3d.visualization.rendering.MaterialRecord()
+        mr.shader = "defaultLitTransparency"
+        mr.base_color = [0.0, 0.0, 0.0, _CAST_ALPHA]
+        scene.add_geometry("cast", mesh, mr)
+
     def _add_axes(self, scene, origin: np.ndarray, name: str, size: float) -> None:
         o3d = self.o3d
         for i, col in enumerate([[1, 0, 0], [0, 1, 0], [0, 0, 1]]):
@@ -485,7 +612,7 @@ class ReconScene:
         person = self.tl.load_person(t)
         o3d = self.o3d
         # 总是先移除旧几何，再按当前状态重建（简单且无残留）
-        for name in ("person", "bones", "shadow0", "shadow1"):
+        for name in ("person", "bones", "cast", "shadow0", "shadow1"):
             try:
                 scene.remove_geometry(name)
             except Exception:  # noqa: BLE001
@@ -495,7 +622,9 @@ class ReconScene:
             return False
 
         verts = person["vertices"]
-        # 程序化接触阴影（画在人物网格之前，透明混合；见 contact_shadow_planes）
+        # 整身投影软影（大而淡，把人体锚在地面）→ 再叠两片小接触盘（脚底核心深影）
+        if self.cast_shadow:
+            self._add_cast_shadow(scene, verts)
         for d in contact_shadow_planes(verts, self.floor_z):
             self._add_shadow_disc(scene, d["name"], d["center"], d["e"],
                                   d["rx"], d["ry"], d["alpha"])
@@ -543,14 +672,16 @@ def load_faces(out_dir: str, easymocap_root: str = "") -> Optional[np.ndarray]:
 # 离线单帧渲染（EGL headless）——验证 / 出 PNG
 # ----------------------------------------------------------------------
 def render_still(tl: ReconTimeline, t: int, width: int = 1280, height: int = 720,
-                 out_png: str = "", root: Optional[str] = None) -> "np.ndarray":
+                 out_png: str = "", root: Optional[str] = None,
+                 cast_shadow: bool = True) -> "np.ndarray":
     """渲染主时钟 t 处一帧到 RGB ndarray（可选写 PNG），供回放/验证。"""
     import open3d as o3d
     o3d.visualization.rendering  # noqa: F401
     from tabletennis.reconstruction.triangulate import load_camera_rig
 
     faces = load_faces(tl.out_dir)
-    scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root))
+    scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root),
+                         cast_shadow=cast_shadow)
 
     r = o3d.visualization.rendering.OffscreenRenderer(width, height)
     sc = r.scene
@@ -609,7 +740,17 @@ class _PlayerApp:
                 self._watch_poll(now)
             self._advance(dt)
             self._show()
-            time.sleep(0.004)
+            if self.watch:
+                time.sleep(0.005)
+            elif self.playing:
+                # 按内容帧边界 pacing：t 走到下一个整数帧所需时间就是理想的休眠
+                # （渲染跟得上时 dt 均匀、丢帧由「整数帧变化才画」决定而非抖动）；
+                # 渲染慢则 wait<=0 不睡 → 自然追赶，保持实时语义。
+                rate = max(1.0, self.speed * self.fps)
+                wait = (int(self.t) + 1 - self.t) / rate
+                time.sleep(min(wait, 0.02) if wait > 0 else 0.0)
+            else:
+                time.sleep(0.02)
         self.win.close()
 
     # -- watch：重建进行中，周期性重扫输出目录，追新帧 ----------------------
@@ -649,8 +790,10 @@ class _PlayerApp:
         self.scene_b.set_lighting(scene)
         w.setup_camera(50.0, self.scene_b.bounds(), self.scene_b.center())
         w.set_on_key(self._on_key)
+        print(f"[回放] 目标 ≈{self.fps * self.speed:.0f} 帧/秒（录制 {self.fps:.0f}fps 实时）。"
+              f"显示若跟不上会自动掉帧；- / + 半速/倍速可调。")
         print("[回放] 鼠标拖=旋转/平移/滚轮缩放；Space=暂停/继续，←/→=步进，"
-              "Home/End=首/尾，R=复位视角，-/+=速度，Esc=退出")
+              "Home/End=首/尾，R=复位视角，Esc=退出")
 
     def _advance(self, dt: float) -> None:
         if not self.playing:
@@ -670,10 +813,12 @@ class _PlayerApp:
         self._need_show = False
         self.last_render_t = t0
         person = self.scene_b.apply_person(self.widget.scene, t0)
+        self.widget.force_redraw()     # 场景变了立即重绘，别等事件流捎带（否则卡/跳帧）
+        rate = self.speed * self.fps
         self.win.title = (f"EasyMocap 重建回放 — {os.path.basename(self.tl.out_dir)}"
                           f"  |  t {t0}/{max(0, self.tl.n_ref - 1)}"
                           f"  |  {'● 人物' if person else '— 无人'}"
-                          f"  |  x{self.speed:.1f}")
+                          f"  |  x{self.speed:.1f} ≈{rate:.0f}帧/秒")
 
     def _on_key(self, ev) -> bool:
         k = ev.key
@@ -710,14 +855,20 @@ class _PlayerApp:
 
 def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
              height: int = 720, fps: float = 0.0, watch: bool = False,
-             root: Optional[str] = None) -> None:
-    """在主线程弹出 Open3D 回放窗口并阻塞到关闭。``fps``<=0 用真实出帧率。"""
+             root: Optional[str] = None, hold_gaps: int = 0,
+             cast_shadow: bool = True) -> None:
+    """在主线程弹出 Open3D 回放窗口并阻塞到关闭。``fps``<=0 用真实出帧率。
+
+    ``hold_gaps``：连续 no_person ≤ 该帧数时播放保持上一姿态（见
+    :class:`ReconTimeline`），超过才清空——100Hz 拟合抖动掉的单帧不闪没人体。
+    """
     _o3d()  # 尽早暴露缺依赖
     from tabletennis.reconstruction.triangulate import load_camera_rig
 
-    tl = ReconTimeline(out_dir)
+    tl = ReconTimeline(out_dir, hold_gaps=hold_gaps)
     faces = load_faces(out_dir, easymocap_root)
-    scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root))
+    scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root),
+                         cast_shadow=cast_shadow)
     if fps <= 0:
         fps = tl.ref_rate_hz
     if tl.n_ref > 1 or not watch:
