@@ -5,17 +5,18 @@
   1) 读 session 文件夹里的 ``cam{cid}.mp4``（cid = 标定相机号）＋ ts 副产物；
   2) 按设备时间戳把四路重新对齐到主时钟相机（允许编码丢帧，见 video_source 文档）；
   3) 每个主时钟帧：各相机对齐帧 → 人检测(yolo11n-gray) + RTMPose halpe26 →
-     每相机取最高置信度的人 → SMPL 拟合（默认 EmFit **热启动流式**，帧间连续）；
+     每相机取最高置信度的人 → SMPL 拟合（默认官方多帧批量，激活帧间平滑）；
   4) 输出：逐帧 ``npz`` + ``recon_index.npz`` + ``recon_meta.json``。
 
 用法
   python scripts/reconstruct_video.py data/video/20260902_180000 \
-      [--config stream] [--stride 1] [--ref-cam 0] [--out ...]
+      [--config batch] [--stride 1] [--ref-cam 0] [--out ...]
 
 拟合档位 --config
+  batch    = 官方多帧批量拟合：整段一次 smpl_from_keypoints3d2d，激活时间平滑（默认）
   official = 官方 cold ``reconstruct()``，每帧冷启动（最慢，行为=原版）
   warm     = EmFit 热启动 ftol 5e-4 / maxiters 40（约 x1.8，误差≈官方）
-  stream   = EmFit 热启动 ftol 1.5e-3 / maxiters 25（约 x2.3，误差略优于官方，默认）
+  stream   = EmFit 热启动 ftol 1.5e-3 / maxiters 25（约 x2.3，误差略优于官方）
 
 调试选项
   --fake-poses  不跑检测，注入一个合成站姿人观测 → 专用于验证 录制→对齐→重建→存档
@@ -117,7 +118,7 @@ def _proj_err_px(Pall: np.ndarray, kp2d: np.ndarray, j25: np.ndarray) -> tuple:
 def build_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("session_dir", help="data/video/<session> 文件夹（含 cam*.mp4）")
-    ap.add_argument("--config", choices=["official", "warm", "stream"], default="stream")
+    ap.add_argument("--config", choices=["official", "warm", "stream", "batch"], default="batch")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--max-frames", type=int, default=0, help="0=全部")
     ap.add_argument("--ref-cam", type=int, default=None)
@@ -132,6 +133,120 @@ def build_args():
     ap.add_argument("--em-verbose", action="store_true")
     ap.add_argument("--easymocap-root", default="/home/yby/projects/EasyMocap")
     return ap.parse_args()
+
+
+def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, out_dir):
+    """官方多帧批量拟合：整段检测+三角化 → 一次 ``smpl_from_keypoints3d2d`` 拟合 T 帧。
+
+    与逐帧 official/warm/stream 不同，这里把全部帧一次性喂给官方管线，激活
+    smooth_body/smooth_poses/smooth_Rh 时间平滑（帧间连贯），单视角关节由相邻帧约束补全。
+    """
+    view_ids = sorted(cids_ok)
+    if len(view_ids) < 2:
+        print("✗ 标定视角不足 2 个，无法批量拟合。")
+        sys.exit(2)
+
+    indices = list(range(0, src.n_ref, max(1, args.stride)))
+    if args.max_frames > 0:
+        indices = indices[: args.max_frames]
+
+    # ---- Pass 1：检测，收集每帧观测 ----
+    frames_obs = []      # List[Dict[int, Pose2D]]（空 dict = 该帧无人）
+    cam_idx_list = []    # 每帧参与视角 {cid: 源帧号}
+    n_person = 0
+    t_global0 = time.time()
+    t0 = time.time()
+    for k in indices:
+        frames_k = src.frames_for_ref(k)
+        frames_k = {cid: f for cid, f in frames_k.items() if cid in cids_ok}
+        if args.fake_poses:
+            best = fake_obs_for(recon, intrinsics, extrinsics, list(frames_k.keys()))
+        elif not frames_k:
+            best = {}
+        else:
+            items = sorted(frames_k.items())
+            poses = detector.detect_batch([f for _, f in items])
+            best = {}
+            for (cid, _f), pl in zip(items, poses):
+                if pl:
+                    best[cid] = max(pl, key=lambda p: p.score)
+        frames_obs.append(best)
+        cam_idx_list.append({c: src.maps[k][c] for c in best})
+        if len(best) >= args.min_cams:
+            n_person += 1
+    det_wall = time.time() - t0
+    print(f"  检测 {len(indices)} 帧（有 ≥{args.min_cams} 视角的人：{n_person}）"
+          f"耗时 {det_wall:.1f}s")
+
+    # ---- Pass 2：批量拟合 ----
+    t0 = time.time()
+    results = recon.reconstruct_batch(frames_obs, intrinsics, extrinsics,
+                                      min_conf=0.3, view_ids=view_ids)
+    fit_wall = time.time() - t0
+    if results is None:
+        print("✗ 批量拟合失败。")
+        sys.exit(1)
+    print(f"  批量拟合 {len(results)} 帧耗时 {fit_wall:.1f}s"
+          f"（{fit_wall/max(1, len(results)):.1f}s/帧）")
+
+    # ---- 逐帧重投影误差 + 写档 ----
+    Pall = np.stack([
+        intrinsics[cid].K
+        @ np.hstack([extrinsics[cid].R, extrinsics[cid].t.reshape(3, 1)])
+        for cid in view_ids
+    ])
+    n_ok = n_gap = 0
+    err_mean_arr, err_worst_arr = [], []
+    idx_arr, status_arr, wall_arr = [], [], []
+    code = {"ok": 0, "no_person": 1, "fit_failed": 2, "error": 3}
+    per_frame_ms = (det_wall + fit_wall) / max(1, len(indices)) * 1000.0
+    for t, k in enumerate(indices):
+        res = results[t]
+        had_person = len(frames_obs[t]) >= args.min_cams
+        status = "ok" if had_person else "no_person"
+        if had_person:
+            n_ok += 1
+        else:
+            n_gap += 1
+        kp2d, _ = recon._obs_to_body25_fixed(
+            frames_obs[t], intrinsics, extrinsics, 0.0, view_ids)
+        em, ew = _proj_err_px(Pall, kp2d, np.asarray(res["joints_body25"]))
+        err_mean_arr.append(em); err_worst_arr.append(ew)
+        idx_arr.append(k); status_arr.append(code[status]); wall_arr.append(per_frame_ms)
+        ensure_faces(out_dir, res)
+        save_one(out_dir, k, res, per_frame_ms, em, ew, cam_idx_list[t])
+        if (t + 1) % max(1, args.progress) == 0 or t == len(indices) - 1:
+            print(f"  写档 {t+1}/{len(indices)} (主时钟 {k}/{src.n_ref}) | "
+                  f"ok={n_ok} gap={n_gap}")
+
+    src.close()
+
+    # ---- 汇总 / 存档 ----
+    wall_s = time.time() - t_global0
+    np.savez(os.path.join(out_dir, "recon_index.npz"),
+             ref_frame=np.asarray(idx_arr, np.int64),
+             status=np.asarray(status_arr, np.int8),
+             wall_ms=np.asarray(wall_arr, np.float64),
+             err_mean_px=np.asarray(err_mean_arr, np.float64),
+             err_worst_px=np.asarray(err_worst_arr, np.float64))
+    index_data = {
+        "session_dir": args.session_dir, "out_dir": out_dir,
+        "config": args.config, "stride": args.stride,
+        "ref_cam": src.ref_cam,
+        "n_ref_frames": src.n_ref, "processed": len(indices),
+        "ok": n_ok, "no_person_gap": n_gap, "failed": 0,
+        "wall_s": round(wall_s, 3),
+        "detect_wall_s": round(det_wall, 3),
+        "fit_wall_s": round(fit_wall, 3),
+        "reproj_err_mean_px_median": _median(err_mean_arr),
+        "source": src.summary(),
+    }
+    with open(os.path.join(out_dir, "recon_meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(index_data, fh, ensure_ascii=False, indent=2)
+    print("=== 完成 ===")
+    print(f"  处理 {len(indices)} 帧（ok={n_ok}, 无人缺口={n_gap}）耗时 {wall_s:.1f}s")
+    print(f"  检测 {det_wall:.1f}s + 批量拟合 {fit_wall:.1f}s")
+    print(f"  重投影误差中位 {_median(err_mean_arr):.2f}px |  → {out_dir}")
 
 
 def main() -> None:
@@ -178,6 +293,10 @@ def main() -> None:
     if detector is None and not args.fake_poses:
         print("✗ 姿态检测器未就绪")
         sys.exit(1)
+
+    if args.config == "batch":
+        run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, out_dir)
+        return
 
     if args.config == "official":
         fit = None
