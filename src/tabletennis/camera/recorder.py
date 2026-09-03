@@ -15,7 +15,9 @@
 ``data/video/<YYYYmmdd_HHMMSS>/``
     cam0.mp4 .. cam3.mp4      四段灰度视频（mp4v 编码，逻辑相机号 = 标定里的 cid）
     cam0_ts.npy ..            ``uint64`` 设备时间戳数组，与 mp4 帧一一对应（长度 = 写入帧数）
-    meta.json                 相机→序列号、fps、起止墙钟、各相机帧数（对账用）
+    meta.json                 相机→序列号、fps、起止墙钟、各相机帧数 + 供帧停顿诊断
+                              ``feed_diag_per_cam``（入队墙钟空档 + GetImageBuffer 超时，
+                              用于判定「进程冻结」还是「相机/总线停供」，见 stop 打印）
 """
 from __future__ import annotations
 
@@ -50,6 +52,40 @@ def default_session_dir(root: Optional[str] = None) -> str:
     return path
 
 
+def _feed_gap_report(wall: List[float], t0: float, t1: float,
+                     thresh_s: float = 0.06, cap: int = 50) -> dict:
+    """把一路相机的入队墙钟序列转成「供帧停顿」诊断。
+
+    Args:
+        wall: ``_CameraWriter._feed_wall``（``time.perf_counter`` 单调秒）。
+        t0: 录像开始墙钟（单调秒，recorder.start 记的）。
+        t1: 停止墙钟（单调秒，recorder.stop 一进来就记的）。
+        thresh_s: 相邻入队间隔超过它才算一次停顿（正常应 ~10ms）。
+        cap: gaps 列表最多记多少条。
+
+    设备时间戳只能说明相机侧节奏；要回答「主机在录到一半停供了多久、当时抓帧线程
+    是卡死还是在超时轮询」，必须有墙钟侧的这一份记录。
+    """
+    off = [x - t0 for x in wall if x >= t0]     # 相对录像开始的偏移（秒）
+    diag = {"n_fed": len(off)}
+    if len(off) < 2:
+        return diag
+    diffs = [off[i + 1] - off[i] for i in range(len(off) - 1)]
+    gaps = [(round(off[i], 3), round(off[i + 1], 3), round(g, 3))
+            for i, g in enumerate(diffs) if g > thresh_s]
+    t1_off = t1 - t0
+    diag.update({
+        "first_feed_s": round(off[0], 3),
+        "last_feed_s": round(off[-1], 3),
+        "span_s": round(off[-1] - off[0], 3),
+        "silence_after_last_s": round(max(t1_off - off[-1], 0.0), 3),
+        "gaps": gaps[:cap],
+        "n_gaps": len(gaps),
+        "max_gap_s": round(max(diffs), 3) if diffs else 0.0,
+    })
+    return diag
+
+
 class _CameraWriter(threading.Thread):
     """一台相机一个编码线程：消费有界队列里的灰度帧 → BGR mp4v + 攒设备时间戳。"""
 
@@ -63,6 +99,7 @@ class _CameraWriter(threading.Thread):
         self.count = 0
         self.n_fed = 0       # 采集侧送进来多少帧（含被丢掉的）
         self.n_dropped = 0   # 队列满被丢掉多少帧（≈ 编码跟不上时的丢帧）
+        self._feed_wall: List[float] = []  # 每帧入队墙钟（单调秒，诊断静默窗口用）
         self._first_ts: Optional[int] = None
         self._last_ts: Optional[int] = None
 
@@ -70,6 +107,9 @@ class _CameraWriter(threading.Thread):
     def feed(self, frame: Frame) -> None:
         """把一帧交给录制队列；满则丢最旧（保持近实时，丢帧由 ts 副产物记录）。"""
         self.n_fed += 1
+        # 入队墙钟：一帧一次 append，开销 ~µs 级。设备 ts 只反映相机侧节奏，
+        # 要定位「主机停供」发生在哪段墙钟必须在这里打点。
+        self._feed_wall.append(time.perf_counter())
         try:
             self._q.put_nowait(frame)
         except queue.Full:
@@ -156,6 +196,8 @@ class SessionVideoRecorder:
         self._writers: Dict[int, _CameraWriter] = {}
         self._started = False
         self._t0 = 0.0
+        self._t0_perf = 0.0   # 开始/停止的单调墙钟（供帧停顿诊断的基准）
+        self._t1_perf = 0.0
 
     @property
     def is_recording(self) -> bool:
@@ -168,6 +210,7 @@ class SessionVideoRecorder:
         os.makedirs(self.session_dir, exist_ok=True)
         # mp4 头标称帧率（只影响播放速度）。构造时由调用方按触发模式给 100/30。
         fps = self.fps if self.fps is not None else 100.0
+        self._t0_perf = time.perf_counter()
         for cam in self.cameras:
             path = os.path.join(self.session_dir, f"cam{cam.logical_id}.mp4")
             w = _CameraWriter(cam, path, fps)
@@ -182,6 +225,7 @@ class SessionVideoRecorder:
         """停录：摘 sink → 各线程收尾 → 写 ts 副产物与 meta.json。返回 meta。"""
         if not self._started:
             return {}
+        self._t1_perf = time.perf_counter()   # 用户按停的瞬间（供帧停顿诊断的截止点）
         self._started = False
         for cam in self.cameras:
             cam.set_frame_sink(None)
@@ -189,6 +233,8 @@ class SessionVideoRecorder:
         periods: Dict[str, float] = {}
         fed_per_cam: Dict[str, int] = {}
         dropped_per_cam: Dict[str, int] = {}
+        feed_diag: Dict[str, dict] = {}
+        cam_by_cid = {c.logical_id: c for c in self.cameras}
         for cid, w in self._writers.items():
             w.stop()
             w.join(timeout=10.0)
@@ -200,6 +246,18 @@ class SessionVideoRecorder:
             if len(ts) > 2:
                 med = float(np.median(np.diff(np.asarray(ts, dtype=np.float64))))
                 periods[str(cid)] = round(med * 1e-8, 6)   # 秒
+            # 供帧停顿诊断：入队墙钟的空档 + 该窗口里 GetImageBuffer 有没有在超时轮询
+            diag = _feed_gap_report(w._feed_wall, self._t0_perf, self._t1_perf)
+            cam = cam_by_cid.get(cid)
+            if cam is not None:
+                # 诊断属性在真相机上由 camera.py 提供；假相机/别的实现缺了就置空
+                tw_all = getattr(cam, "grab_timeout_wall", [])
+                t1_off = self._t1_perf - self._t0_perf
+                tw = [round(x - self._t0_perf, 3) for x in tw_all
+                      if 0.0 <= x - self._t0_perf <= t1_off]
+                diag["getimg_timeouts"] = int(getattr(cam, "grab_timeouts", 0))
+                diag["timeout_at_s"] = tw[-50:]   # 停录前的超时时刻（最多 50 条）
+            feed_diag[str(cid)] = diag
             np.save(os.path.join(self.session_dir, f"cam{cid}_ts.npy"), ts)
         self._writers = {}
 
@@ -211,10 +269,12 @@ class SessionVideoRecorder:
             "fps": (self.fps if self.fps is not None else 100.0),
             "camera_serials": {str(c.logical_id): c.serial for c in self.cameras},
             "frames_per_cam": frames_per_cam,
-            # 诊断：喂进来 vs 写进文件 vs 编码丢帧——差多少一眼看出瓶颈在哪侧
+            # 诊断 1：喂进来 vs 写进文件 vs 编码丢帧——差多少一眼看出瓶颈在哪侧
             "fed_per_cam": fed_per_cam,
             "encoder_dropped_per_cam": dropped_per_cam,
             "measured_period_s": periods,
+            # 诊断 2：墙钟侧供帧停顿（区分「进程冻结」vs「相机/总线停供」，见下方打印）
+            "feed_diag_per_cam": feed_diag,
         }
         with open(os.path.join(self.session_dir, "meta.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh, ensure_ascii=False, indent=2)
@@ -226,5 +286,24 @@ class SessionVideoRecorder:
             fps_est = written / wall_s if wall_s > 0 else 0.0
             print(f"  cam{cid}: 喂 {fed} → 写 {written} 帧（编码丢 {dropped}）"
                   f"· 实测 {fps_est:5.1f} fps / 100 目标")
+            d = feed_diag.get(str(cid), {})
+            silent = d.get("silence_after_last_s", 0.0)
+            # 中段停顿（n_gaps>0）很敏感；尾部静默要 >0.5s 才算异常（用户按停本身
+            # 有零点几秒的正常延迟，20260903 那种 1.35s 不会漏）
+            if d.get("n_gaps", 0) or silent > 0.5:
+                # 静默区 = 各停顿间隙 [s,e] + 末帧后的尾部 [last_feed, t1]
+                regions = [(s, e) for s, e, _ in d.get("gaps", [])]
+                last = d.get("last_feed_s", 0.0)
+                if silent > 0.5:
+                    regions.append((last, round(self._t1_perf - self._t0_perf, 3)))
+                n_tmo_in_gap = sum(
+                    1 for t in d.get("timeout_at_s", [])
+                    if any(s - 0.02 <= t <= e + 0.02 for s, e in regions))
+                side = ("相机/总线停供（抓帧线程在超时轮询，但相机没把帧送上来）"
+                        if n_tmo_in_gap > 0
+                        else "进程冻结（静默区里抓帧线程一次都没来取帧，疑似 GIL/阻塞调用）")
+                print(f"      ⚠ 供帧 {d.get('span_s', 0):.2f}s 后静默 {silent:.2f}s"
+                      f"（{d.get('n_gaps', 0)} 处停顿，最大 {d.get('max_gap_s', 0):.2f}s）"
+                      f"· 静默区内 GetImageBuffer 超时 {n_tmo_in_gap} 次 → {side}")
         print(f"        → {self.session_dir}")
         return meta
