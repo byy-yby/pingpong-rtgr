@@ -9,6 +9,8 @@
 **播放观感**：连续 no_person ≤ ``--hold-gaps``（默认 3≈30ms）帧时保持上一姿态、
 超过才清空——100Hz 拟合单帧抖动不会把人体闪没；目标速度=录像真实出帧率，
 渲染跟不上会自动掉帧（可 ``-``/``+`` 调速，标题栏显示 ``≈N帧/秒``）。
+若输出里带 ``ball_trajectory.npz``（reconstruct_video.py 默认会写），回放同时渲染
+乒乓球当前位置红球 + 到当前帧为止的轨迹线（可 ``--no-ball-trail`` 关掉轨迹线）。
 
 用法
   python scripts/visualize_recon.py <out_dir>        # 回放某次重建结果
@@ -56,6 +58,8 @@ def build_args():
                          "100Hz 下拟合单帧抖动掉点不会把人体闪没）")
     ap.add_argument("--no-cast", action="store_true",
                     help="关闭人物脚下整身投影软影（默认开）")
+    ap.add_argument("--no-ball-trail", action="store_true",
+                    help="关闭球轨迹线（默认开；红球仍显示）")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--render", nargs=2, metavar=("T", "OUT_PNG"),
@@ -83,11 +87,12 @@ def main() -> None:
 
     root = args.root or None
     cast = not args.no_cast
+    trail = not args.no_ball_trail
     if args.render:
         t, png = int(args.render[0]), args.render[1]
         tl = ReconTimeline(out_dir, hold_gaps=args.hold_gaps)
         arr = render_still(tl, t, args.width, args.height, out_png=png, root=root,
-                           cast_shadow=cast)
+                           cast_shadow=cast, ball_trail=trail)
         shown = tl.person_path_at(t)
         print(f"✓ 已渲染 t={t} -> {png}（{arr.shape[1]}×{arr.shape[0]}，"
               f"{'人物' if shown else '无人'}）")
@@ -96,7 +101,7 @@ def main() -> None:
     play_gui(out_dir, easymocap_root=args.easymocap_root,
              width=args.width, height=args.height, fps=args.fps,
              watch=args.watch, root=root, hold_gaps=args.hold_gaps,
-             cast_shadow=cast)
+             cast_shadow=cast, ball_trail=trail)
 
 
 if __name__ == "__main__":

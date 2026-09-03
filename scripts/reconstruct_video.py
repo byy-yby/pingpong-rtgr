@@ -6,7 +6,9 @@
   2) 按设备时间戳把四路重新对齐到主时钟相机（允许编码丢帧，见 video_source 文档）；
   3) 每个主时钟帧：各相机对齐帧 → 人检测(yolo11n-gray) + RTMPose halpe26 →
      每相机取最高置信度的人 → SMPL 拟合（默认官方多帧批量，激活帧间平滑）；
-  4) 输出：逐帧 ``npz`` + ``recon_index.npz`` + ``recon_meta.json``。
+  4) 球轨迹（独立一遍，默认开启）：逐帧各相机球检测（经典 / YOLO）→ DLT 三角化
+     → 3D 球心，写 ``ball_trajectory.npz``（供 visualize_recon.py 渲染红球 + 轨迹线）；
+  5) 输出：逐帧 ``npz`` + ``recon_index.npz`` + ``recon_meta.json``。
 
 用法
   python scripts/reconstruct_video.py data/video/20260902_180000 \
@@ -23,6 +25,12 @@
                 整条管道（视频内容无关），或给重建流程计时。
   --stride N    主时钟每 N 帧重建 1 帧（默认 1 全量）。
   --max-frames  最多处理前 N 个主时钟帧（调试/计时用，0 = 全部）。
+
+球重建选项（默认开启）
+  --no-ball          跳过球轨迹重建。
+  --ball-detector    球检测路线：classical（默认）/ yolo。
+  --ball-model       显式指定 YOLO 球 ONNX 路径（覆盖 yolo 的自动查找）。
+  --ball-min-conf    球三角化最低置信度（默认 0.3）。
 """
 from __future__ import annotations
 
@@ -132,6 +140,15 @@ def build_args():
     ap.add_argument("--progress", type=int, default=10)
     ap.add_argument("--em-verbose", action="store_true")
     ap.add_argument("--easymocap-root", default="/home/yby/projects/EasyMocap")
+    ap.add_argument("--no-ball", action="store_true", help="跳过球轨迹重建（默认开启）")
+    ap.add_argument("--ball-detector", choices=["classical", "yolo"], default="classical",
+                    help="球检测路线：classical（默认，背景减除+帧差）/ yolo（onnx）")
+    ap.add_argument("--ball-model", default=None,
+                    help="YOLO 球 ONNX 模型路径（给定则覆盖 --ball-detector yolo 的自动查找）")
+    ap.add_argument("--ball-imgsz", type=int, default=1280, help="YOLO 球检测输入分辨率")
+    ap.add_argument("--ball-min-conf", type=float, default=0.3, help="球三角化最低置信度")
+    ap.add_argument("--ball-radius-min", type=float, default=5.0, help="经典检测球半径像素下限")
+    ap.add_argument("--ball-radius-max", type=float, default=15.0, help="经典检测球半径像素上限")
     return ap.parse_args()
 
 
@@ -255,6 +272,110 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     print(f"  重投影误差中位 {_median(err_mean_arr):.2f}px |  → {out_dir}")
 
 
+def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
+    """离线球轨迹重建：逐主时钟帧各相机球检测 → 置信度加权 DLT 三角化 → 存轨迹。
+
+    与姿态重建独立跑一遍（球检测 ~3.6ms/相机，解码开销远小于 SMPL 拟合）。球检测
+    默认经典路线（背景减除 + 帧差 + 尺寸先验，有状态、按相机分背景）；``--ball-detector
+    yolo`` / ``--ball-model`` 走 onnxruntime YOLO。结果写 ``out_dir/ball_trajectory.npz``
+    （每帧 ``ref_frame`` + 3D 球心 ``X``，失败帧 ``X=NaN``），供 visualize_recon.py 回放渲染。
+    """
+    from tabletennis.reconstruction.ball import triangulate_ball
+    from tabletennis.reconstruction.triangulate import MultiViewTriangulator
+    from tabletennis.vision.ball import ClassicalBallDetector, YoloBallDetector
+    from tabletennis.vision.detector import create_detector
+
+    triangulator = MultiViewTriangulator(intrinsics, extrinsics)
+    cids = sorted(set(triangulator.cameras) & set(cids_ok))
+    if len(cids) < 2:
+        print("✗ 标定视角不足 2 个，跳过球轨迹重建。")
+        return None
+
+    # 检测器：YOLO（显式路径 / 自动找权重）或经典（每相机一个，背景模型独立）
+    ball_det = None
+    if args.ball_model:
+        if os.path.exists(args.ball_model):
+            ball_det = YoloBallDetector(args.ball_model, imgsz=args.ball_imgsz)
+        else:
+            print(f"⚠ --ball-model 指定模型不存在：{args.ball_model}，回退经典检测。")
+    elif args.ball_detector == "yolo":
+        ball_det = create_detector("ball_yolo")
+        if ball_det is None:
+            print("⚠ YOLO 球权重缺失（runs/detect/*/weights/best.onnx），回退经典检测。")
+    if ball_det is not None:
+        print(f"球检测：YOLO（backend={getattr(ball_det, 'actual_provider', '?')}，"
+              f"imgsz={getattr(ball_det, 'imgsz', args.ball_imgsz)}）")
+    else:
+        dets = {cid: ClassicalBallDetector(
+            radius_px=(args.ball_radius_min, args.ball_radius_max)) for cid in cids}
+        print(f"球检测：经典（背景减除+帧差+尺寸先验，{len(dets)} 相机各一实例）")
+
+    indices = list(range(0, src.n_ref, max(1, args.stride)))
+    if args.max_frames > 0:
+        indices = indices[: args.max_frames]
+
+    ref_arr, X_arr = [], []
+    conf_arr, err_arr, nv_arr, ang_arr = [], [], [], []
+    t0 = time.time()
+    n_ball = 0
+    for k in indices:
+        frames_k = {cid: f for cid, f in src.frames_for_ref(k).items() if cid in cids}
+        balls = {}
+        if frames_k:
+            if ball_det is not None:
+                items = sorted(frames_k.items())
+                if hasattr(ball_det, "detect_batch"):
+                    outs = ball_det.detect_batch([f for _, f in items])
+                else:
+                    outs = [ball_det.detect(f) for _, f in items]
+                for (cid, _f), bl in zip(items, outs):
+                    if bl:
+                        balls[cid] = bl[0]  # 单球，取最高置信者（YOLO 已按 conf 排序）
+            else:
+                for cid, f in frames_k.items():
+                    d = dets[cid].detect(f)
+                    if d:
+                        balls[cid] = d[0]
+        res = triangulate_ball(balls, triangulator, min_conf=args.ball_min_conf) if balls else None
+        ref_arr.append(k)
+        if res is not None:
+            X, conf, err, nv, ang = res
+            X_arr.append(np.asarray(X, np.float64).reshape(3))
+            conf_arr.append(float(conf)); err_arr.append(float(err))
+            nv_arr.append(int(nv)); ang_arr.append(float(ang))
+            n_ball += 1
+        else:
+            X_arr.append(np.full(3, np.nan))
+            conf_arr.append(0.0); err_arr.append(np.nan)
+            nv_arr.append(0); ang_arr.append(0.0)
+        if len(ref_arr) % max(1, args.progress) == 0:
+            print(f"  球重建 {len(ref_arr)}/{len(indices)}（主时钟 {k}/{src.n_ref}，"
+                  f"已成功 {n_ball}）")
+    wall = time.time() - t0
+    src.close()
+
+    np.savez(
+        os.path.join(out_dir, "ball_trajectory.npz"),
+        ref_frame=np.asarray(ref_arr, np.int64),
+        X=np.asarray(X_arr, np.float64),
+        conf=np.asarray(conf_arr, np.float64),
+        reproj_err=np.asarray(err_arr, np.float64),
+        n_views=np.asarray(nv_arr, np.int32),
+        angle_deg=np.asarray(ang_arr, np.float64),
+    )
+    with open(os.path.join(out_dir, "ball_meta.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "detector": "yolo" if ball_det is not None else "classical",
+            "min_conf": args.ball_min_conf,
+            "n_frames": len(indices), "ok": n_ball,
+            "wall_s": round(wall, 3),
+            "ref_cam": src.ref_cam,
+        }, fh, ensure_ascii=False, indent=2)
+    print(f"球轨迹：{n_ball}/{len(indices)} 帧三角化成功，耗时 {wall:.1f}s"
+          f" → {os.path.join(out_dir, 'ball_trajectory.npz')}")
+    return {"n_frames": len(indices), "ok": n_ball, "wall_s": round(wall, 3)}
+
+
 def main() -> None:
     args = build_args()
     _add_easymocap_path(args.easymocap_root)
@@ -299,6 +420,15 @@ def main() -> None:
     if detector is None and not args.fake_poses:
         print("✗ 姿态检测器未就绪")
         sys.exit(1)
+
+    # ---- 球轨迹重建（独立一遍，先跑，写 ball_trajectory.npz；失败不阻断姿态）----
+    if not args.no_ball:
+        print("=== 球轨迹重建 ===")
+        try:
+            src_ball = VideoSource(session_dir, ref_cam=args.ref_cam)
+            run_ball_recon(args, src_ball, intrinsics, extrinsics, cids_ok, out_dir)
+        except Exception as exc:  # noqa: BLE001 —— 球失败不影响姿态重建
+            print(f"✗ 球轨迹重建失败（姿态重建继续）：{exc}")
 
     if args.config == "batch":
         run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, out_dir)

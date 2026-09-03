@@ -15,6 +15,9 @@
   ① 两片脚下接触椭圆（核心深影，把足底到地板的空间感压实）；② **整身投影软影**：
   把所有 SMPL 顶点沿光水平方向投到地面 → 凸包填充盘，带身形且随姿态伸长——合起来
   才是肉眼看得出的影子。烘焙光源与假影太阳取同一侧，观感一致。
+- 球轨迹 = 若有 ``ball_trajectory.npz``（reconstruct_video.py 的球重建输出），逐帧画
+  当前位置红球 + 到 t 为止的轨迹线（``defaultUnlit`` 红球 + ``unlitLine`` 亮橙，
+  按「缺测 >5 帧」断开，不把不同回合连成一条大线）。
 
 两个入口共用同一套 ``ReconScene``（把几何加进任意 ``Open3DScene``）：
 
@@ -62,6 +65,12 @@ _SHADOW_LAYERS = (
     dict(alpha=0.45, off=0.16, rx=0.15, ry=0.10),   # 脚下核心影
 )
 
+# 球轨迹渲染：当前位置球（红）+ 到 t 为止的轨迹线（亮橙，缺测 >GAP 帧断开，不跨回合连线）
+_BALL_COLOR = np.array([0.95, 0.25, 0.18], np.float32)       # 当前位置球
+_BALL_TRAIL_COLOR = np.array([1.00, 0.55, 0.28], np.float32)  # 轨迹线
+_BALL_RADIUS = 0.02                                          # 乒乓球半径 20mm
+_BALL_TRAIL_GAP = 5                                          # 断连阈值（帧）：缺测 >5 帧即断开
+
 
 def _o3d():
     try:
@@ -103,6 +112,11 @@ class ReconTimeline:
         self.state = np.zeros(0, dtype=np.int64)
         self.ref_rate_hz = 100.0
         self.hold_gaps = int(hold_gaps)
+        self.ball_ok = False
+        self.ball_refs = np.zeros(0, dtype=np.int64)
+        self.ball_X = np.zeros((0, 3), dtype=np.float64)
+        self.ball_valid = np.zeros(0, dtype=bool)
+        self.ball_pos: Dict[int, np.ndarray] = {}
         self.reload()
 
     # ------------------------------------------------------------------
@@ -185,6 +199,7 @@ class ReconTimeline:
             self.ref_rate_hz = 100.0
 
         self._rebuild_state()
+        self._load_ball()
 
     # ------------------------------------------------------------------
     def _rebuild_state(self) -> None:
@@ -238,6 +253,84 @@ class ReconTimeline:
         except Exception as exc:  # noqa: BLE001 —— 重建正在写/文件半截
             print(f"[recon_player] ⚠ t={t} 读帧失败：{exc}")
             return None
+
+    # ------------------------------------------------------------------
+    # 球轨迹（ball_trajectory.npz）：ball_pos_at 取当前/coast 位置，
+    # ball_trail_upto 取到 t 为止的连续轨迹段（缺测 >GAP 帧断开，不跨回合连线）
+    # ------------------------------------------------------------------
+    def _load_ball(self) -> None:
+        """读 ``ball_trajectory.npz``（可能不存在 / 半截），失败则置 ball_ok=False。"""
+        path = self._p("ball_trajectory.npz")
+        if not os.path.exists(path):
+            self.ball_ok = False
+            self.ball_refs = np.zeros(0, dtype=np.int64)
+            self.ball_X = np.zeros((0, 3), dtype=np.float64)
+            self.ball_valid = np.zeros(0, dtype=bool)
+            self.ball_pos = {}
+            return
+        try:
+            z = np.load(path)
+            refs = np.asarray(z["ref_frame"], np.int64)
+            X = np.asarray(z["X"], np.float64).reshape(-1, 3)
+            n = min(len(refs), len(X))
+            refs, X = refs[:n], X[:n]
+            valid = np.isfinite(X).all(axis=1)
+            self.ball_refs = refs
+            self.ball_X = X
+            self.ball_valid = valid
+            self.ball_pos = {int(t): X[i] for i, t in enumerate(refs) if valid[i]}
+            self.ball_ok = bool(self.ball_pos)
+        except Exception as exc:  # noqa: BLE001 —— 重建正在写 / 文件半截
+            print(f"[recon_player] ⚠ 读 ball_trajectory.npz 失败：{exc}")
+            self.ball_ok = False
+            self.ball_refs = np.zeros(0, dtype=np.int64)
+            self.ball_X = np.zeros((0, 3), dtype=np.float64)
+            self.ball_valid = np.zeros(0, dtype=bool)
+            self.ball_pos = {}
+
+    def ball_pos_at(self, t: int) -> Optional[np.ndarray]:
+        """t 处球心 ``(3,)``；当前帧无球则回看最近 ``hold_gaps`` 帧内的有效球（防闪没）。"""
+        if not self.ball_ok:
+            return None
+        X = self.ball_pos.get(int(t))
+        if X is not None:
+            return X
+        for dt in range(1, max(1, self.hold_gaps + 1)):
+            X = self.ball_pos.get(int(t) - dt)
+            if X is not None:
+                return X
+        return None
+
+    def ball_trail_upto(self, t: int) -> List[np.ndarray]:
+        """到 t 为止的球轨迹，按「连续缺测 ≤ _BALL_TRAIL_GAP 帧」切成若干段。
+
+        断连处不连线（否则会把不同回合 / 长时间无球段错误连成一条大线）。每段 ``(M,3)``。
+        """
+        if not self.ball_ok:
+            return []
+        mask = self.ball_refs <= int(t)
+        refs = self.ball_refs[mask]
+        valid = self.ball_valid[mask]
+        X = self.ball_X[mask]
+        segs: List[np.ndarray] = []
+        cur: List[np.ndarray] = []
+        last_ref = None
+        for i in range(len(refs)):
+            if not valid[i]:
+                last_ref = None
+                if cur:
+                    segs.append(np.asarray(cur, np.float64))
+                    cur = []
+                continue
+            if last_ref is not None and (int(refs[i]) - last_ref) > _BALL_TRAIL_GAP:
+                if cur:
+                    segs.append(np.asarray(cur, np.float64))
+                    cur = []
+            cur.append(X[i])
+            last_ref = int(refs[i])
+        if cur:
+            segs.append(np.asarray(cur, np.float64))
+        return [s for s in segs if len(s) >= 2]
 
 
 # ----------------------------------------------------------------------
@@ -408,7 +501,8 @@ class ReconScene:
     def __init__(self, tl: ReconTimeline, faces: Optional[np.ndarray],
                  table: Optional[Table3D] = None,
                  camera_rig: Optional[tuple] = None,
-                 cast_shadow: bool = True):
+                 cast_shadow: bool = True,
+                 ball_trail: bool = True):
         o3d = _o3d()
         self.o3d = o3d
         self.tl = tl
@@ -417,12 +511,15 @@ class ReconScene:
         self.intrinsics, self.extrinsics = (camera_rig or (None, None))
         self.faces = faces                       # (13776,3) int；None 则只画关节
         self.cast_shadow = cast_shadow           # 脚下整身投影软影（默认开）
+        self.ball_trail = ball_trail             # 球轨迹线（默认开）
         # person 用 defaultUnlit：肤色+明暗烘焙在顶点色里（bake_body_shading），
         # 不参与场景光照 —— 人体凸凹明暗由烘焙保证（Filament 真阴影在 EGL 不可靠）
         self._mat_smpl = self._make_material(_SMPL_SKIN, roughness=0.62)
         self._mat_smpl.shader = "defaultUnlit"
         self._mat_smpl.base_color = [1.0, 1.0, 1.0, 1.0]
         self._mat_bones = self._make_material(_BONE_COLOR, roughness=0.8)
+        self._mat_ball = self._make_material(_BALL_COLOR, roughness=0.35)
+        self._mat_ball.shader = "defaultUnlit"   # 小球不参与光照，保证 2cm 红球始终醒目
         self._last_t = None
         self.n_added = 0
 
@@ -683,6 +780,43 @@ class ReconScene:
         self._last_t = t
         return True
 
+    # ------------------------------------------------------------------
+    # 球层：当前位置红球 + 到 t 为止的轨迹（分段连线）
+    # ------------------------------------------------------------------
+    def apply_ball(self, scene, t: int) -> bool:
+        """把 t 处的球 + 轨迹喂给场景。返回 True 表示本帧有球显示。"""
+        o3d = self.o3d
+        for name in ("ball", "ball_trail"):
+            try:
+                scene.remove_geometry(name)
+            except Exception:  # noqa: BLE001
+                pass
+        if not self.tl.ball_ok:
+            return False
+        X = self.tl.ball_pos_at(t)
+        if X is None:
+            return False
+        sph = o3d.geometry.TriangleMesh.create_sphere(radius=_BALL_RADIUS)
+        sph.translate(np.asarray(X, np.float64))
+        scene.add_geometry("ball", sph, self._mat_ball)
+        if self.ball_trail:
+            segs = self.tl.ball_trail_upto(t)
+            if segs:
+                # 多段拼进同一个 LineSet：点拼接、段内相邻连线（段间不连），
+                # 单个几何名 "ball_trail" 保证下一帧 remove_geometry 能清干净。
+                pts = [np.asarray(s, np.float64) for s in segs]
+                lines = [
+                    np.column_stack([base + np.arange(len(s) - 1),
+                                     base + np.arange(1, len(s))]).astype(np.int32)
+                    for base, s in zip(np.cumsum([0] + [len(s) for s in pts[:-1]]), pts)
+                ]
+                ls = o3d.geometry.LineSet()
+                ls.points = o3d.utility.Vector3dVector(np.concatenate(pts, axis=0))
+                ls.lines = o3d.utility.Vector2iVector(np.concatenate(lines, axis=0))
+                self._add_line_geo(scene, "ball_trail", ls,
+                                   np.asarray(_BALL_TRAIL_COLOR, np.float64), 2.0)
+        return True
+
 
 def load_faces(out_dir: str, easymocap_root: str = "") -> Optional[np.ndarray]:
     """读 ``out_dir/recon_faces.npy``；缺则尝试用 EasyMocap SMPL 模型补一次。"""
@@ -711,7 +845,7 @@ def load_faces(out_dir: str, easymocap_root: str = "") -> Optional[np.ndarray]:
 # ----------------------------------------------------------------------
 def render_still(tl: ReconTimeline, t: int, width: int = 1280, height: int = 720,
                  out_png: str = "", root: Optional[str] = None,
-                 cast_shadow: bool = True) -> "np.ndarray":
+                 cast_shadow: bool = True, ball_trail: bool = True) -> "np.ndarray":
     """渲染主时钟 t 处一帧到 RGB ndarray（可选写 PNG），供回放/验证。"""
     import open3d as o3d
     o3d.visualization.rendering  # noqa: F401
@@ -719,13 +853,14 @@ def render_still(tl: ReconTimeline, t: int, width: int = 1280, height: int = 720
 
     faces = load_faces(tl.out_dir)
     scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root),
-                         cast_shadow=cast_shadow)
+                         cast_shadow=cast_shadow, ball_trail=ball_trail)
 
     r = o3d.visualization.rendering.OffscreenRenderer(width, height)
     sc = r.scene
     sc.set_background(np.array([0.09, 0.10, 0.13, 1.0], np.float32))
     scene_b.add_static(sc)
     scene_b.apply_person(sc, t)
+    scene_b.apply_ball(sc, t)
     scene_b.set_lighting(sc)
 
     c = scene_b.center()
@@ -851,11 +986,13 @@ class _PlayerApp:
         self._need_show = False
         self.last_render_t = t0
         person = self.scene_b.apply_person(self.widget.scene, t0)
+        has_ball = self.scene_b.apply_ball(self.widget.scene, t0)
         self.widget.force_redraw()     # 场景变了立即重绘，别等事件流捎带（否则卡/跳帧）
         rate = self.speed * self.fps
         self.win.title = (f"EasyMocap 重建回放 — {os.path.basename(self.tl.out_dir)}"
                           f"  |  t {t0}/{max(0, self.tl.n_ref - 1)}"
                           f"  |  {'● 人物' if person else '— 无人'}"
+                          f"  |  {'● 球' if has_ball else ''}"
                           f"  |  x{self.speed:.1f} ≈{rate:.0f}帧/秒")
 
     def _on_key(self, ev) -> bool:
@@ -894,7 +1031,7 @@ class _PlayerApp:
 def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
              height: int = 720, fps: float = 0.0, watch: bool = False,
              root: Optional[str] = None, hold_gaps: int = 0,
-             cast_shadow: bool = True) -> None:
+             cast_shadow: bool = True, ball_trail: bool = True) -> None:
     """在主线程弹出 Open3D 回放窗口并阻塞到关闭。``fps``<=0 用真实出帧率。
 
     ``hold_gaps``：连续 no_person ≤ 该帧数时播放保持上一姿态（见
@@ -906,7 +1043,7 @@ def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
     tl = ReconTimeline(out_dir, hold_gaps=hold_gaps)
     faces = load_faces(out_dir, easymocap_root)
     scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root),
-                         cast_shadow=cast_shadow)
+                         cast_shadow=cast_shadow, ball_trail=ball_trail)
     if fps <= 0:
         fps = tl.ref_rate_hz
     if tl.n_ref > 1 or not watch:
