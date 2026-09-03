@@ -61,23 +61,27 @@ class _CameraWriter(threading.Thread):
         self._q: "queue.Queue" = queue.Queue(maxsize=max_queue)
         self._ts: List[int] = []
         self.count = 0
+        self.n_fed = 0       # 采集侧送进来多少帧（含被丢掉的）
+        self.n_dropped = 0   # 队列满被丢掉多少帧（≈ 编码跟不上时的丢帧）
         self._first_ts: Optional[int] = None
         self._last_ts: Optional[int] = None
 
     # -- 采集线程侧（快进快出）------------------------------------------------
     def feed(self, frame: Frame) -> None:
         """把一帧交给录制队列；满则丢最旧（保持近实时，丢帧由 ts 副产物记录）。"""
+        self.n_fed += 1
         try:
             self._q.put_nowait(frame)
         except queue.Full:
             try:
-                self._q.get_nowait()
+                self._q.get_nowait()      # 丢最旧，给新帧腾位
+                self.n_dropped += 1
             except queue.Empty:
                 pass
             try:
                 self._q.put_nowait(frame)
-            except queue.Full:
-                pass
+            except queue.Full:            # 仍满：本次帧也丢（极端）
+                self.n_dropped += 1
 
     def stop(self) -> None:
         """请求停止（置哨兵），随后由调用方 join()。
@@ -183,11 +187,15 @@ class SessionVideoRecorder:
             cam.set_frame_sink(None)
         frames_per_cam: Dict[str, int] = {}
         periods: Dict[str, float] = {}
+        fed_per_cam: Dict[str, int] = {}
+        dropped_per_cam: Dict[str, int] = {}
         for cid, w in self._writers.items():
             w.stop()
             w.join(timeout=10.0)
             ts = w.ts_array
             frames_per_cam[str(cid)] = int(len(ts))
+            fed_per_cam[str(cid)] = int(w.n_fed)
+            dropped_per_cam[str(cid)] = int(w.n_dropped)
             # 实测帧率（ticks→s：设备时间戳 ~100MHz → 1 tick=1e-8s）
             if len(ts) > 2:
                 med = float(np.median(np.diff(np.asarray(ts, dtype=np.float64))))
@@ -203,10 +211,20 @@ class SessionVideoRecorder:
             "fps": (self.fps if self.fps is not None else 100.0),
             "camera_serials": {str(c.logical_id): c.serial for c in self.cameras},
             "frames_per_cam": frames_per_cam,
+            # 诊断：喂进来 vs 写进文件 vs 编码丢帧——差多少一眼看出瓶颈在哪侧
+            "fed_per_cam": fed_per_cam,
+            "encoder_dropped_per_cam": dropped_per_cam,
             "measured_period_s": periods,
         }
         with open(os.path.join(self.session_dir, "meta.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh, ensure_ascii=False, indent=2)
-        print(f"[录像] ■ 停止：本次 {wall_s:.1f}s | 帧数 {frames_per_cam}")
+        print(f"[录像] ■ 停止：本次 {wall_s:.1f}s")
+        for cid in sorted(frames_per_cam):
+            written = frames_per_cam[cid]
+            fed = fed_per_cam[cid]
+            dropped = dropped_per_cam[cid]
+            fps_est = written / wall_s if wall_s > 0 else 0.0
+            print(f"  cam{cid}: 喂 {fed} → 写 {written} 帧（编码丢 {dropped}）"
+                  f"· 实测 {fps_est:5.1f} fps / 100 目标")
         print(f"        → {self.session_dir}")
         return meta

@@ -15,6 +15,16 @@
 
 `viewer3d.py` 提供 `SceneViewer3D`（Open3D 后台线程）：`build_scene()` 构建「相机视锥 +
 标准尺寸球桌 + 地面网格」，`start()` / `close()` 控制独立 3D 窗口。
+`viewer3d` 也提供 SMPL 层（`add_smpl_layer` / `set_smpl`，在线拟合时实时显示网格）。
+
+`recon_player.py` 提供离线重建结果的 **3D 回放**（`ReconTimeline` 时间线 +
+`ReconScene` 场景 + `render_still` EGL 出图 + `play_gui` 交互窗口）：
+
+- 逐帧回放 SMPL 网格（主时钟 t，no_person/失败清空、被 stride 跳过帧保持上姿态）。
+- 人体 PBR 环境光着色（曾因法线没重算 render 成一片白）；接触阴影是程序化两层半透明
+  椭圆（Filament 太阳定向光在本机 OpenGL 下实测不生效，见模块 docstring）。
+- 交互：Space 暂停/播放、←/→ 步进、Home/End、R 复位、-/= 调速、Esc 退出。
+- 用法：`scripts/visualize_recon.py <recon目录>`（加 `--watch` 在重建进行中追帧）。
 
 骨架连线/关键点定义从 `vision.skeleton.get_skeleton()` 取，保证画图和检测用的同一套索引。
 
@@ -31,7 +41,9 @@ bgr = annotate_frame(frame.image, poses, title="cam0")
 ## 还没做完
 
 - **3D 场景已实现（`viewer3d`）**：Open3D 后台线程渲染「相机视锥 + 标准尺寸球桌」，
-  由 `live_control.py` 按 T 触发。骨架 / 球轨迹的 3D 渲染仍待重建模块。
+  由 `live_control.py` 按 T 触发。在线 SMPL 网格层（`add_smpl_layer`）与离线回放
+  （`recon_player`，带程序化接触阴影）已就绪；多人与球轨迹的实时 3D 仍未接入主循环。
 - `draw_ball` 已实现但**暂时没被调用**——球检测器还没写；`draw_table` / `draw_table_model`
   已由球桌检测接入。
-- 没有封装交互式/可持久化的可视化组件（如录像、保存带标注的图片）。
+- 没有封装交互式/可持久化的可视化组件（如录像、保存带标注的图片）——回放窗口见
+  `scripts/visualize_recon.py`（重建结果已在录像/离线链里）。

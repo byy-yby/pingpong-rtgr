@@ -123,6 +123,8 @@ def build_args():
     ap.add_argument("--ref-cam", type=int, default=None)
     ap.add_argument("--min-cams", type=int, default=2)
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
+    ap.add_argument("--root", default=None,
+                    help="项目根（读 data/calibration 与 data/extrinsics，默认自动探测）")
     ap.add_argument("--fake-poses", action="store_true")
     ap.add_argument("--em-ftol", type=float, default=None)
     ap.add_argument("--em-maxiters", type=int, default=None)
@@ -161,7 +163,7 @@ def main() -> None:
     print(f"  主时钟 cam{src.ref_cam} → 对齐后 {src.n_ref} 帧")
 
     # ---- 标定 ----
-    intrinsics, extrinsics = load_camera_rig()
+    intrinsics, extrinsics = load_camera_rig(args.root)
     cids_ok = [c for c in src.cids if c in intrinsics and c in extrinsics]
     missing = [c for c in src.cids if c not in cids_ok]
     if missing:
@@ -252,6 +254,7 @@ def main() -> None:
         if status == "ok":
             n_ok += 1
             wall_ms_list.append(dt)
+            ensure_faces(out_dir, res)
             save_one(out_dir, k, res, dt, extra.get("err_mean"),
                      extra.get("err_worst"), extra.get("cam_idx"))
             err_mean_arr.append(extra.get("err_mean"))
@@ -295,6 +298,21 @@ def main() -> None:
     print(f"  处理 {len(indices)} 帧（ok={n_ok}, 无人缺口={n_gap}, 失败={n_fail}）耗时 {wall_s:.1f}s")
     print(f"  平均 {wall_s/max(1, len(indices))*1000:.0f}ms/帧 | 单帧中位 {_median(wall_ms_list):.0f}ms")
     print(f"  重投影误差中位 {_median(err_mean_arr):.2f}px |  → {out_dir}")
+
+
+def ensure_faces(out_dir: str, res: dict) -> None:
+    """SMPL 网格拓扑（13776 面）只在输出目录写一次，供 3D 回放查看器重建网格。
+
+    逐帧 npz 只存顶点以省空间；拓扑对所有帧相同，所以单独存 ``recon_faces.npy``。
+    """
+    path = os.path.join(out_dir, "recon_faces.npy")
+    if os.path.exists(path):
+        return
+    faces = res.get("faces")
+    if faces is None:
+        return
+    np.save(path, np.asarray(faces, dtype=np.int64))
+    print(f"  ✓ 已存 SMPL 网格拓扑 {path}（{np.asarray(faces).shape[0]} 面）")
 
 
 def save_one(out_dir: str, k: int, res: dict, dt_ms: float,

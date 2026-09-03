@@ -82,7 +82,6 @@
 - 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）。
 - 每个方法里自己 `o3d = _o3d()` 惰性 import（`_update_ball_geometry` 曾漏写致渲染线程 NameError 窗口退出）；Open3D 窗口必须在主线程开，后台线程只加载模型。
 
-<<<<<<< HEAD
 ### IMU 姿态（维特智能 WT9011DCL-BT5.0，按 i）
 
 `scripts/live_control.py` 按 **i** 读插在拍柄末端的 IMU：3D 窗口里球拍**朝向来自 IMU**（notify 线程 100Hz 直接推 `viewer3d.set_imu_orientation`，绕开主循环 ~20FPS），**位置绑到检测到的右手腕**（主循环每帧 `right_wrist_anchor` 选「离桌面原点最近的有效右手腕」→ `set_imu_anchor`，两人时即按 i 放拍在原点那一侧）。代码在 `src/tabletennis/imu/`：
@@ -115,7 +114,6 @@
   相关单测 `test_world_heading_hold_*` / `test_reader_ready_*` / `test_handle_bearing_*`。
 - `right_wrist_anchor` / `so3_project` / `imu_to_paddle_world` 逻辑可测（`viewer3d.right_wrist_anchor` 按骨架名找 `right_wrist`，halpe26=idx10；锚点默认原点 = 桌面原点 (0,0,0)）。
 - 四元数默认不上报（0x59 需 `FF AA 27 51 00` 寄存器读，当前用角度即可）。
-=======
 ### 录像 + 离线重建（EasyMocap 的主路线）
 
 录制端 `camera/recorder.py`：
@@ -140,7 +138,6 @@
   整条 录制→对齐→检测→拟合→存档 管道，无硬件/无真人视频也能验证与计时。
 - 实测单帧真机开销：检测不在此列；EmFit stream ~2.1s、official cold ~6.2s（GPU 5080）——
   即**放弃实时（100fps 视频离线跑）是必然选择**。
->>>>>>> worktree-easymocap-recon
 - 四元数默认不上报（0x51 寄存器读响应同 0x71 帧；当前用角度 + 磁力计寄存器读即可）。
 
 ## 标定工具的归属（易混）
