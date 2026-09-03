@@ -22,7 +22,9 @@
 
 多人识别：``--person-groups "[[0,2],[1,3]]"`` 每个组=一个人（组内相机拍同一个人，
 组下标=身份，仿 live_control 按 P 的 match_people_fixed）。单人用 ``--person-groups
-"[[1,3]]"``（只放拍人的那组相机）。``--det-conf`` 人检测阈值（默认 0.3）。
+"[[1,3]]"``（只放拍人的那组相机）。``--det-conf`` 人检测阈值（默认 0.2）、
+``--fit-conf`` 拟合关键点阈值（默认 0.15）——黑衣服/低亮度人关键点置信度偏低，
+阈值太高会把 2D 已检出的关节在 3D 拟合里丢掉，致其退化成均值模型。
 
 调试选项
   --fake-poses  不跑检测，注入一个合成站姿人观测 → 专用于验证 录制→对齐→重建→存档
@@ -135,8 +137,10 @@ def build_args():
     ap.add_argument("--max-frames", type=int, default=0, help="0=全部")
     ap.add_argument("--ref-cam", type=int, default=None)
     ap.add_argument("--min-cams", type=int, default=2)
-    ap.add_argument("--det-conf", type=float, default=0.3,
-                    help="人检测置信度阈值（yolo11n；实时默认 0.5 偏严，离线降到 0.3 少丢人）")
+    ap.add_argument("--det-conf", type=float, default=0.2,
+                    help="人检测置信度阈值（yolo11n bbox；黑衣服/低亮度人易被漏检，离线降到 0.2 少丢人）")
+    ap.add_argument("--fit-conf", type=float, default=0.15,
+                    help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此被丢弃；黑衣服人关键点偏低，降到 0.15 保留更多约束）")
     ap.add_argument("--person-groups", default="[[0,2],[1,3]]",
                     help="相机分组 JSON：每个组=一个人，组内相机拍同一个人（仿 live_control P）")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
@@ -215,8 +219,14 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             if obs:
                 n_seen_by_pid[g] += 1
     det_wall = time.time() - t0
-    print(f"  检测 {len(indices)} 帧耗时 {det_wall:.1f}s | 各身份被看到帧数："
-          + ", ".join(f"p{g}={n_seen_by_pid[g]}" for g in range(n_people)))
+    stats = []
+    for g in range(n_people):
+        seen = frames_obs_by_pid[g]
+        n_seen = sum(1 for obs in seen if obs)
+        avg_views = float(np.mean([len(obs) for obs in seen if obs])) if n_seen else 0.0
+        stats.append(f"p{g}={n_seen}帧/均{avg_views:.1f}视角")
+    print(f"  检测 {len(indices)} 帧耗时 {det_wall:.1f}s | 各身份被看到：{', '.join(stats)}"
+          + "（均<2 视角=常单视角，重建会退化成均值模型）")
     if pose2d_by_frame:
         save_pose2d(out_dir, pose2d_by_frame)
         print(f"  2D 姿态检测已存 pose2d.json（{len(pose2d_by_frame)} 帧）")
@@ -235,7 +245,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             continue
         results_by_pid[g] = recon.reconstruct_batch(
             frames_obs_by_pid[g], intrinsics, extrinsics,
-            min_conf=0.3, view_ids=sorted(group))
+            min_conf=args.fit_conf, view_ids=sorted(group))
         if results_by_pid[g] is None:
             print(f"  ⚠ p{g} 批量拟合失败")
     fit_wall = time.time() - t0

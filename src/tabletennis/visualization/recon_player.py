@@ -1055,10 +1055,11 @@ class _PlayerApp:
         self.scene_b.add_static(scene)
         self.scene_b.set_lighting(scene)
         w.setup_camera(50.0, self.scene_b.bounds(), self.scene_b.center())
+        w.set_view_controls(self.gui.SceneWidget.Controls.ROTATE_CAMERA)  # 左拖旋转/右拖平移/滚轮缩放
         w.set_on_key(self._on_key)
         print(f"[回放] 目标 ≈{self.fps * self.speed:.0f} 帧/秒（录制 {self.fps:.0f}fps 实时）。"
               f"显示若跟不上会自动掉帧；- / + 半速/倍速可调。")
-        print("[回放] 鼠标拖=旋转/平移/滚轮缩放；Space=暂停/继续，←/→=步进，"
+        print("[回放] 鼠标：左拖=旋转/右拖=平移/滚轮=缩放；Space=暂停/继续，←/→=步进，"
               "Home/End=首/尾，R=复位视角，Esc=退出")
         if self.overlay is not None and self.overlay.available:
             print("[回放] V=开关 2D 检测叠加窗口（四路视频 + 球框 + 关键点）")
@@ -1130,6 +1131,8 @@ class _PlayerApp:
             return
         img = _o3d().geometry.Image(np.ascontiguousarray(tile))
         self._2d_img_widget.update_image(img)
+        if self._2d_win is not None:
+            self._2d_win.post_redraw()   # 独立窗口不随主窗口自动重绘，须显式请求
 
     def _on_key(self, ev) -> bool:
         k = ev.key
