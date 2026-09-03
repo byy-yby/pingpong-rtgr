@@ -111,7 +111,7 @@ def test_timeline_no_index_watch_reload(tmp_path):
     assert tl.index_ready
 
 
-def test_load_person_ok_and_missing_joints(tmp_path):
+def test_load_people_ok_and_missing_joints(tmp_path):
     out = tmp_path / "recon"
     out.mkdir()
     _write_meta(out, n_ref=2)
@@ -119,11 +119,12 @@ def test_load_person_ok_and_missing_joints(tmp_path):
     _write_frame(out, 0, with_joints=True)
     _write_frame(out, 1, with_joints=False)
     tl = ReconTimeline(str(out))
-    p0 = tl.load_person(0)
-    assert p0["vertices"].shape == (6890, 3)
-    assert p0["joints"].shape == (24, 3)
-    p1 = tl.load_person(1)
-    assert p1["joints"] is None            # 无 joints 键不崩
+    people0 = tl.load_people(0)
+    assert len(people0) == 1
+    assert people0[0]["vertices"].shape == (6890, 3)
+    assert people0[0]["joints"].shape == (24, 3)
+    people1 = tl.load_people(1)
+    assert people1[0]["joints"] is None    # 无 joints 键不崩
 
 
 # ----------------------------------------------------------------------

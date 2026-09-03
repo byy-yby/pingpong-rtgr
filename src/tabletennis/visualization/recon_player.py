@@ -530,11 +530,11 @@ class ReconScene:
         self.cast_shadow = cast_shadow           # 脚下整身投影软影（默认开）
         self.ball_trail = ball_trail             # 球轨迹线（默认开）
         # person 用 defaultUnlit：肤色+明暗烘焙在顶点色里（bake_body_shading），
-        # 不参与场景光照 —— 人体凸凹明暗由烘焙保证（Filament 真阴影在 EGL 不可靠）
+        # 不参与场景光照 —— 人体凸凹明暗由烘焙保证（Filament 真阴影在 EGL 不可靠）。
+        # 多人身份区分靠烘焙时把对应 _PERSON_COLORS 的 skin 色传进去（见 apply_people）。
         self._mat_smpl = self._make_material(_SMPL_SKIN, roughness=0.62)
         self._mat_smpl.shader = "defaultUnlit"
         self._mat_smpl.base_color = [1.0, 1.0, 1.0, 1.0]
-        self._mats_smpl = [self._make_material(c, roughness=0.62) for c in _PERSON_COLORS]
         self._mat_bones = self._make_material(_BONE_COLOR, roughness=0.8)
         self._mat_ball = self._make_material(_BALL_COLOR, roughness=0.35)
         self._mat_ball.shader = "defaultUnlit"   # 小球不参与光照，保证 2cm 红球始终醒目
@@ -656,7 +656,7 @@ class ReconScene:
         mr.base_color = [0.0, 0.0, 0.0, float(alpha)]
         scene.add_geometry(name, m, mr)
 
-    def _add_cast_shadow(self, scene, verts: np.ndarray) -> None:
+    def _add_cast_shadow(self, scene, verts: np.ndarray, name: str = "cast") -> None:
         """在人物脚下画整身投影软影：顶点沿光水平方向投到地面 → 凸包填充盘。
 
         两片小接触椭圆（~0.3m）在真场景里小到几乎看不见；投影整身轮廓才能给出
@@ -687,7 +687,7 @@ class ReconScene:
         mr = o3d.visualization.rendering.MaterialRecord()
         mr.shader = "defaultLitTransparency"
         mr.base_color = [0.0, 0.0, 0.0, _CAST_ALPHA]
-        scene.add_geometry("cast", mesh, mr)
+        scene.add_geometry(name, mesh, mr)
 
     def _add_axes(self, scene, origin: np.ndarray, name: str, size: float) -> None:
         o3d = self.o3d
@@ -762,43 +762,10 @@ class ReconScene:
         """把 t 处的（可能多个）人体喂给场景。返回 True 表示本帧有人体被显示。"""
         people = self.tl.load_people(t)
         o3d = self.o3d
-        # 总是先移除旧几何，再按当前状态重建（简单且无残留）
-        for name in ("person", "bones", "cast", "shadow0", "shadow1"):
-            try:
-                scene.remove_geometry(name)
-            except Exception:  # noqa: BLE001
-                pass
-        if person is None:
-            self._last_t = None
-            return False
-
-        verts = person["vertices"]
-        # 整身投影软影（大而淡，把人体锚在地面）→ 再叠两片小接触盘（脚底核心深影）
-        if self.cast_shadow:
-            self._add_cast_shadow(scene, verts)
-        for d in contact_shadow_planes(verts, self.floor_z):
-            self._add_shadow_disc(scene, d["name"], d["center"], d["e"],
-                                  d["rx"], d["ry"], d["alpha"])
-        # 网格
-        if self.faces is not None and len(verts):
-            mesh = o3d.geometry.TriangleMesh()
-            mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
-            mesh.triangles = o3d.utility.Vector3iVector(self.faces.astype(np.int32))
-            mesh.compute_vertex_normals()
-            # 凸凹明暗烘焙进顶点色（defaultUnlit 显示）：见 bake_body_shading
-            mesh.vertex_colors = o3d.utility.Vector3dVector(
-                bake_body_shading(np.asarray(mesh.vertex_normals)))
-            scene.add_geometry("person", mesh, self._mat_smpl)
-        # 骨骼（若 npz 里有关节 24×3）
-        joints = person.get("joints")
-        if joints is not None and len(joints):
-            ls = o3d.geometry.LineSet()
-            ls.points = o3d.utility.Vector3dVector(joints[:24].astype(np.float64))
-            ls.lines = o3d.utility.Vector2iVector(np.asarray(_SMPL_EDGES, np.int32))
-            self._add_line_geo(scene, "bones", ls, _BONE_COLOR * 0.85, 2.0)
         # 总是先移除上一帧的人体几何，再按当前状态重建（简单且无残留）
         for p in range(max(1, self._last_n_people)):
-            for name in (f"person_{p}", f"bones_{p}", f"shadow0_{p}", f"shadow1_{p}"):
+            for name in (f"person_{p}", f"bones_{p}", f"cast_{p}",
+                         f"shadow0_{p}", f"shadow1_{p}"):
                 try:
                     scene.remove_geometry(name)
                 except Exception:  # noqa: BLE001
@@ -810,18 +777,22 @@ class ReconScene:
 
         for p, person in enumerate(people):
             verts = person["vertices"]
-            # 程序化接触阴影（画在人物网格之前，透明混合；见 contact_shadow_planes）
+            skin = _PERSON_COLORS[p % len(_PERSON_COLORS)]
+            # 整身投影软影（把人体锚在地面）→ 再叠两片脚下接触盘（核心深影）
+            if self.cast_shadow:
+                self._add_cast_shadow(scene, verts, name=f"cast_{p}")
             for d in contact_shadow_planes(verts, self.floor_z):
                 self._add_shadow_disc(scene, f"{d['name']}_{p}", d["center"], d["e"],
                                       d["rx"], d["ry"], d["alpha"])
-            # 网格（按身份着色）
-            mat = self._mats_smpl[p % len(self._mats_smpl)]
+            # 网格（按身份着色：凸凹明暗烘焙进顶点色，defaultUnlit 显示）
             if self.faces is not None and len(verts):
                 mesh = o3d.geometry.TriangleMesh()
                 mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
                 mesh.triangles = o3d.utility.Vector3iVector(self.faces.astype(np.int32))
                 mesh.compute_vertex_normals()
-                scene.add_geometry(f"person_{p}", mesh, mat)
+                mesh.vertex_colors = o3d.utility.Vector3dVector(
+                    bake_body_shading(np.asarray(mesh.vertex_normals), skin=skin))
+                scene.add_geometry(f"person_{p}", mesh, self._mat_smpl)
             # 骨骼（若 npz 里有关节 24×3）
             joints = person.get("joints")
             if joints is not None and len(joints):
@@ -911,9 +882,8 @@ def render_still(tl: ReconTimeline, t: int, width: int = 1280, height: int = 720
     sc = r.scene
     sc.set_background(np.array([0.09, 0.10, 0.13, 1.0], np.float32))
     scene_b.add_static(sc)
-    scene_b.apply_person(sc, t)
-    scene_b.apply_ball(sc, t)
     scene_b.apply_people(sc, t)
+    scene_b.apply_ball(sc, t)
     scene_b.set_lighting(sc)
 
     c = scene_b.center()
@@ -1038,7 +1008,7 @@ class _PlayerApp:
             return
         self._need_show = False
         self.last_render_t = t0
-        person = self.scene_b.apply_person(self.widget.scene, t0)
+        person = self.scene_b.apply_people(self.widget.scene, t0)
         has_ball = self.scene_b.apply_ball(self.widget.scene, t0)
         self.widget.force_redraw()     # 场景变了立即重绘，别等事件流捎带（否则卡/跳帧）
         rate = self.speed * self.fps

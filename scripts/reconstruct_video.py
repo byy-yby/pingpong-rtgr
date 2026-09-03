@@ -149,12 +149,12 @@ def build_args():
     ap.add_argument("--em-verbose", action="store_true")
     ap.add_argument("--easymocap-root", default="/home/yby/projects/EasyMocap")
     ap.add_argument("--no-ball", action="store_true", help="跳过球轨迹重建（默认开启）")
-    ap.add_argument("--ball-detector", choices=["classical", "yolo"], default="classical",
-                    help="球检测路线：classical（默认，背景减除+帧差）/ yolo（onnx）")
+    ap.add_argument("--ball-detector", choices=["classical", "yolo"], default="yolo",
+                    help="球检测路线：yolo（默认，onnx，与 live_control 一致）/ classical（背景减除+帧差，先验弱易误检）")
     ap.add_argument("--ball-model", default=None,
                     help="YOLO 球 ONNX 模型路径（给定则覆盖 --ball-detector yolo 的自动查找）")
     ap.add_argument("--ball-imgsz", type=int, default=1280, help="YOLO 球检测输入分辨率")
-    ap.add_argument("--ball-min-conf", type=float, default=0.3, help="球三角化最低置信度")
+    ap.add_argument("--ball-min-conf", type=float, default=0.15, help="球三角化最低置信度")
     ap.add_argument("--ball-radius-min", type=float, default=5.0, help="经典检测球半径像素下限")
     ap.add_argument("--ball-radius-max", type=float, default=15.0, help="经典检测球半径像素上限")
     return ap.parse_args()
