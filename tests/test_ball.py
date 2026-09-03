@@ -267,6 +267,48 @@ def test_tracker_mahalanobis_rejects_clear_outlier():
     assert tr.coast == 1                # 判为外点
 
 
+def test_tracker_floor_bounce_prevents_piercing():
+    """球下落 coast 穿过桌面时应反弹，输出 z 永不 < floor_z（防穿模）。"""
+    g = 9.81
+    tr = BallTracker(dt=0.02, process_noise=1.0, meas_noise_m=0.001,
+                     gravity=(0.0, 0.0, -g), floor_z=0.02, restitution=0.9,
+                     max_coast=200)
+    z, vz = 0.5, 0.0
+    for _ in range(100):                # 喂自由落体测量，建立向下速度，直到接近桌面
+        vz -= g * 0.02
+        z += vz * 0.02
+        if z < 0.02:
+            break
+        tr.update(np.array([0.0, 0.0, z]), conf=0.9)
+    assert tr.velocity[2] < 0.0         # 下落速度已建立（负）
+    min_z = float("inf")
+    for _ in range(40):                 # coast：预测向下穿 → 应在桌面反弹
+        out = tr.update(None, conf=0.0)
+        assert out is not None
+        min_z = min(min_z, float(out[2]))
+    assert min_z >= 0.02 - 1e-6         # 永不击穿桌面
+    assert tr.velocity[2] > 0.0         # 已反弹，速度朝上
+
+
+def test_tracker_floor_bounce_follows_bounce_measurements():
+    """真实弹跳测量序列（下落→反弹）应被滤波跟住，且不穿桌。"""
+    g = 9.81
+    dt = 0.01
+    tr = BallTracker(dt=dt, process_noise=500.0, meas_noise_m=0.001,
+                     gravity=(0.0, 0.0, -g), floor_z=0.02, restitution=0.9,
+                     gate_sigma=3.0, max_coast=10)
+    z, vz = 1.0, 0.0
+    for _ in range(100):                # 解析弹道：自由落体→桌面反弹（e=0.9）
+        vz -= g * dt
+        z += vz * dt
+        if z < 0.02:
+            z = 0.02 + (0.02 - z)       # 反射位置
+            vz = abs(vz) * 0.9
+        out = tr.update(np.array([0.0, 0.0, z]), conf=0.9)
+        assert out[2] >= 0.02 - 1e-6    # 全程不穿桌（多次反弹仍被跟住）
+    assert tr.initialized               # 从未失联
+
+
 # ----------------------------------------------------------------------
 # classical detector
 # ----------------------------------------------------------------------

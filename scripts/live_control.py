@@ -1054,6 +1054,7 @@ class LiveControl:
                 dt=0.01, process_noise=1000.0, meas_noise_m=0.002,
                 gate_m=0.3, min_conf=0.0, max_coast=10,
                 gravity=(0.0, 0.0, -9.81), gate_sigma=3.0,
+                floor_z=0.02, restitution=0.9,
             )
             self._ball_last_t = None
             self.ball_filter = True

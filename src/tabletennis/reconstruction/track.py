@@ -19,7 +19,7 @@ __all__ = ["BallTracker"]
 
 
 class BallTracker:
-    """3D 球轨迹卡尔曼滤波器（常速度模型，可选已知重力 → 弹道模型）。"""
+    """3D 球轨迹卡尔曼滤波器（常速度模型，可选已知重力 → 弹道模型，可选桌面反弹）。"""
 
     def __init__(
         self,
@@ -31,6 +31,8 @@ class BallTracker:
         max_coast: Optional[int] = None,
         gravity: Optional[np.ndarray] = None,
         gate_sigma: Optional[float] = None,
+        floor_z: Optional[float] = None,
+        restitution: float = 0.9,
     ) -> None:
         """
         Args:
@@ -49,6 +51,10 @@ class BallTracker:
             gate_sigma: 马氏距离门限（σ 数）。非 None 时用 ``innovᵀ S⁻¹ innov``（S 为
                 新息协方差）判离群点，门限随 coast 期间不确定性增长自动放宽，球重新
                 出现时更不易被误拒。None = 用固定欧氏 ``gate_m``。
+            floor_z: 球心最低 z（米，世界系；= 桌面 z + 球半径）。非 None 时，预测若
+                向下穿过该平面就触发反弹：钳回 floor_z 并竖直速度反向（乘 ``restitution``），
+                否则球下落会击穿桌面（穿模）。None = 不约束（旧行为）。
+            restitution: 反弹的竖直恢复系数（0~1）。乒乓球在球台上约 0.9。
         """
         self.dt = float(dt)
         self.q = float(process_noise)
@@ -58,6 +64,8 @@ class BallTracker:
         self.max_coast = None if max_coast is None else int(max_coast)
         self.gravity = None if gravity is None else np.asarray(gravity, dtype=np.float64).reshape(3)
         self.gate_sigma = None if gate_sigma is None else float(gate_sigma)
+        self.floor_z = None if floor_z is None else float(floor_z)
+        self.restitution = float(restitution)
 
         self.x = np.zeros(6, dtype=np.float64)   # [px,py,pz,vx,vy,vz]
         self.P = np.eye(6, dtype=np.float64) * 1.0
@@ -87,6 +95,11 @@ class BallTracker:
             # 已知重力作为控制输入（弹道模型）：位置 += ½g·dt²、速度 += g·dt
             self.x[0:3] += self.gravity * (0.5 * dt * dt)
             self.x[3:6] += self.gravity * dt
+        if self.floor_z is not None and self.x[2] < self.floor_z and self.x[5] < 0.0:
+            # 球向下穿过桌面 → 反弹：钳回桌面平面 + 竖直速度反向（恢复系数）。
+            # 否则滤波会在碰撞那几帧继续往下积分，球击穿桌面（穿模）。
+            self.x[2] = self.floor_z
+            self.x[5] = -self.restitution * self.x[5]
         self.P = F @ self.P @ F.T + self._process_cov(dt)
 
     def _update(self, z: np.ndarray) -> None:
