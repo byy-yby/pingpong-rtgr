@@ -23,7 +23,7 @@
 交互
   鼠标：左拖=旋转，右键拖=平移，滚轮=缩放
   键盘：Space=播放/暂停，←/→=步进一帧，Home/End=首/尾，R=复位视角，
-        -=/+ 半速/倍速，Esc=退出
+        S=从头播放，-=/+ 半速/倍速，Esc=退出
 
 要求重建输出里带 ``recon_faces.npy``（网格拓扑，SMPL 网格必需；新版
 reconstruct_video.py 会自动写）。旧输出缺它时可加 ``--easymocap-root`` 让本脚本用

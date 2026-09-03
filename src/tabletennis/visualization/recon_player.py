@@ -30,6 +30,7 @@
 """
 from __future__ import annotations
 
+import gc
 import os
 import time
 from typing import Dict, List, Optional
@@ -1037,29 +1038,37 @@ class _PlayerApp:
 
     def run(self) -> None:
         self._setup()
-        next_due = time.perf_counter()
-        was_playing = self.playing
-        while self.app.run_one_tick():
-            now = time.perf_counter()
-            if self.watch:
-                self._watch_poll(now)
-            if self.playing:
-                if not was_playing:
-                    next_due = now          # 暂停→播放：重置调度，不连补欠账
-                self._show()
-                self._step_forward()
-                budget = 1.0 / max(1.0, self.speed * self.fps)
-                next_due += budget
-                if next_due < now:
-                    next_due = now          # 渲染慢于目标：不睡，逐帧追（不掉帧）
-                delay = next_due - time.perf_counter()
-                if delay > 0:
-                    time.sleep(min(delay, 0.02))
-            else:
-                self._show()
-                time.sleep(0.02)
-            was_playing = self.playing
-        self.win.close()
+        self._warmup()
+        gc.collect()
+        gc.disable()               # 回放期间关自动 GC：实测每 ~30 帧一次 ~25ms 停顿
+        was_playing = self.playing  # （24 个临时几何/帧 × 30 帧 ≈ GC 阈值 700），关掉后
+        next_due = time.perf_counter()  # 停顿从 27/600 降到 5/600（余下来自 GPU 驱动）
+        try:
+            while self.app.run_one_tick():
+                now = time.perf_counter()
+                if self.watch:
+                    self._watch_poll(now)
+                if self.playing:
+                    if not was_playing:
+                        next_due = now          # 暂停→播放：重置调度，不连补欠账
+                    self._show()
+                    self._step_forward()
+                    budget = 1.0 / max(1.0, self.speed * self.fps)
+                    next_due += budget
+                    if next_due < now:
+                        next_due = now          # 渲染慢于目标：不睡，逐帧追（不掉帧）
+                    delay = next_due - time.perf_counter()
+                    if delay > 0:
+                        time.sleep(min(delay, 0.02))
+                else:
+                    self._show()
+                    if was_playing:
+                        gc.collect()            # 刚暂停时收一次，避免长时间回放内存累积
+                    time.sleep(0.02)
+                was_playing = self.playing
+        finally:
+            gc.enable()
+            self.win.close()
 
     # -- watch：重建进行中，周期性重扫输出目录，追新帧 ----------------------
     def _watch_poll(self, now: float) -> None:
@@ -1102,9 +1111,28 @@ class _PlayerApp:
         print(f"[回放] 目标 ≈{self.fps * self.speed:.0f} 帧/秒（录制 {self.fps:.0f}fps 实时）。"
               f"每帧都渲染（跟得上=实时，跟不上=平滑慢放不跳帧）；- / + 半速/倍速可调。")
         print("[回放] 鼠标：左拖=旋转/右拖=平移/滚轮=缩放；Space=暂停/继续，←/→=步进，"
-              "Home/End=首/尾，R=复位视角，Esc=退出")
+              "Home/End=首/尾，R=复位视角，S=从头播放，Esc=退出")
         if self.overlay is not None and self.overlay.available:
             print("[回放] V=开关 2D 检测叠加窗口（四路视频 + 球框 + 关键点）")
+
+    def _warmup(self) -> None:
+        """首帧预热：渲染几帧真人，提前编译透明阴影等 shader + 摊平 GPU 缓冲分配。
+
+        实测首帧 ``run_one_tick`` 会卡 ~190ms（Filament 首次编译 defaultUnlit/
+        defaultLitTransparency 着色器 + GPU 缓冲分配）；在进入回放循环前渲染几帧
+        真人把这些一次性开销摊到开窗前，避免播放开头「卡一下」。
+        """
+        warmed = 0
+        for t in self.tl.files:
+            if not self.tl.load_people(t):
+                continue
+            self.scene_b.apply_people(self.widget.scene, t)
+            self.scene_b.apply_ball(self.widget.scene, t)
+            self.widget.force_redraw()
+            self.app.run_one_tick()
+            warmed += 1
+            if warmed >= 3:
+                return
 
     def _step_forward(self) -> None:
         """前进一帧：每帧都渲染（不按墙钟跳帧），保证动作连续不顿。
@@ -1200,6 +1228,9 @@ class _PlayerApp:
             self.playing = False
         elif k == ord("R"):
             self.widget.setup_camera(50.0, self.scene_b.bounds(), self.scene_b.center())
+        elif k == ord("s") or k == ord("S"):
+            self.t = 0.0
+            self.playing = True
         elif k == ord("V") or k == ord("v"):
             self._toggle_2d()
         elif k == ord("-"):
