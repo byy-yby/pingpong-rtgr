@@ -42,6 +42,14 @@ from .viewer3d import (
 _SMPL_SKIN = np.array([0.82, 0.71, 0.60], np.float32)
 _BONE_COLOR = np.array([0.95, 0.60, 0.25], np.float32)
 
+# 多人配色：person 0 用肤色，其余用区分度高的纯色（按身份稳定着色）
+_PERSON_COLORS = [
+    _SMPL_SKIN,
+    np.array([0.36, 0.56, 0.86], np.float32),   # 蓝
+    np.array([0.86, 0.36, 0.40], np.float32),   # 红
+    np.array([0.42, 0.72, 0.46], np.float32),   # 绿
+]
+
 _FLOOR_COLOR = np.array([0.36, 0.38, 0.46], np.float32)   # 地面（接阴影）
 _FLOOR_ALPHA = 1.0
 
@@ -205,21 +213,30 @@ class ReconTimeline:
         i = int(self.state[t])
         return None if i < 0 else self._file_list[i]
 
-    def load_person(self, t: int) -> Optional[dict]:
-        """读 t 处 npz：``{vertices (6890,3), joints (24,3)}``；读失败返回 None。"""
+    def load_people(self, t: int) -> List[dict]:
+        """读 t 处 npz：返回 ``[{vertices (6890,3), joints (24,3)}, ...]``（多人）。
+
+        旧单帧格式（无 ``n_people``）当作 1 人；新格式 person 0 无后缀、p≥1 用 ``_p``。
+        读失败返回空列表。
+        """
         path = self.person_path_at(t)
         if path is None:
-            return None
+            return []
         try:
             with np.load(path) as z:
-                verts = np.asarray(z["vertices"], np.float32).reshape(-1, 3)
-                joints = None
-                if "joints" in z:
-                    joints = np.asarray(z["joints"], np.float32).reshape(-1, 3)
-            return {"vertices": verts, "joints": joints}
+                n_people = int(z["n_people"]) if "n_people" in z else 1
+                out = []
+                for p in range(n_people):
+                    suf = "" if p == 0 else f"_{p}"
+                    verts = np.asarray(z[f"vertices{suf}"], np.float32).reshape(-1, 3)
+                    joints = None
+                    if f"joints{suf}" in z:
+                        joints = np.asarray(z[f"joints{suf}"], np.float32).reshape(-1, 3)
+                    out.append({"vertices": verts, "joints": joints})
+                return out
         except Exception as exc:  # noqa: BLE001 —— 重建正在写/文件半截
             print(f"[recon_player] ⚠ t={t} 读帧失败：{exc}")
-            return None
+            return []
 
 
 # ----------------------------------------------------------------------
@@ -288,9 +305,10 @@ class ReconScene:
         self.floor_z = -self.table.height
         self.intrinsics, self.extrinsics = (camera_rig or (None, None))
         self.faces = faces                       # (13776,3) int；None 则只画关节
-        self._mat_smpl = self._make_material(_SMPL_SKIN, roughness=0.62)
+        self._mats_smpl = [self._make_material(c, roughness=0.62) for c in _PERSON_COLORS]
         self._mat_bones = self._make_material(_BONE_COLOR, roughness=0.8)
         self._last_t = None
+        self._last_n_people = 0
         self.n_added = 0
 
     # ------------------------------------------------------------------
@@ -480,39 +498,43 @@ class ReconScene:
         except Exception:  # noqa: BLE001
             pass
 
-    def apply_person(self, scene, t: int) -> bool:
-        """把 t 处的人体喂给场景。返回 True 表示本帧有人体被显示。"""
-        person = self.tl.load_person(t)
+    def apply_people(self, scene, t: int) -> bool:
+        """把 t 处的（可能多个）人体喂给场景。返回 True 表示本帧有人体被显示。"""
+        people = self.tl.load_people(t)
         o3d = self.o3d
-        # 总是先移除旧几何，再按当前状态重建（简单且无残留）
-        for name in ("person", "bones", "shadow0", "shadow1"):
-            try:
-                scene.remove_geometry(name)
-            except Exception:  # noqa: BLE001
-                pass
-        if person is None:
+        # 总是先移除上一帧的人体几何，再按当前状态重建（简单且无残留）
+        for p in range(max(1, self._last_n_people)):
+            for name in (f"person_{p}", f"bones_{p}", f"shadow0_{p}", f"shadow1_{p}"):
+                try:
+                    scene.remove_geometry(name)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._last_n_people = len(people)
+        if not people:
             self._last_t = None
             return False
 
-        verts = person["vertices"]
-        # 程序化接触阴影（画在人物网格之前，透明混合；见 contact_shadow_planes）
-        for d in contact_shadow_planes(verts, self.floor_z):
-            self._add_shadow_disc(scene, d["name"], d["center"], d["e"],
-                                  d["rx"], d["ry"], d["alpha"])
-        # 网格
-        if self.faces is not None and len(verts):
-            mesh = o3d.geometry.TriangleMesh()
-            mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
-            mesh.triangles = o3d.utility.Vector3iVector(self.faces.astype(np.int32))
-            mesh.compute_vertex_normals()
-            scene.add_geometry("person", mesh, self._mat_smpl)
-        # 骨骼（若 npz 里有关节 24×3）
-        joints = person.get("joints")
-        if joints is not None and len(joints):
-            ls = o3d.geometry.LineSet()
-            ls.points = o3d.utility.Vector3dVector(joints[:24].astype(np.float64))
-            ls.lines = o3d.utility.Vector2iVector(np.asarray(_SMPL_EDGES, np.int32))
-            self._add_line_geo(scene, "bones", ls, _BONE_COLOR * 0.85, 2.0)
+        for p, person in enumerate(people):
+            verts = person["vertices"]
+            # 程序化接触阴影（画在人物网格之前，透明混合；见 contact_shadow_planes）
+            for d in contact_shadow_planes(verts, self.floor_z):
+                self._add_shadow_disc(scene, f"{d['name']}_{p}", d["center"], d["e"],
+                                      d["rx"], d["ry"], d["alpha"])
+            # 网格（按身份着色）
+            mat = self._mats_smpl[p % len(self._mats_smpl)]
+            if self.faces is not None and len(verts):
+                mesh = o3d.geometry.TriangleMesh()
+                mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+                mesh.triangles = o3d.utility.Vector3iVector(self.faces.astype(np.int32))
+                mesh.compute_vertex_normals()
+                scene.add_geometry(f"person_{p}", mesh, mat)
+            # 骨骼（若 npz 里有关节 24×3）
+            joints = person.get("joints")
+            if joints is not None and len(joints):
+                ls = o3d.geometry.LineSet()
+                ls.points = o3d.utility.Vector3dVector(joints[:24].astype(np.float64))
+                ls.lines = o3d.utility.Vector2iVector(np.asarray(_SMPL_EDGES, np.int32))
+                self._add_line_geo(scene, f"bones_{p}", ls, _BONE_COLOR * 0.85, 2.0)
         self._last_t = t
         return True
 
@@ -556,7 +578,7 @@ def render_still(tl: ReconTimeline, t: int, width: int = 1280, height: int = 720
     sc = r.scene
     sc.set_background(np.array([0.09, 0.10, 0.13, 1.0], np.float32))
     scene_b.add_static(sc)
-    scene_b.apply_person(sc, t)
+    scene_b.apply_people(sc, t)
     scene_b.set_lighting(sc)
 
     c = scene_b.center()
@@ -669,7 +691,7 @@ class _PlayerApp:
             return
         self._need_show = False
         self.last_render_t = t0
-        person = self.scene_b.apply_person(self.widget.scene, t0)
+        person = self.scene_b.apply_people(self.widget.scene, t0)
         self.win.title = (f"EasyMocap 重建回放 — {os.path.basename(self.tl.out_dir)}"
                           f"  |  t {t0}/{max(0, self.tl.n_ref - 1)}"
                           f"  |  {'● 人物' if person else '— 无人'}"
