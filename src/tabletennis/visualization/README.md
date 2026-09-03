@@ -21,10 +21,18 @@
 `ReconScene` 场景 + `render_still` EGL 出图 + `play_gui` 交互窗口）：
 
 - 逐帧回放 SMPL 网格（主时钟 t，no_person/失败清空、被 stride 跳过帧保持上姿态）。
-- 人体 PBR 环境光着色（曾因法线没重算 render 成一片白）；接触阴影是程序化两层半透明
-  椭圆（Filament 太阳定向光在本机 OpenGL 下实测不生效，见模块 docstring）。
+  播放按**内容帧边界 pacing**：目标速度 = 录像真实出帧率（`recon_meta.json` 的
+  period 反推，100fps 录制 → 实时回放），标题栏实时显示 `≈N帧/秒`，渲染跟不上
+  自动掉帧不慢放。**`--hold-gaps N`**（默认 3≈30ms）：连续 no_person ≤ N 帧保持
+  上一姿态不清空，100Hz 拟合单帧抖动不会把人体闪没。
+- 人体 PBR 环境光着色（曾因法线没重算 render 成一片白）；阴影是程序化假影
+  （Filament 太阳定向光在本机 OpenGL 下实测不生效，见模块 docstring），**两层都画
+  在地板平面**：① 两片脚下接触椭圆（核心深影）② **整身投影软影**（所有 SMPL 顶点
+  沿光水平方向投到地面 → 凸包填充盘，带身形且随姿态伸长，默认开、`--no-cast` 关）。
+  重建的 SMPL 脚底常悬空几 cm，影子钉在地板才是真「地上影」（贴脚画会悬空）。
 - 交互：Space 暂停/播放、←/→ 步进、Home/End、R 复位、-/= 调速、Esc 退出。
-- 用法：`scripts/visualize_recon.py <recon目录>`（加 `--watch` 在重建进行中追帧）。
+- 用法：`scripts/visualize_recon.py <recon目录>`（加 `--watch` 在重建进行中追帧，
+  `--render T out.png` EGL 出图验证）。
 
 骨架连线/关键点定义从 `vision.skeleton.get_skeleton()` 取，保证画图和检测用的同一套索引。
 

@@ -130,18 +130,18 @@ def test_load_person_ok_and_missing_joints(tmp_path):
 # contact_shadow_planes（程序化接触阴影）
 # ----------------------------------------------------------------------
 def test_shadow_planes_under_feet_and_follow_sun():
-    # 一个“站立”在 z=0 地面上的人（脚底 0，头顶 1.75）
+    # 一个“站立”在地面上的人：脚底 = 地板 = 0，头顶 1.75
     verts = np.zeros((8, 3))
     verts[:, 2] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.4, 1.75, 1.75]
     verts[:, 0] = np.arange(8) * 0.05          # 沿 +x 散开一点
     sun = np.array([1.0, 0.0, 0.5])
     sun = sun / np.linalg.norm(sun)
 
-    layers = contact_shadow_planes(verts, floor_z=-0.76, sun_dir=sun)
+    layers = contact_shadow_planes(verts, floor_z=0.0, sun_dir=sun)
     assert len(layers) == 2
     for d in layers:
         assert d["rx"] > d["ry"] > 0
-        assert abs(d["center"][2] - 0.004) < 1e-6   # 略高于脚底平面防 z-fight
+        assert abs(d["center"][2] - 0.004) < 1e-6   # 略高于地板平面防 z-fight
         assert d["center"][1] == pytest.approx(0.0, abs=1e-9)  # y 居中
         # 影子沿 +x（太阳水平方向）偏移 → 盘心在立足点 x 正侧
         assert d["center"][0] > 0.0
@@ -150,7 +150,7 @@ def test_shadow_planes_under_feet_and_follow_sun():
 
     # 太阳从另一侧 → 影子翻到 -x
     sun2 = np.array([-1.0, 0.0, 0.5])
-    layers2 = contact_shadow_planes(verts, floor_z=-0.76, sun_dir=sun2)
+    layers2 = contact_shadow_planes(verts, floor_z=0.0, sun_dir=sun2)
     for d, d2 in zip(layers, layers2):
         assert d2["center"][0] < 0.0
         assert abs(d["center"][1] - d2["center"][1]) < 1e-9
@@ -161,11 +161,102 @@ def test_shadow_planes_empty_verts():
     assert contact_shadow_planes(None, -0.76) == []
 
 
-def test_shadow_clamps_below_floor():
-    # 脚底陷到地面以下（SMPL 常轻微穿透）→ 阴影盘贴回地板上方而非埋在地里
-    verts = np.zeros((6, 3))
-    verts[:, 2] = -0.79                       # 低于 floor_z=-0.76
-    layers = contact_shadow_planes(verts, floor_z=-0.76)
-    assert len(layers) == 2
-    for d in layers:
-        assert abs(d["center"][2] - (-0.756)) < 1e-6   # max(-0.79,-0.76)+0.004
+def test_shadow_disc_pinned_to_floor_plane():
+    # 盘心永远钉在地板平面上（floor_z+0.004），不随脚底抬起：
+    # SMPL 脚底悬空地板上方几 cm 是常态（实测 median ~-0.71 vs floor -0.76），
+    # 若盘子贴脚平面就会悬在地板上方、低视角看是脱开的深斑。
+    for foot_z in (-0.68, -0.79):            # 悬浮 / 穿透 两种都钉地板
+        verts = np.zeros((6, 3))
+        verts[:, 2] = foot_z
+        layers = contact_shadow_planes(verts, floor_z=-0.76)
+        assert len(layers) == 2
+        for d in layers:
+            assert abs(d["center"][2] - (-0.756)) < 1e-6   # floor_z + 0.004
+
+
+# ----------------------------------------------------------------------
+# 整身投影软影（project_floor_shadow + ReconTimeline.hold_gaps）
+# ----------------------------------------------------------------------
+def test_project_floor_shadow_elongates_with_height():
+    from tabletennis.visualization.recon_player import project_floor_shadow
+    # 站在 z=0 地面：脚底 (0,0)、头顶 1m 处一点
+    verts = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.2, 0.1, 0.5]])
+    sun = np.array([1.0, 0.0, 0.5]); sun = sun / np.linalg.norm(sun)
+    proj = project_floor_shadow(verts, floor_z=0.0, sun_dir=sun, k=0.5)
+    assert proj.shape == (3, 2)
+    # 脚底不动；1m 高处沿 +x 伸 0.5m
+    assert proj[0, 0] == pytest.approx(0.0, abs=1e-12)
+    assert proj[0, 1] == pytest.approx(0.0, abs=1e-12)
+    assert proj[1, 0] == pytest.approx(0.5, abs=1e-12)   # 1.0m * 0.5
+    assert proj[1, 1] == pytest.approx(0.0, abs=1e-12)   # y 分量 0
+    # 中间高度按比例：0.5m → 0.25m
+    assert proj[2, 0] == pytest.approx(0.2 + 0.25, abs=1e-12)
+    # 太阳反向 → 影朝 -x
+    sun2 = np.array([-1.0, 0.0, 0.5])
+    proj2 = project_floor_shadow(verts, 0.0, sun_dir=sun2, k=0.5)
+    assert proj2[1, 0] == pytest.approx(-0.5, abs=1e-12)
+
+
+def test_project_floor_shadow_clips_below_floor_and_empty():
+    from tabletennis.visualization.recon_player import project_floor_shadow
+    # 陷到地面以下的顶点不再往回缩（clip 到 0）
+    verts = np.array([[1.0, 2.0, -0.79], [0.0, 0.0, -0.8]])
+    sun = np.array([1.0, 0.0, 1.0])
+    proj = project_floor_shadow(verts, floor_z=-0.76, sun_dir=sun, k=0.5)
+    assert proj.shape == (2, 2)
+    assert proj[0, 0] == pytest.approx(1.0, abs=1e-12)    # (-0.79 < floor) → 原位
+    assert project_floor_shadow(np.empty((0, 3)), 0.0).shape == (0, 2)
+    assert project_floor_shadow(None, 0.0).shape == (0, 2)
+
+
+def test_convex_hull2d_ccw_square_and_area():
+    from tabletennis.visualization.recon_player import convex_hull2d
+    # 含内部点的正方形 → 只留 4 角，CCW 有序
+    pts = np.array([[0, 0], [1, 0], [1, 1], [0, 1], [0.5, 0.5], [0.2, 0.7]])
+    hull = convex_hull2d(pts)
+    assert hull is not None and len(hull) == 4
+    # CCW + 面积为 1（标准 shoelace，>0 即 CCW）
+    a = 0.5 * (hull[:, 0] * np.roll(hull[:, 1], -1)
+               - hull[:, 1] * np.roll(hull[:, 0], -1)).sum()
+    assert a == pytest.approx(1.0, abs=1e-9)   # 正值 = CCW → 三角扇法线 +Z
+
+
+def test_convex_hull2d_degenerate_returns_none():
+    from tabletennis.visualization.recon_player import convex_hull2d
+    assert convex_hull2d(np.empty((0, 2))) is None
+    assert convex_hull2d(np.array([[0, 0], [1, 1]])) is None       # <3 点
+    collinear = np.array([[0, 0], [1, 1], [2, 2], [3, 3], [0.5, 0.5]])
+    assert convex_hull2d(collinear) is None                        # 全共线
+    # 共面但投影在 xy 非共线 → 正常返回（cast 的实际使用形态）
+    ring = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float64)
+    assert convex_hull2d(ring) is not None
+
+
+def test_hold_gaps_keeps_through_short_gaps_only(tmp_path):
+    out = tmp_path / "recon"
+    out.mkdir()
+    # t0..2 ok；t3 no_person；t4 ok；t5..7 连续 no_person；t8..9 ok；t10..11 stride 跳过
+    _write_meta(out, n_ref=12)
+    _write_index(out, refs=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                 status=[0, 0, 0, 1, 0, 1, 1, 1, 0, 0])
+    for t in (0, 1, 2, 4, 8, 9):
+        _write_frame(out, t)
+    f4 = str(out / "frame_000004.npz")
+
+    # hold=0：语义精确——遇 no_person 立即清空
+    tl0 = ReconTimeline(str(out), hold_gaps=0)
+    assert tl0.person_path_at(3) is None
+    assert tl0.person_path_at(5) is None and tl0.person_path_at(7) is None
+
+    # hold=2：单帧空窗(t3)保持；连续 3 帧空窗(t5..7)第 3 帧开始清空
+    tl2 = ReconTimeline(str(out), hold_gaps=2)
+    assert tl2.person_path_at(3) == str(out / "frame_000002.npz")
+    assert tl2.person_path_at(5) == f4          # 第 1 个 empty 保持
+    assert tl2.person_path_at(6) == f4          # 第 2 个 empty 保持
+    assert tl2.person_path_at(7) is None        # 第 3 个 > hold → 清空
+    assert tl2.person_path_at(8) == str(out / "frame_000008.npz")
+
+    # hold=3：t5..7 全保持（3 ≤ hold）；stride 跳过帧照常保持最近姿态
+    tl3 = ReconTimeline(str(out), hold_gaps=3)
+    assert tl3.person_path_at(7) == f4
+    assert tl3.person_path_at(11) == str(out / "frame_000009.npz")

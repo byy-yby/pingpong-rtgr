@@ -2,9 +2,12 @@
 """把某次离线重建（``scripts/reconstruct_video.py`` 的输出目录）做成 3D 回放。
 
 在 Open3D 新 Filament 渲染器里搭出 球桌 + 地面 + 相机视锥 场景，逐帧回放 SMPL
-拟合结果——人物网格按太阳光照着色并在桌面/地面投射**真实接触阴影**（不是旧
-``Visualizer`` 的 headlight 平面白）。播放语义与重建一致：no_person/失败帧清空
-人体；被 ``--stride`` 跳过的帧保持上一姿态。
+拟合结果——人物网格按环境光着色，脚下有**整身投影软影**（沿光水平方向投影
+人体轮廓，把人锚在地面上；不是旧 ``Visualizer`` 的 headlight 平面白）。播放
+语义与重建一致：no_person/失败帧清空人体；被 ``--stride`` 跳过的帧保持上一姿态。
+**播放观感**：连续 no_person ≤ ``--hold-gaps``（默认 3≈30ms）帧时保持上一姿态、
+超过才清空——100Hz 拟合单帧抖动不会把人体闪没；目标速度=录像真实出帧率，
+渲染跟不上会自动掉帧（可 ``-``/``+`` 调速，标题栏显示 ``≈N帧/秒``）。
 
 用法
   python scripts/visualize_recon.py <out_dir>        # 回放某次重建结果
@@ -47,6 +50,11 @@ def build_args():
     ap.add_argument("out_dir", nargs="?", help="reconstruct_video.py 的输出目录（默认最新）")
     ap.add_argument("--watch", action="store_true", help="重建进行中实时追帧（recon 还在跑时用）")
     ap.add_argument("--fps", type=float, default=0.0, help="回放速度（帧/秒；默认=录像真实出帧率）")
+    ap.add_argument("--hold-gaps", type=int, default=3,
+                    help="播放时连续 no_person ≤N 帧保持上一姿态不闪没（默认 3≈30ms；"
+                         "100Hz 下拟合单帧抖动掉点不会把人体闪没）")
+    ap.add_argument("--no-cast", action="store_true",
+                    help="关闭人物脚下整身投影软影（默认开）")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--render", nargs=2, metavar=("T", "OUT_PNG"),
@@ -73,10 +81,12 @@ def main() -> None:
         sys.exit(2)
 
     root = args.root or None
+    cast = not args.no_cast
     if args.render:
         t, png = int(args.render[0]), args.render[1]
-        tl = ReconTimeline(out_dir)
-        arr = render_still(tl, t, args.width, args.height, out_png=png, root=root)
+        tl = ReconTimeline(out_dir, hold_gaps=args.hold_gaps)
+        arr = render_still(tl, t, args.width, args.height, out_png=png, root=root,
+                           cast_shadow=cast)
         shown = tl.person_path_at(t)
         print(f"✓ 已渲染 t={t} -> {png}（{arr.shape[1]}×{arr.shape[0]}，"
               f"{'人物' if shown else '无人'}）")
@@ -84,7 +94,8 @@ def main() -> None:
 
     play_gui(out_dir, easymocap_root=args.easymocap_root,
              width=args.width, height=args.height, fps=args.fps,
-             watch=args.watch, root=root)
+             watch=args.watch, root=root, hold_gaps=args.hold_gaps,
+             cast_shadow=cast)
 
 
 if __name__ == "__main__":

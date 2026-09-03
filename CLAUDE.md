@@ -87,7 +87,8 @@
 
 - `scripts/reconstruct_video.py` 每帧存 `frame_NNNNNN.npz`（vertices/joints/…）时**多写一次 `recon_faces.npy`**（13776×3 SMPL 拓扑，整段一次，`ensure_faces`）。
 - `scripts/visualize_recon.py <recon目录>` 弹出 Open3D 新渲染器窗口逐帧回放（`--watch` 重建进行中追帧；`--render T out.png` EGL 出 PNG；`--root` 指定含标定的项目根）。t 是主时钟帧号：no_person/失败帧清空人体，被 `--stride` 跳过帧保持上一姿态（`ReconTimeline`）。
-- **坑：本机 Filament 太阳定向光不生效**（EGL headless 与屏幕窗口都是 OpenGL 4.1，翻转太阳方向画面像素不变；只剩环境漫反射）→ 人体用 IBL 漫反射着色，接触阴影用**程序化两层半透明椭圆**（`contact_shadow_planes` + `defaultLitTransparency` 混合，脚底按太阳水平方向偏移）。透明材质必须显式 `shader="defaultLitTransparency"`——`base_color` alpha 默认不混合。
+- **播放观感（三处曾踩的坑，2026-09）**：① 播放速度按**内容帧边界 pacing**——目标 = 录像真实出帧率（meta 里 period 反推，100fps 录制=实时），标题栏实时显示 `≈N帧/秒`；渲染跟不上自动掉帧不慢放，别用固定 sleep。② **必须 `widget.force_redraw()`**（每次换帧后）——否则场景变了事件流不保证重绘，观感一卡一卡/跳帧。③ 100Hz 拟合常单帧/两三帧 no_person 抖动 → `--hold-gaps`（默认 3≈30ms）：连续 no_person ≤N 帧保持上一姿态不清空（`ReconTimeline.hold_gaps`），否则人体高频闪没。
+- **坑：本机 Filament 太阳定向光不生效**（EGL headless 与屏幕窗口都是 OpenGL 4.1，翻转太阳方向画面像素不变；只剩环境漫反射）→ 人体用 IBL 漫反射着色，假影用 `defaultLitTransparency` 混合。**影子两层都画在地板平面 `floor_z`（不是脚平面）**：重建 SMPL 脚底常悬空几 cm（142020 实测 median -0.713 vs floor -0.76），贴脚画盘会悬在地板上方成脱开深斑。① 接触椭圆 `contact_shadow_planes`（脚底核心深影）② 整身投影软影 `project_floor_shadow`+`convex_hull2d`（**纯 numpy 2D monotone-chain**，投影点全在同平面——open3d `compute_convex_hull` 会因退化抛 QH6154/每帧打 QH7089 精度告警刷屏；质心 apex 三角扇 CCW → 法线 +Z）——垂直俯视桌顶时人影被桌面挡住看不见（取景限制，侧视/低视角可见），这是物理遮挡不是 bug。透明材质必须显式 `shader="defaultLitTransparency"`——`base_color` alpha 默认不混合。
 - 键盘：Space 播放/暂停、←/→ 步进、Home/End、R 复位、-/= 调速、Esc 退出。
 
 ### 录像 + 离线重建（EasyMocap 的主路线）
