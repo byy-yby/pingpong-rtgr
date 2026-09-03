@@ -112,6 +112,14 @@
   gray 会让 ffmpeg 每帧软件上采样（swscale gray→yuv420p 就是那堵墙）；灰度图没颜色，
   U/V 恒 128，编码线程每帧只多一次 Y 拷贝 + 两个 `os.write`。② 4 路 100fps 噪声满压 3s：
   **编码丢 0**（喂 293 → 写 293 全落盘，cv2 读回帧数一致）——对比 mp4v 同场景丢 385/路。
+- **首次录像冷启动丢帧（20260903_141311 实例）**：同一 live_control 进程里**第一次**录像
+  四路开头各丢 ~44 帧（读 `cam{cid}_ts.npy` 定位：缺口全在 ~5% 处一处集中爆发，后面只有
+  零星 1-2 拍 = 正常 USB 传输丢 <1%）——`_resolve_encoder` 的探测（含一次冷 NVENC 实编码）
+  留到编码线程收到首帧才触发，lru_cache 锁让 4 个线程全堵住、队列（128）溢出丢最旧；
+  live_control 满 GPU（TRT 推理）时该探测可达 1s+。**第二次**录像探测已缓存 → 编码丢 0
+  （141353：10.3s 喂=写=1028，仅 4-6 拍传输层单缺）。修法：`recorder.start()` 在挂 sink 前
+  先 `_resolve_encoder()`（冷启动代价移到开录前、无害）。**若再见「短录丢/长录不丢」，先问
+  是不是该进程第一次录像**，别往编码吞吐上想（长短录的编码器吞吐一样）。
 - **每相机诊断**：`SessionVideoRecorder.stop()` 现在逐相机打印
   `喂 {n_fed} → 写 {frames} 帧（编码丢 {n_dropped}）· 实测 {fps} fps / 100 目标`，
   并把 `fed_per_cam` / `encoder_dropped_per_cam` / `measured_period_s` 写进
