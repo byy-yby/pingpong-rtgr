@@ -38,6 +38,9 @@ from ..core.types import CameraExtrinsics, CameraIntrinsics, Pose2D
 # EasyMocap 代码的默认位置（可通过 EASYMOCAP_ROOT 覆盖）
 DEFAULT_EASYMOCAP_ROOT = "/home/yby/projects/EasyMocap"
 
+# VPoser 预训练 checkpoint 默认位置（~2.7MB，可 VPOSER_CKPT 环境变量 / --vposer-ckpt 覆盖）
+DEFAULT_VPOSER_CKPT = "/mnt/newdisk1/vposer/TR00_E096.pt"
+
 # halpe26 -> body25 2D 关键点映射：(halpe26 索引, body25 索引)。
 # body25 关节序（OpenPose）：
 #   0 Nose, 1 Neck, 2 RShoulder, 3 RElbow, 4 RWrist,
@@ -528,4 +531,72 @@ class EasymocapReconstructor:
                 "faces": self._faces,
                 "params": {k: np.asarray(v) for k, v in p.items()},
             }
+        return results
+
+    def reconstruct_vposer(
+        self,
+        frames_obs: List[Dict[int, Pose2D]],
+        intrinsics: Dict[int, CameraIntrinsics],
+        extrinsics: Dict[int, CameraExtrinsics],
+        *,
+        min_conf: float = DEFAULT_MIN_CONF,
+        view_ids: Optional[List[int]] = None,
+        vposer_ckpt: Optional[str] = None,
+        n_iter: int = 150,
+        lambda_z: float = 1e-3,
+    ) -> Optional[List[Optional[dict]]]:
+        """VPoser 潜空间逐帧拟合（治本）：三角化 body25 后，用 VPoser 潜变量替代
+        ``smpl_from_keypoints3d2d`` 拟合姿态——姿态恒在自然流形上，从根上消掉
+        腿部扭曲 / 翻转 / 反关节。
+
+        与 :meth:`reconstruct_batch` 的区别：不做整段 batch 时间平滑，逐帧独立拟合
+        （VPoser 先验本身保证姿态自然）。输出格式与 ``reconstruct_batch`` 完全一致
+        （vertices/joints/joints_body25/faces/params），下游合并/存盘可直接复用。
+        """
+        if self._model is None:
+            print(f"[EasyMocap] {self._error}")
+            return None
+
+        from easymocap.mytools.triangulator import batch_triangulate
+        from easymocap.smplmodel.body_param import check_keypoints
+
+        from .vposer import fit_frame, load_vposer
+
+        T = len(frames_obs)
+        if view_ids is None:
+            seen: set = set()
+            for obs in frames_obs:
+                seen.update(obs.keys())
+            view_ids = sorted(seen)
+        view_ids = sorted(view_ids)
+        if len(view_ids) < 2:
+            print("[EasyMocap] VPoser 拟合需要 ≥2 个标定视角。")
+            return None
+
+        Pall = np.stack([
+            intrinsics[cid].K
+            @ np.hstack([extrinsics[cid].R, extrinsics[cid].t.reshape(3, 1)])
+            for cid in view_ids
+        ])
+
+        ckpt = vposer_ckpt or os.environ.get("VPOSER_CKPT") or DEFAULT_VPOSER_CKPT
+        vposer = load_vposer(ckpt, device=str(self._device))
+        print(f"[EasyMocap] VPoser 已加载（{ckpt}），逐帧潜空间拟合 {T} 帧")
+
+        results: List[Optional[dict]] = [None] * T
+        for t, obs in enumerate(frames_obs):
+            if not obs:
+                continue
+            kp2d, _ = self._obs_to_body25_fixed(
+                obs, intrinsics, extrinsics, min_conf, view_ids)
+            kp3d = batch_triangulate(kp2d, Pall, min_view=2)      # (25, 4)
+            kp3d = check_keypoints(kp3d, 1, min_conf=min_conf)
+            target = np.asarray(kp3d[:, :3], dtype=np.float64)     # (25, 3)
+            conf = np.asarray(kp3d[:, 3], dtype=np.float64)        # (25,)
+            target[conf < min_conf] = np.nan                       # 低置信度关节当缺失
+            r = fit_frame(vposer, self._model, target, n_iter=n_iter, lambda_z=lambda_z)
+            if r is None:
+                continue
+            r["faces"] = self._faces
+            results[t] = r
         return results

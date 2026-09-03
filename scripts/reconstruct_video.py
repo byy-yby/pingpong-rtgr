@@ -145,6 +145,10 @@ def build_args():
                     help="姿态模型：rtmpose-x-halpe26（默认，384×288 更高精度，脚部更准）/ rtmpose-l-halpe26（256×192 更快）")
     ap.add_argument("--pose-input-size", type=int, nargs=2, default=(288, 384),
                     metavar=("H", "W"), help="姿态模型输入尺寸 (H, W)，默认 288 384（对应 384×288）")
+    ap.add_argument("--vposer", action="store_true",
+                    help="用 VPoser 潜空间拟合姿态（治本：姿态恒在自然流形，消腿扭/翻转），替代官方 batch 拟合")
+    ap.add_argument("--vposer-ckpt", default=None,
+                    help="VPoser checkpoint 路径（默认 VPOSER_CKPT 环境变量或 easymocap.DEFAULT_VPOSER_CKPT）")
     ap.add_argument("--person-groups", default="[[0,2],[1,3]]",
                     help="相机分组 JSON：每个组=一个人，组内相机拍同一个人（仿 live_control P）")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
@@ -247,11 +251,19 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             print(f"  p{g}：整段未匹配到人，跳过")
             results_by_pid[g] = None
             continue
-        results_by_pid[g] = recon.reconstruct_batch(
-            frames_obs_by_pid[g], intrinsics, extrinsics,
-            min_conf=args.fit_conf, view_ids=sorted(group))
-        if results_by_pid[g] is None:
-            print(f"  ⚠ p{g} 批量拟合失败")
+        if args.vposer:
+            results_by_pid[g] = recon.reconstruct_vposer(
+                frames_obs_by_pid[g], intrinsics, extrinsics,
+                min_conf=args.fit_conf, view_ids=sorted(group),
+                vposer_ckpt=args.vposer_ckpt)
+            if results_by_pid[g] is None:
+                print(f"  ⚠ p{g} VPoser 拟合失败")
+        else:
+            results_by_pid[g] = recon.reconstruct_batch(
+                frames_obs_by_pid[g], intrinsics, extrinsics,
+                min_conf=args.fit_conf, view_ids=sorted(group))
+            if results_by_pid[g] is None:
+                print(f"  ⚠ p{g} 批量拟合失败")
     fit_wall = time.time() - t0
     print(f"  批量拟合 {n_people} 人耗时 {fit_wall:.1f}s")
 
