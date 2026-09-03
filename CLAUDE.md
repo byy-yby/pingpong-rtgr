@@ -127,16 +127,24 @@
 - **每相机诊断**：`SessionVideoRecorder.stop()` 现在逐相机打印
   `喂 {n_fed} → 写 {frames} 帧（编码丢 {n_dropped}）· 实测 {fps} fps / 100 目标`，
   并把 `fed_per_cam` / `encoder_dropped_per_cam` / `measured_period_s` 写进
-  `meta.json`。**帧数不足分三层**：① 生产侧（USB 抓帧，100Hz 触发但主队列丢帧/取帧慢）
-  ② 编码侧（`_CameraWriter` 队列满丢最旧 = `encoder_dropped`）。idle 4 路 mp4v
-  ≈110fps/路，说明单靠编码丢不了那么多——先看每行的「喂」少不少（生产侧）还是
-  「写 < 喂 - 丢」（编码侧）。③ **四路同时整段静默 = 进程级/总线级一次性停供**
+  `meta.json`。**先看时长口径**：`duration_s` 是从 start() 到 stop() **返回**（含 4 路
+  编码线程排空 backlog + mp4 落盘 + meta 写入，实测 ~1-2s），**不是真实录制长度**；
+  真实长度是 `capture_s`（=用户按停瞬间）。meta 的 `feed_diag_per_cam[*].last_feed_s`
+  就是真实录制终点。**帧数不足分三层**：① 生产侧（USB 抓帧，100Hz 触发但主队列
+  丢帧/取帧慢）② 编码侧（`_CameraWriter` 队列满丢最旧 = `encoder_dropped`）。idle
+  4 路 mp4v ≈110fps/路，说明单靠编码丢不了那么多——先看每行的「喂」少不少（生产侧）
+  还是「写 < 喂 - 丢」（编码侧）。③ **四路同时整段静默 = 进程级/总线级一次性停供**
   （`recorder.py::_feed_gap_report` 对每帧入队墙钟找 >60ms 空档 + `camera.py` 记
   GetImageBuffer 超时墙钟 → meta 写 `feed_diag_per_cam`，stop 打印判定）：
   静默区里超时 >0 → 「相机/总线停供（抓帧线程在超时轮询）」；=0 → 「进程冻结
-  （抓帧线程没来取，GIL/阻塞调用）」。判定例：3.2s 会话四路各 186 帧、ts 全
-  10.000ms 连续、跨度仅 1.85s → 非编码非逐路带宽，是一次 ~1.3s 全局停供，等新
-  探针判侧。**离线重建不受影响**：脉冲号对齐天然容忍缺帧。
+  （抓帧线程没来取，GIL/阻塞调用）」。
+  **判定例（曾误读，勿再犯）**：3.2s 会话四路各 186 帧、ts 全 10.000ms 连续、跨度
+  仅 1.85s，当时被判成「~1.3s 全局停供」——**错的**。`feed_diag` 证明 last_feed
+  ≈ 按停瞬间、入队全程无 >60ms 空档、GetImageBuffer 超时 0：那段 "缺失" 只是
+  stop() 收尾 ~1.3s。同理 122139：5.0s=3.1s 录制+1.9s 收尾，USB 传输丢帧 <1%，
+  真损失是编码侧 cam0 丢 23/cam3 丢 18（~5-7%，集中在 1.3~1.9s 一次 CPU 抢占，
+  cam1/cam2 为 0）——逐帧 ts 的 >1 拍间隙是**编码丢最旧造成的写入断档**，不等于
+  USB 丢脉冲。**离线重建不受影响**：脉冲号对齐天然容忍缺帧。
 - 命名按**逻辑相机号** `cam{cid}.mp4`（cid=标定 `cam_{cid}.yaml` 的号），与在线 EasyMocap
   一致；live_control 按 `v` / 面板「录像」按钮启停（`fps=100` 外部触发 / `30` 自由采集）。
 

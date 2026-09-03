@@ -261,11 +261,17 @@ class SessionVideoRecorder:
             np.save(os.path.join(self.session_dir, f"cam{cid}_ts.npy"), ts)
         self._writers = {}
 
-        wall_s = time.time() - self._t0
+        # 时长口径：duration_s 是从 start() 到 stop() 返回（含 4 路编码线程排空 backlog +
+        # mp4 落盘 + meta 写入，实测 ~1-2s）——不是真实录制长度！真实长度看 capture_s
+        # （用户按停瞬间 − 开始），否则会把收尾耗时误读成「录到一半停供了」。
+        wall_s = time.time() - self._t0                       # 含收尾，向后兼容保留
+        capture_s = self._t1_perf - self._t0_perf             # 真实录制长度（按停前）
         meta = {
             "session_dir": self.session_dir,
             "started_wall": self._t0,
             "duration_s": round(wall_s, 3),
+            "capture_s": round(max(capture_s, 0.0), 3),       # 真实录制长度（对账用）
+            "stop_overhead_s": round(max(wall_s - capture_s, 0.0), 3),
             "fps": (self.fps if self.fps is not None else 100.0),
             "camera_serials": {str(c.logical_id): c.serial for c in self.cameras},
             "frames_per_cam": frames_per_cam,
@@ -278,12 +284,13 @@ class SessionVideoRecorder:
         }
         with open(os.path.join(self.session_dir, "meta.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh, ensure_ascii=False, indent=2)
-        print(f"[录像] ■ 停止：本次 {wall_s:.1f}s")
+        print(f"[录像] ■ 停止：录制 {capture_s:.1f}s"
+              f"（收尾 {max(wall_s - capture_s, 0.0):.1f}s）")
         for cid in sorted(frames_per_cam):
             written = frames_per_cam[cid]
             fed = fed_per_cam[cid]
             dropped = dropped_per_cam[cid]
-            fps_est = written / wall_s if wall_s > 0 else 0.0
+            fps_est = written / capture_s if capture_s > 0 else 0.0
             print(f"  cam{cid}: 喂 {fed} → 写 {written} 帧（编码丢 {dropped}）"
                   f"· 实测 {fps_est:5.1f} fps / 100 目标")
             d = feed_diag.get(str(cid), {})
