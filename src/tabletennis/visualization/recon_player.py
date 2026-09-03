@@ -5,15 +5,16 @@
 ``out/recon_faces.npy``。本模块把这些结果放回一个 3D 场景里播放：
 
 - 场景 = 桌面系（与重建/在线 3D 一致）：桌面（z=0）+ 地面（z=-height）+ 相机视锥。
-- 人体 = 每帧一个 SMPL 网格（13776 面，肤色，PBR），**逐帧重建网格 + 计算法线按环境
-  光着色**——不是一片白（旧 ``Visualizer`` 的坑是法线没重算，渲染成 unlit 平面白）。
-- 阴影 = 本机 Filament 的**太阳定向光不生效**（实测 EGL 与屏幕窗口翻转太阳方向画面
-  像素不变，只剩环境漫反射），故用程序化假影（``defaultLitTransparency`` 透明混合，
-  **两层都画在地板平面 ``floor_z`` 上**——重建的 SMPL 脚底常悬空几 cm，贴脚画盘会
-  悬在地板上方）：① 两片脚下接触椭圆（核心深影，把足底到地板的空间感压实）；
-  ② **整身投影软影**：把所有 SMPL 顶点沿光水平方向投到地面 → 凸包填充盘，带身形
-  且随姿态伸长——合起来才是肉眼看得出的影子。Filament 窗口走 ``SOFT_SHADOWS``
-  提供环境光；太阳光可用的机器上会额外叠加真实阴影，二者方向一致。
+- 人体 = 每帧一个 SMPL 网格（13776 面，肤色），**凸凹明暗烘焙在顶点色里**
+  （``bake_body_shading`` 逐顶点 Lambert，``defaultUnlit`` 显示）——朝光面亮、
+  颌下/腋下/腹股沟等凹处法线不朝光自然变暗，一眼看出身体起伏。不再依赖 Filament
+  实时光照（本机 EGL 实测 cast_shadows 不产影、fill 低强度无效；高 lux 方向光能出
+  漫反射但真阴影不可靠，故明暗走烘焙、地上阴影走程序化假影，双保险）。
+- 地上阴影 = 程序化假影（``defaultLitTransparency`` 透明混合，**两层都画在地板平面
+  ``floor_z`` 上**——重建的 SMPL 脚底常悬空几 cm，贴脚画盘会悬在地板上方）：
+  ① 两片脚下接触椭圆（核心深影，把足底到地板的空间感压实）；② **整身投影软影**：
+  把所有 SMPL 顶点沿光水平方向投到地面 → 凸包填充盘，带身形且随姿态伸长——合起来
+  才是肉眼看得出的影子。烘焙光源与假影太阳取同一侧，观感一致。
 
 两个入口共用同一套 ``ReconScene``（把几何加进任意 ``Open3DScene``）：
 
@@ -246,11 +247,11 @@ def contact_shadow_planes(verts: np.ndarray, floor_z: float,
                           sun_dir: Optional[np.ndarray] = None) -> List[dict]:
     """由 SMPL 顶点算脚下地面上的软影椭圆参数（纯 numpy，可单测）。
 
-    为什么自己画影子：Open3D 新 Filament 渲染器在本机（EGL headless 与
-    屏幕窗口都是 OpenGL 4.1）**太阳定向光不生效**——实测翻转太阳方向画面像素
-    不变，只剩环境光漫反射。所以「真实投射阴影」做不到，改在人物脚下画两层
-    半透明深色椭圆（``defaultLitTransparency`` 混合已验证可用），位置/朝向跟着
-    太阳水平方向走，观感即接触阴影。
+    为什么自己画影子：本机 EGL/屏幕窗口实测 Filament **cast_shadows 不产真影**
+    （高 lux 方向光能出漫反射明暗，但投射阴影在这条渲染路径不可靠）。所以「真实
+    投射阴影」做不到，改在人物脚下画两层半透明深色椭圆
+    （``defaultLitTransparency`` 混合已验证可用），位置/朝向跟着太阳水平方向走，
+    观感即接触阴影。人体自身的凸凹明暗另走顶点色烘焙（``bake_body_shading``）。
 
     Args:
         verts: (N,3) SMPL 顶点（桌面系，m）。
@@ -301,6 +302,38 @@ def contact_shadow_planes(verts: np.ndarray, floor_z: float,
 _CAST_K = 0.5            # 每米高度沿影方向的伸长系数（太阳 ~63° 俯角的感觉）
 _CAST_ALPHA = 0.26       # 软影透明度（比接触盘淡，覆盖更大范围）
 _CAST_SUBSAMPLE = 3      # 顶点抽稀（6890→~2300，凸包足够；省建包时间）
+
+
+# ----------------------------------------------------------------------
+# 人体自身明暗（凸凹可读）——烘焙进顶点色
+# ----------------------------------------------------------------------
+# 方向性漫反射（Lambert）在纯 numpy 逐顶点算好写进顶点色，person 用
+# ``defaultUnlit`` 直接显示，**不依赖** Filament 太阳/自阴影（EGL 实测
+# cast_shadows 不产影、fill/IBL 低强度无效；高 lux 方向光虽能出漫反射，但
+# 真阴影不可靠）。朝光面亮、背光/法线朝下的凹处（颌下/腋下/腹股沟）自然变暗
+# → 一眼看出人体哪里凸哪里凹。光源方向与假影的太阳方向取同一侧，观感一致。
+_KEY_LIGHT_FROM = np.array([-0.45, -0.25, 0.86], np.float64)  # 指向光源（光从上方略偏左前）
+_KEY_LIGHT_FROM = _KEY_LIGHT_FROM / np.linalg.norm(_KEY_LIGHT_FROM)
+_BAKE_AMBIENT = 0.52     # 环境光：背光/凹处最低亮度（≈0.52×肤色，保证全身可见）
+_BAKE_KEY = 0.85         # 主光漫反射：朝光面 ≈ ambient + key（肤色顶格、强浮雕）
+
+
+def bake_body_shading(normals, skin=_SMPL_SKIN, ambient=_BAKE_AMBIENT,
+                      key=_BAKE_KEY, light_from=_KEY_LIGHT_FROM) -> np.ndarray:
+    """把一束方向光漫反射烘焙成逐顶点颜色，让 SMPL 网格本身带明暗（凸凹可读）。
+
+    纯 numpy、无渲染器依赖，返回 ``(V,3) float64 ∈ [0,1]`` 线性色，供
+    ``defaultUnlit`` 顶点色使用。``light_from`` 是「指向光源」的单位向量；
+    法线朝光源面 ≈ ``skin*(ambient+key)``，背光面 ≈ ``skin*ambient``。
+    因为凹处（颌下/腋下/腹股沟/脐窝）法线不朝光源，自然比凸面暗一档。
+    """
+    n = np.asarray(normals, np.float64)
+    lf = np.asarray(light_from, np.float64)
+    lf = lf / np.linalg.norm(lf)
+    lambert = np.clip(n @ lf, 0.0, 1.0)
+    sk = np.asarray(skin, np.float64).reshape(3)
+    col = sk[None, :] * (float(ambient) + float(key) * lambert[:, None])
+    return np.clip(col, 0.0, 1.0)
 
 
 def convex_hull2d(points) -> Optional[np.ndarray]:
@@ -382,7 +415,11 @@ class ReconScene:
         self.intrinsics, self.extrinsics = (camera_rig or (None, None))
         self.faces = faces                       # (13776,3) int；None 则只画关节
         self.cast_shadow = cast_shadow           # 脚下整身投影软影（默认开）
+        # person 用 defaultUnlit：肤色+明暗烘焙在顶点色里（bake_body_shading），
+        # 不参与场景光照 —— 人体凸凹明暗由烘焙保证（Filament 真阴影在 EGL 不可靠）
         self._mat_smpl = self._make_material(_SMPL_SKIN, roughness=0.62)
+        self._mat_smpl.shader = "defaultUnlit"
+        self._mat_smpl.base_color = [1.0, 1.0, 1.0, 1.0]
         self._mat_bones = self._make_material(_BONE_COLOR, roughness=0.8)
         self._last_t = None
         self.n_added = 0
@@ -587,23 +624,19 @@ class ReconScene:
     # 人体层：逐帧移除+重建网格（Filament 无 TriangleMesh 的 update_geometry）
     # ------------------------------------------------------------------
     def set_lighting(self, scene) -> None:
-        """环境光漫反射由 ``set_lighting`` 安装的 IBL 提供（本机已实测生效）。
+        """静态场景（桌/地/视锥）的环境光漫反射由 ``set_lighting`` 安装的 IBL 提供。
 
-        注意：Filament 太阳定向光在本机 OpenGL 4.1 下**不生效**（见模块 docstring），
-        这里仍调用 SOFT_SHADOWS 仅为在太阳光可用的机器上叠加真实投影，不依赖它。
+        人体不受此影响：person 走 ``defaultUnlit`` + 顶点色烘焙（``bake_body_shading``），
+        明暗确定、不依赖渲染器实时光照。此处仅装饰静态物体，太阳/阴影细节见模块 docstring。
         """
         o3d = self.o3d
         scene.set_lighting(
             o3d.visualization.rendering.Open3DScene.LightingProfile.SOFT_SHADOWS,
             _SUN_DIR)
         s = scene.scene
-        try:                                   # 弱环境光，避免阴影侧死黑
+        try:                                   # 弱环境光，静态物体阴影侧不黑死
             s.enable_indirect_light(True)
             s.set_indirect_light_intensity(0.5)
-        except Exception:  # noqa: BLE001
-            pass
-        try:                                   # 反方向弱填充光（不开阴影，避免双影）
-            s.add_directional_light("fill", -_SUN_DIR, np.array([1, 1, 1], np.float32), 0.10)
         except Exception:  # noqa: BLE001
             pass
 
@@ -634,6 +667,9 @@ class ReconScene:
             mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
             mesh.triangles = o3d.utility.Vector3iVector(self.faces.astype(np.int32))
             mesh.compute_vertex_normals()
+            # 凸凹明暗烘焙进顶点色（defaultUnlit 显示）：见 bake_body_shading
+            mesh.vertex_colors = o3d.utility.Vector3dVector(
+                bake_body_shading(np.asarray(mesh.vertex_normals)))
             scene.add_geometry("person", mesh, self._mat_smpl)
         # 骨骼（若 npz 里有关节 24×3）
         joints = person.get("joints")
