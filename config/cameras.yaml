@@ -32,9 +32,10 @@ gain:
 # contrast: 1.0          # 对比度
 
 # ---- 相机序列号 -> 逻辑索引映射 ----
-# serial 留空则按枚举顺序绑定 index 0..N-1。
+# 按序列号绑定（稳定，不随 USB 枚举顺序变化）。列表顺序 = 逻辑相机号 cam_0..cam_3，
+# 对应 09-01 标定的物理机位：cam_0=右上、cam_1=左下、cam_2=左上、cam_3=右下。
 cameras:
-  - { index: 0, serial: "" }
-  - { index: 1, serial: "" }
-  - { index: 2, serial: "" }
-  - { index: 3, serial: "" }
+  - { index: 0, serial: "DB1719717" }   # cam_0 = 右上
+  - { index: 1, serial: "DB2100801" }   # cam_1 = 左下
+  - { index: 2, serial: "DB2100900" }   # cam_2 = 左上
+  - { index: 3, serial: "DB2100957" }   # cam_3 = 右下
