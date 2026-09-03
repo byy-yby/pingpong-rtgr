@@ -331,6 +331,8 @@ def bake_body_shading(normals, skin=_SMPL_SKIN, ambient=_BAKE_AMBIENT,
     lf = np.asarray(light_from, np.float64)
     lf = lf / np.linalg.norm(lf)
     lambert = np.clip(n @ lf, 0.0, 1.0)
+    # 孤立顶点（不参与任何面）的 compute_vertex_normals 可能是 NaN → 抹成 0（环境光底）
+    lambert = np.nan_to_num(lambert, nan=0.0)
     sk = np.asarray(skin, np.float64).reshape(3)
     col = sk[None, :] * (float(ambient) + float(key) * lambert[:, None])
     return np.clip(col, 0.0, 1.0)

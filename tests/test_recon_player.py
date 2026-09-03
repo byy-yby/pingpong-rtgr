@@ -304,6 +304,16 @@ def test_bake_body_shading_tilt_faces_shade_continuously():
     assert lums[0] > lums[-1]
 
 
+def test_bake_body_shading_nan_normal_degrades_to_ambient():
+    from tabletennis.visualization.recon_player import bake_body_shading
+    nrm = np.array([[0, 0, 1.0], [np.nan, 0, 0], [0, np.nan, np.nan]], np.float64)
+    c = bake_body_shading(nrm, skin=np.ones(3), ambient=0.5, key=0.8,
+                          light_from=np.array([0.0, 0.0, 1.0]))
+    assert np.isfinite(c).all()
+    np.testing.assert_allclose(c[1], c[2])          # NaN 行退化为环境光底 0.5
+    assert c[1, 0] == 0.5 and c[0, 0] == 1.0        # 正常顶面仍吃满主光
+
+
 def test_bake_body_shading_skin_tints_and_xyz_convex():
     from tabletennis.visualization.recon_player import bake_body_shading
     lf = np.array([-0.45, -0.25, 0.86]); lf = lf / np.linalg.norm(lf)
