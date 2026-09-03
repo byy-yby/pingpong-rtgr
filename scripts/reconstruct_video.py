@@ -15,10 +15,14 @@
       [--config batch] [--stride 1] [--ref-cam 0] [--out ...]
 
 拟合档位 --config
-  batch    = 官方多帧批量拟合：整段一次 smpl_from_keypoints3d2d，激活时间平滑（默认）
+  batch    = 官方多帧批量拟合（多人）：整段一次 smpl_from_keypoints3d2d，激活时间平滑（默认）
   official = 官方 cold ``reconstruct()``，每帧冷启动（最慢，行为=原版）
   warm     = EmFit 热启动 ftol 5e-4 / maxiters 40（约 x1.8，误差≈官方）
   stream   = EmFit 热启动 ftol 1.5e-3 / maxiters 25（约 x2.3，误差略优于官方）
+
+多人识别：``--person-groups "[[0,2],[1,3]]"`` 每个组=一个人（组内相机拍同一个人，
+组下标=身份，仿 live_control 按 P 的 match_people_fixed）。单人用 ``--person-groups
+"[[1,3]]"``（只放拍人的那组相机）。``--det-conf`` 人检测阈值（默认 0.3）。
 
 调试选项
   --fake-poses  不跑检测，注入一个合成站姿人观测 → 专用于验证 录制→对齐→重建→存档
@@ -54,7 +58,7 @@ def _add_easymocap_path(root: str) -> None:
 
 
 def _median(x):
-    x = [v for v in x if v is not None]
+    x = [v for v in x if v is not None and not (isinstance(v, float) and np.isnan(v))]
     return float(np.median(x)) if x else float("nan")
 
 
@@ -131,6 +135,10 @@ def build_args():
     ap.add_argument("--max-frames", type=int, default=0, help="0=全部")
     ap.add_argument("--ref-cam", type=int, default=None)
     ap.add_argument("--min-cams", type=int, default=2)
+    ap.add_argument("--det-conf", type=float, default=0.3,
+                    help="人检测置信度阈值（yolo11n；实时默认 0.5 偏严，离线降到 0.3 少丢人）")
+    ap.add_argument("--person-groups", default="[[0,2],[1,3]]",
+                    help="相机分组 JSON：每个组=一个人，组内相机拍同一个人（仿 live_control P）")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
     ap.add_argument("--root", default=None,
                     help="项目根（读 data/calibration 与 data/extrinsics，默认自动探测）")
@@ -153,94 +161,120 @@ def build_args():
 
 
 def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, out_dir):
-    """官方多帧批量拟合：整段检测+三角化 → 一次 ``smpl_from_keypoints3d2d`` 拟合 T 帧。
+    """官方多帧批量拟合（多人）：按相机分组识别身份 → 逐人批量拟合。
 
-    与逐帧 official/warm/stream 不同，这里把全部帧一次性喂给官方管线，激活
-    smooth_body/smooth_poses/smooth_Rh 时间平滑（帧间连贯），单视角关节由相邻帧约束补全。
+    跨相机身份关联仿 live_control 按 P 的实时重建：``match_people_fixed`` 固定相机
+    分组（每组相机拍同一个人，组下标=身份）。对每个身份把整段帧一次性喂给官方
+    ``smpl_from_keypoints3d2d``（nFrames=T），激活 smooth_body/smooth_poses/smooth_Rh
+    时间平滑；单视角关节由相邻帧约束 + 模型先验补全。
     """
-    view_ids = sorted(cids_ok)
-    if len(view_ids) < 2:
-        print("✗ 标定视角不足 2 个，无法批量拟合。")
-        sys.exit(2)
+    from tabletennis.reconstruction.associate import match_people_fixed
+    from tabletennis.reconstruction.triangulate import MultiViewTriangulator
+
+    # 过滤掉未标定的相机，组内相机数 <2 则该身份无法三角化（后面跳过）
+    person_groups = [[c for c in g if c in cids_ok] for g in args.person_groups]
+    n_people = len(person_groups)
+    triangulator = MultiViewTriangulator(intrinsics, extrinsics)
+    print(f"  相机分组（{n_people} 人）：{person_groups}")
 
     indices = list(range(0, src.n_ref, max(1, args.stride)))
     if args.max_frames > 0:
         indices = indices[: args.max_frames]
 
-    # ---- Pass 1：检测，收集每帧观测 ----
-    frames_obs = []      # List[Dict[int, Pose2D]]（空 dict = 该帧无人）
-    cam_idx_list = []    # 每帧参与视角 {cid: 源帧号}
-    n_person = 0
+    # ---- Pass 1：检测 + 分组匹配，按身份（组下标）收集每帧观测 ----
+    frames_obs_by_pid = {g: [] for g in range(n_people)}   # pid -> [ {cid:Pose2D} per frame ]
+    n_seen_by_pid = {g: 0 for g in range(n_people)}
     t_global0 = time.time()
     t0 = time.time()
     for k in indices:
+        if args.fake_poses:
+            # 合成：每组各造一个固定站姿人（同一个人投到该组相机，测管道用）
+            for g, group in enumerate(person_groups):
+                obs = fake_obs_for(recon, intrinsics, extrinsics, group)
+                frames_obs_by_pid[g].append(obs)
+                n_seen_by_pid[g] += 1
+            continue
         frames_k = src.frames_for_ref(k)
         frames_k = {cid: f for cid, f in frames_k.items() if cid in cids_ok}
-        if args.fake_poses:
-            best = fake_obs_for(recon, intrinsics, extrinsics, list(frames_k.keys()))
-        elif not frames_k:
-            best = {}
-        else:
+        if frames_k:
             items = sorted(frames_k.items())
-            poses = detector.detect_batch([f for _, f in items])
-            best = {}
-            for (cid, _f), pl in zip(items, poses):
-                if pl:
-                    best[cid] = max(pl, key=lambda p: p.score)
-        frames_obs.append(best)
-        cam_idx_list.append({c: src.maps[k][c] for c in best})
-        if len(best) >= args.min_cams:
-            n_person += 1
+            plist = detector.detect_batch([f for _, f in items])
+            poses_per_cam = {cid: pl for (cid, _f), pl in zip(items, plist) if pl}
+        else:
+            poses_per_cam = {}
+        for g, group in enumerate(person_groups):
+            matched = match_people_fixed(poses_per_cam, triangulator, groups=[group])
+            obs = matched[0] if matched else {}
+            frames_obs_by_pid[g].append(obs)
+            if obs:
+                n_seen_by_pid[g] += 1
     det_wall = time.time() - t0
-    print(f"  检测 {len(indices)} 帧（有 ≥{args.min_cams} 视角的人：{n_person}）"
-          f"耗时 {det_wall:.1f}s")
+    print(f"  检测 {len(indices)} 帧耗时 {det_wall:.1f}s | 各身份被看到帧数："
+          + ", ".join(f"p{g}={n_seen_by_pid[g]}" for g in range(n_people)))
 
-    # ---- Pass 2：批量拟合 ----
+    # ---- Pass 2：逐人批量拟合 ----
     t0 = time.time()
-    results = recon.reconstruct_batch(frames_obs, intrinsics, extrinsics,
-                                      min_conf=0.3, view_ids=view_ids)
+    results_by_pid = {}
+    for g, group in enumerate(person_groups):
+        if len(group) < 2:
+            print(f"  ⚠ p{g} 组内相机数 {len(group)} < 2，跳过（无法三角化）")
+            results_by_pid[g] = None
+            continue
+        if n_seen_by_pid[g] == 0:
+            print(f"  p{g}：整段未匹配到人，跳过")
+            results_by_pid[g] = None
+            continue
+        results_by_pid[g] = recon.reconstruct_batch(
+            frames_obs_by_pid[g], intrinsics, extrinsics,
+            min_conf=0.3, view_ids=sorted(group))
+        if results_by_pid[g] is None:
+            print(f"  ⚠ p{g} 批量拟合失败")
     fit_wall = time.time() - t0
-    if results is None:
-        print("✗ 批量拟合失败。")
-        sys.exit(1)
-    print(f"  批量拟合 {len(results)} 帧耗时 {fit_wall:.1f}s"
-          f"（{fit_wall/max(1, len(results)):.1f}s/帧）")
+    print(f"  批量拟合 {n_people} 人耗时 {fit_wall:.1f}s")
 
-    # ---- 逐帧重投影误差 + 写档 ----
-    Pall = np.stack([
-        intrinsics[cid].K
-        @ np.hstack([extrinsics[cid].R, extrinsics[cid].t.reshape(3, 1)])
-        for cid in view_ids
-    ])
+    # ---- 逐帧合并多人结果 + 写档 ----
     n_ok = n_gap = 0
     err_mean_arr, err_worst_arr = [], []
     idx_arr, status_arr, wall_arr = [], [], []
     code = {"ok": 0, "no_person": 1, "fit_failed": 2, "error": 3}
     per_frame_ms = (det_wall + fit_wall) / max(1, len(indices)) * 1000.0
     for t, k in enumerate(indices):
-        res = results[t]
-        if res is None:
-            # 首/尾完全无人帧（被批量拟合修剪），不写档
+        people = []
+        for g in range(n_people):
+            r = results_by_pid[g]
+            if r is not None and r[t] is not None:
+                people.append(r[t])
+        if not people:
             n_gap += 1
             idx_arr.append(k); status_arr.append(code["no_person"]); wall_arr.append(per_frame_ms)
             err_mean_arr.append(float("nan")); err_worst_arr.append(float("nan"))
             continue
-        had_person = len(frames_obs[t]) >= args.min_cams
-        status = "ok" if had_person else "no_person"
-        if had_person:
-            n_ok += 1
-        else:
-            n_gap += 1
-        kp2d, _ = recon._obs_to_body25_fixed(
-            frames_obs[t], intrinsics, extrinsics, 0.0, view_ids)
-        em, ew = _proj_err_px(Pall, kp2d, np.asarray(res["joints_body25"]))
+        # 重投影误差：逐人算，跨人取均值/最差
+        errs = []
+        for g in range(n_people):
+            r = results_by_pid[g]
+            if r is None or r[t] is None:
+                continue
+            obs = frames_obs_by_pid[g][t]
+            if not obs:
+                continue
+            cids_g = sorted(person_groups[g])
+            kp2d, _ = recon._obs_to_body25_fixed(obs, intrinsics, extrinsics, 0.0, cids_g)
+            Pall_g = np.stack([intrinsics[c].K
+                               @ np.hstack([extrinsics[c].R, extrinsics[c].t.reshape(3, 1)])
+                               for c in cids_g])
+            e = _proj_err_px(Pall_g, kp2d, np.asarray(r[t]["joints_body25"]))
+            if np.isfinite(e[0]):
+                errs.append(e)
+        em = float(np.mean([e[0] for e in errs])) if errs else float("nan")
+        ew = float(np.max([e[1] for e in errs])) if errs else float("nan")
         err_mean_arr.append(em); err_worst_arr.append(ew)
-        idx_arr.append(k); status_arr.append(code[status]); wall_arr.append(per_frame_ms)
-        ensure_faces(out_dir, res)
-        save_one(out_dir, k, res, per_frame_ms, em, ew, cam_idx_list[t])
+        idx_arr.append(k); status_arr.append(code["ok"]); wall_arr.append(per_frame_ms)
+        n_ok += 1
+        ensure_faces(out_dir, people[0])
+        save_one_multi(out_dir, k, people, per_frame_ms, em, ew)
         if (t + 1) % max(1, args.progress) == 0 or t == len(indices) - 1:
-            print(f"  写档 {t+1}/{len(indices)} (主时钟 {k}/{src.n_ref}) | "
-                  f"ok={n_ok} gap={n_gap}")
+            print(f"  写档 {t+1}/{len(indices)} (主时钟 {k}/{src.n_ref}) | ok={n_ok} gap={n_gap}")
 
     src.close()
 
@@ -261,6 +295,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
         "wall_s": round(wall_s, 3),
         "detect_wall_s": round(det_wall, 3),
         "fit_wall_s": round(fit_wall, 3),
+        "person_groups": person_groups, "n_people": n_people,
         "reproj_err_mean_px_median": _median(err_mean_arr),
         "source": src.summary(),
     }
@@ -268,7 +303,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
         json.dump(index_data, fh, ensure_ascii=False, indent=2)
     print("=== 完成 ===")
     print(f"  处理 {len(indices)} 帧（ok={n_ok}, 无人缺口={n_gap}）耗时 {wall_s:.1f}s")
-    print(f"  检测 {det_wall:.1f}s + 批量拟合 {fit_wall:.1f}s")
+    print(f"  检测 {det_wall:.1f}s + 批量拟合 {fit_wall:.1f}s（{n_people} 人）")
     print(f"  重投影误差中位 {_median(err_mean_arr):.2f}px |  → {out_dir}")
 
 
@@ -385,7 +420,6 @@ def main() -> None:
     from tabletennis.reconstruction.em_fit import EmFit, EMSettings
     from tabletennis.reconstruction.triangulate import load_camera_rig
     from tabletennis.reconstruction.video_source import VideoSource
-    from tabletennis.vision.detector import create_detector
 
     session_dir = args.session_dir
     if not os.path.isdir(session_dir):
@@ -416,7 +450,13 @@ def main() -> None:
     if not recon.ready:
         print(f"✗ {recon.error}")
         sys.exit(1)
-    detector = None if args.fake_poses else create_detector("pose")
+    if args.fake_poses:
+        detector = None
+    else:
+        from tabletennis.vision.pose.rtmpose_pose import RTMPoseDetector
+        detector = RTMPoseDetector(device="cuda", backend="tensorrt",
+                                   score_thr=args.det_conf)
+        print(f"  人检测置信度阈值：{args.det_conf}")
     if detector is None and not args.fake_poses:
         print("✗ 姿态检测器未就绪")
         sys.exit(1)
@@ -429,6 +469,16 @@ def main() -> None:
             run_ball_recon(args, src_ball, intrinsics, extrinsics, cids_ok, out_dir)
         except Exception as exc:  # noqa: BLE001 —— 球失败不影响姿态重建
             print(f"✗ 球轨迹重建失败（姿态重建继续）：{exc}")
+    # 解析相机分组（每个组=一个人）
+    try:
+        args.person_groups = json.loads(args.person_groups)
+    except Exception as exc:  # noqa: BLE001
+        print(f"✗ --person-groups 解析失败：{exc}")
+        sys.exit(2)
+    if (not isinstance(args.person_groups, list) or not args.person_groups
+            or not all(isinstance(g, list) and g for g in args.person_groups)):
+        print("✗ --person-groups 须为非空列表的列表，如 '[[0,2],[1,3]]'")
+        sys.exit(2)
 
     if args.config == "batch":
         run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, out_dir)
@@ -590,6 +640,27 @@ def save_one(out_dir: str, k: int, res: dict, dt_ms: float,
         idx_a = np.asarray(list(cam_idx.values()), np.int64)
         with open(os.path.join(out_dir, f"frame_{k:06d}_cams.json"), "w") as fh:
             json.dump({str(c): int(i) for c, i in zip(cids_a, idx_a)}, fh)
+
+
+def save_one_multi(out_dir: str, k: int, people: List[dict], dt_ms: float,
+                   err_mean=None, err_worst=None) -> None:
+    """把一帧多个人的拟合结果存进同一 npz。
+
+    person 0 用无后缀键（与旧单帧格式兼容），person p≥1 用 ``_p`` 后缀；
+    外加 ``n_people`` 标量供回放查看器知道本帧有几个人。
+    """
+    payload = {"ref_frame": k, "n_people": len(people),
+               "wall_ms": dt_ms, "err_mean_px": err_mean, "err_worst_px": err_worst}
+    for p, res in enumerate(people):
+        suf = "" if p == 0 else f"_{p}"
+        payload[f"vertices{suf}"] = np.asarray(res["vertices"], dtype=np.float32)
+        payload[f"joints{suf}"] = np.asarray(res["joints"], dtype=np.float32)
+        payload[f"joints_body25{suf}"] = np.asarray(res["joints_body25"], dtype=np.float32)
+        payload[f"params_poses{suf}"] = np.asarray(res["params"]["poses"]).reshape(-1)
+        payload[f"params_shapes{suf}"] = np.asarray(res["params"]["shapes"]).reshape(-1)
+        payload[f"params_Rh{suf}"] = np.asarray(res["params"]["Rh"]).reshape(-1)
+        payload[f"params_Th{suf}"] = np.asarray(res["params"]["Th"]).reshape(-1)
+    np.savez_compressed(os.path.join(out_dir, f"frame_{k:06d}.npz"), **payload)
 
 
 if __name__ == "__main__":
