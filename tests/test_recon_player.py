@@ -260,3 +260,67 @@ def test_hold_gaps_keeps_through_short_gaps_only(tmp_path):
     tl3 = ReconTimeline(str(out), hold_gaps=3)
     assert tl3.person_path_at(7) == f4
     assert tl3.person_path_at(11) == str(out / "frame_000009.npz")
+
+
+# ----------------------------------------------------------------------
+# 人体凸凹明暗烘焙（bake_body_shading）：纯 numpy，凸/凹按法线·光源方向明暗
+# ----------------------------------------------------------------------
+def test_bake_body_shading_shape_and_bounds():
+    from tabletennis.visualization.recon_player import bake_body_shading
+    n = np.random.RandomState(0).normal(size=(500, 3))
+    c = bake_body_shading(n, skin=np.array([0.8, 0.7, 0.6]))
+    assert c.shape == (500, 3)
+    assert c.dtype == np.float64
+    assert np.isfinite(c).all()
+    assert c.min() >= 0.0 and c.max() <= 1.0
+
+
+def test_bake_body_shading_facing_light_brighter_than_away():
+    from tabletennis.visualization.recon_player import bake_body_shading
+    lf = np.array([0.0, 0.0, 1.0])          # 光从正上方来
+    skin = np.array([1.0, 1.0, 1.0])
+    amb, key = 0.4, 0.8
+    up = bake_body_shading(np.array([[0, 0, 1.0]]), skin=skin, ambient=amb,
+                           key=key, light_from=lf)[0]
+    down = bake_body_shading(np.array([[0, 0, -1.0]]), skin=skin, ambient=amb,
+                             key=key, light_from=lf)[0]
+    # 顶面吃满主光（0.4+0.8=1.2 → clip 1.0）；底面只吃环境光（=0.4）
+    assert up[0] == 1.0
+    assert down[0] == 0.4
+    assert (up > down).all()
+
+
+def test_bake_body_shading_tilt_faces_shade_continuously():
+    from tabletennis.visualization.recon_player import bake_body_shading
+    lf = np.array([0.0, 0.0, 1.0])
+    # 法线从上仰 0°→90°，亮度应单调下降（Lambert，凸凹可读的来源）
+    lums = []
+    for deg in (0, 30, 60, 90):
+        th = np.deg2rad(deg)
+        c = bake_body_shading(np.array([[0, np.sin(th), np.cos(th)]]),
+                              skin=np.ones(3), ambient=0.0, key=1.0, light_from=lf)[0]
+        lums.append(float(c.mean()))
+    assert lums == sorted(lums, reverse=True)
+    assert lums[0] > lums[-1]
+
+
+def test_bake_body_shading_nan_normal_degrades_to_ambient():
+    from tabletennis.visualization.recon_player import bake_body_shading
+    nrm = np.array([[0, 0, 1.0], [np.nan, 0, 0], [0, np.nan, np.nan]], np.float64)
+    c = bake_body_shading(nrm, skin=np.ones(3), ambient=0.5, key=0.8,
+                          light_from=np.array([0.0, 0.0, 1.0]))
+    assert np.isfinite(c).all()
+    np.testing.assert_allclose(c[1], c[2])          # NaN 行退化为环境光底 0.5
+    assert c[1, 0] == 0.5 and c[0, 0] == 1.0        # 正常顶面仍吃满主光
+
+
+def test_bake_body_shading_skin_tints_and_xyz_convex():
+    from tabletennis.visualization.recon_player import bake_body_shading
+    lf = np.array([-0.45, -0.25, 0.86]); lf = lf / np.linalg.norm(lf)
+    skin = np.array([0.82, 0.71, 0.60])
+    c = bake_body_shading(np.array([[0.0, 0.0, 1.0]]), skin=skin,
+                          ambient=0.42, key=0.80, light_from=lf)[0]
+    # 朝光面的三通道都显著大于环境光底
+    assert (c > skin * 0.42).all()
+    assert np.argmax(c) == 0                       # R 通道最多（肤色暖调保持）
+    assert c[1] > c[2]
