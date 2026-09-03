@@ -95,11 +95,23 @@
 录制端 `camera/recorder.py`：
 - **帧走旁路 sink 不进主循环**：`Camera.set_frame_sink(fn)` 在采集线程入主队列前把帧送给录制
   回调（须快进快出，只入队）；`SessionVideoRecorder` 每台相机一个后台编码线程
-  `_CameraWriter` 消费队列写 `mp4v`→`.mp4`，**编码跟不上丢最旧帧不阻塞抓帧**——写进文件
-  的每一帧都 append 设备时间戳，收尾 `np.save cam{cid}_ts.npy`。
-- **编解码实测**（本机 OpenCV 5.0）：1440×1080 Mono8 下 `mp4v` ~8ms/帧（100fps 预算内可行）；
-  MJPG 26ms 太慢；`avc1`(h264) 无 v4l2 设备打不开。`fps` 只写 mp4 头（播放速度），重建读
-  帧序号 + ts 副产物，不受影响。
+  `_CameraWriter` 消费队列，灰度帧在 Python 侧转 yuv420p 喂 **ffmpeg 子进程**
+  （默认 GPU `h264_nvenc`，见 `_resolve_encoder`）→`.mp4`，**编码跟不上丢最旧帧不阻塞抓帧**
+  ——写进文件的每一帧都 append 设备时间戳，收尾 `np.save cam{cid}_ts.npy`。
+- **编码器选型（第一性原则，2026-09-03）**：mp4v 是丢帧根因——本机实测 1440×1080
+  噪声内容 mp4v **~44fps/路**（131812 会话四路各丢 30-38%）；MJPG 26ms/帧、`avc1`(h264)
+  无 v4l2 设备打不开（OpenCV 无 libx264）。改走 **NVENC**：自编 ffmpeg 位于
+  `/home/yby/tools/ffmpeg-nvenc/bin/ffmpeg`（源码+头文件也在 `/home/yby/tools/nvcodec`；
+  自带/系统 ffmpeg 无 nvenc，BtbN latest 的 nvenc 请求 API 13.1 > 驱动 580 的 13.0 打不开，
+  故从 ffmpeg 7.0.2 + nv-codec-headers `n13.0.19.1` 源码自编）。`recorder.py` 探测链
+  `$TT_FFMPEG` > 该路径 > PATH；编码器 `h264_nvenc` → `libx264` → cv2 mp4v 兜底，
+  `$TT_RECORDER_CODEC=auto|nvenc|x264|cv2` 可强制。`fps` 只写 mp4 头（播放速度），
+  重建读帧序号 + ts 副产物，不受影响。
+- **两个关键实测结论**（均 1440×1080 Mono8 最坏=随机噪声内容）：
+  ① 直接喂 yuv420p 比喂 gray 快 ~2 倍（4 路 gray ~93fps/路 → **yuv420p ~168fps/路**）——
+  gray 会让 ffmpeg 每帧软件上采样（swscale gray→yuv420p 就是那堵墙）；灰度图没颜色，
+  U/V 恒 128，编码线程每帧只多一次 Y 拷贝 + 两个 `os.write`。② 4 路 100fps 噪声满压 3s：
+  **编码丢 0**（喂 293 → 写 293 全落盘，cv2 读回帧数一致）——对比 mp4v 同场景丢 385/路。
 - **每相机诊断**：`SessionVideoRecorder.stop()` 现在逐相机打印
   `喂 {n_fed} → 写 {frames} 帧（编码丢 {n_dropped}）· 实测 {fps} fps / 100 目标`，
   并把 `fed_per_cam` / `encoder_dropped_per_cam` / `measured_period_s` 写进
@@ -107,9 +119,10 @@
   编码线程排空 backlog + mp4 落盘 + meta 写入，实测 ~1-2s），**不是真实录制长度**；
   真实长度是 `capture_s`（=用户按停瞬间）。meta 的 `feed_diag_per_cam[*].last_feed_s`
   就是真实录制终点。**帧数不足分三层**：① 生产侧（USB 抓帧，100Hz 触发但主队列
-  丢帧/取帧慢）② 编码侧（`_CameraWriter` 队列满丢最旧 = `encoder_dropped`）。idle
-  4 路 mp4v ≈110fps/路，说明单靠编码丢不了那么多——先看每行的「喂」少不少（生产侧）
-  还是「写 < 喂 - 丢」（编码侧）。③ **四路同时整段静默 = 进程级/总线级一次性停供**
+  丢帧/取帧慢）② 编码侧（`_CameraWriter` 队列满丢最旧 = `encoder_dropped`）。换 nvenc 后
+  `encoder_dropped` 应恒 ~0（~168fps/路 ≫ 100 目标）——若又非零，先怀疑 GPU/驱动或
+  ffmpeg 子进程异常，再看每行的「喂」少不少（生产侧）还是「写 < 喂 - 丢」（编码侧）。
+  ③ **四路同时整段静默 = 进程级/总线级一次性停供**
   （`recorder.py::_feed_gap_report` 对每帧入队墙钟找 >60ms 空档 + `camera.py` 记
   GetImageBuffer 超时墙钟 → meta 写 `feed_diag_per_cam`，stop 打印判定）：
   静默区里超时 >0 → 「相机/总线停供（抓帧线程在超时轮询）」；=0 → 「进程冻结
@@ -254,7 +267,7 @@ MvCamera.MV_CC_Finalize()
 - [ ] 录像离线重建目前每相机取最高置信度一人（`reconstruct_video.py`，与 live_control 在线一致）；多人离线（match_people 或逐人 EmFit）未串。
 
 ### 录像 / 重建相关已踩坑
-- [x] `np.savez_compressed` 返回 None（无 `.close()`）；编解码实测 mp4v≈8ms 可用、MJPG 太慢、h264 无 v4l2 打不开——见「录像 + 离线重建」节。
+- [x] `np.savez_compressed` 返回 None（无 `.close()`）；编码 mp4v 跟不上 100fps（噪声 ~44fps/路）→ 换 ffmpeg h264_nvenc（yuv420p 直喂免 swscale，4 路 ~168fps/路、满压丢 0）——见「录像 + 离线重建」节。
 - [ ] 录像 meta/fps 头为标称值；若以后要按真实触发率校准视频时间轴，读 `cam{cid}_ts.npy` 中位差即可（离线已如此，见 video_source.period_sec）。
 
 ### 可视化

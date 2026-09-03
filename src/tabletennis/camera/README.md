@@ -55,9 +55,25 @@ finalize_sdk()
 
 `Camera.set_frame_sink(sink)` 把每帧**旁路**交给录制回调（采集线程里同步调用，须快进快出），
 `SessionVideoRecorder` 给每台相机开一个后台编码线程消费该回调，写
-`data/video/<YYYYmmdd_HHMMSS>/cam{cid}.mp4`（mp4v；编码跟不上时丢最旧帧不阻塞抓帧）。
-每个写进文件的帧都记下设备时间戳 → `cam{cid}_ts.npy`，离线脚本靠它把丢帧后的四路
-重新对齐到同一触发脉冲。
+`data/video/<YYYYmmdd_HHMMSS>/cam{cid}.mp4`。每个写进文件的帧都记下设备时间戳 →
+`cam{cid}_ts.npy`，离线脚本靠它把丢帧后的四路重新对齐到同一触发脉冲。
+
+**编码器**：默认 ffmpeg 子进程 `h264_nvenc`（GPU，4 路 1440×1080 最坏噪声内容满压
+~168fps/路、编码丢帧 0）。编码线程把灰度帧转成 yuv420p（灰度图 U/V 恒 128，逐帧只变
+Y 平面）直喂 ffmpeg——**别喂 gray**：那会让 ffmpeg 每帧软件上采样，4 路被压到 ~93fps/路。
+探测链：环境变量 `TT_FFMPEG` > `/home/yby/tools/ffmpeg-nvenc/bin/ffmpeg` > PATH；
+编码器 `h264_nvenc` → `libx264` → OpenCV mp4v 兜底；`TT_RECORDER_CODEC=auto|nvenc|x264|cv2`
+可强制。编码跟不上时丢最旧帧不阻塞抓帧（nvenc 下一般不会发生）。
+
+**NVENC ffmpeg 从哪来（`/home/yby/tools/ffmpeg-nvenc` 没了就这样重编）**：系统/自带
+ffmpeg 要么无 nvenc、要么版本太新，故源码自编。关键在 NVENC API 版本：驱动 580 支持
+**13.0**，要配 nv-codec-headers `n13.0.19.1`（BtbN latest 的 n13.1 请求 API 13.1，
+报「Required: 13.1 Found: 13.0」打不开）：
+1. `make install PREFIX=/home/yby/tools/nvcodec` 装头文件（github FFmpeg/nv-codec-headers
+   tag `n13.0.19.1`）
+2. ffmpeg 7.0.2 源码 `./configure --enable-nvenc --enable-nonfree --disable-x86asm
+   --disable-network --disable-doc --disable-debug`（`PKG_CONFIG_PATH` 指到上面头文件）
+3. `make -j$(nproc) && make install`（本机 12 核 ~2 分钟）。
 
 ```python
 from tabletennis.camera import CameraManager
