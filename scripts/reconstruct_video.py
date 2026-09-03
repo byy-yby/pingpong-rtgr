@@ -202,6 +202,12 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     per_frame_ms = (det_wall + fit_wall) / max(1, len(indices)) * 1000.0
     for t, k in enumerate(indices):
         res = results[t]
+        if res is None:
+            # 首/尾完全无人帧（被批量拟合修剪），不写档
+            n_gap += 1
+            idx_arr.append(k); status_arr.append(code["no_person"]); wall_arr.append(per_frame_ms)
+            err_mean_arr.append(float("nan")); err_worst_arr.append(float("nan"))
+            continue
         had_person = len(frames_obs[t]) >= args.min_cams
         status = "ok" if had_person else "no_person"
         if had_person:

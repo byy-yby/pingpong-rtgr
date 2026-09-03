@@ -405,7 +405,7 @@ class EasymocapReconstructor:
         *,
         min_conf: float = DEFAULT_MIN_CONF,
         view_ids: Optional[List[int]] = None,
-    ) -> Optional[List[dict]]:
+    ) -> Optional[List[Optional[dict]]]:
         """官方多帧批量 SMPL 拟合（视频管线）。
 
         与单帧 :meth:`reconstruct` 的区别：把整段（或一个窗口的）帧**一次性**喂给官方
@@ -419,8 +419,9 @@ class EasymocapReconstructor:
             view_ids: 固定相机顺序（投影矩阵 Pall 的行序）。默认 ``sorted(所有出现过的 cid)``。
 
         Returns:
-            ``List[dict]``，与 :meth:`reconstruct` 单帧返回格式一致（每帧一份
-            vertices/joints/joints_body25/params）。拟合失败返回 None。
+            ``List[Optional[dict]]``，与 :meth:`reconstruct` 单帧返回格式一致（每帧一份
+            vertices/joints/joints_body25/params）；首/尾完全无人帧为 ``None``（调用方
+            标 no_person 且不写档）。整段无有效观测时返回 None。
         """
         if self._model is None:
             print(f"[EasyMocap] {self._error}")
@@ -470,14 +471,31 @@ class EasymocapReconstructor:
         print(f"[EasyMocap] 批量拟合 {T} 帧 × {len(view_ids)} 视角，"
               f"单帧有效 3D 关节最多 {n_valid_max}/25")
 
+        # 掐掉首尾「完全无有效 3D 关节」的帧：官方 get_interp_by_keypoints 对首/尾
+        # 空帧做相邻帧插值时会 index 越界（left=-1 / right=T）。中间空帧仍交给官方
+        # 插值补全；首尾空帧返回 None，由调用方标 no_person。
+        nonempty = (kp3ds[..., 3] > 0).any(axis=1)              # (T,) bool
+        if not nonempty.any():
+            print("[EasyMocap] 整段无有效 3D 关节，跳过批量拟合。")
+            return None
+        first = int(np.argmax(nonempty))
+        last = int(len(nonempty) - 1 - np.argmax(nonempty[::-1]))
+        if first > 0 or last < T - 1:
+            print(f"[EasyMocap] 首/尾空帧修剪：保留 {first}..{last} "
+                  f"（{last - first + 1}/{T} 帧）")
+        kp2ds_fit = kp2ds[first:last + 1]
+        bboxes_fit = bboxes[first:last + 1]
+        kp3ds_fit = kp3ds[first:last + 1]
+        T_fit = last - first + 1
+
         args = _make_args(verbose=self._verbose)
         weight_shape = load_weight_shape("smpl", args.opts)
         weight_pose = load_weight_pose("smpl", args.opts)
         params = smpl_from_keypoints3d2d(
             self._model,
-            kp3ds,          # (T, 25, 4)
-            kp2ds,          # (T, nViews, 25, 3)
-            bboxes,         # (T, nViews, 5)
+            kp3ds_fit,      # (T_fit, 25, 4)
+            kp2ds_fit,      # (T_fit, nViews, 25, 3)
+            bboxes_fit,     # (T_fit, nViews, 5)
             Pall,           # (nViews, 3, 4)
             config=CONFIG["body25"],
             args=args,
@@ -488,24 +506,24 @@ class EasymocapReconstructor:
             print("[EasyMocap] 官方批量拟合返回空。")
             return None
 
-        # 一次前向出整批顶点/关节，再按帧切分
+        # 一次前向出整批顶点/关节，再按帧切分（首尾被修剪的帧填 None）
         import torch
         with torch.no_grad():
-            verts_all = self._model(return_verts=True, return_tensor=False, **params)  # (T, 6890, 3)
-            j25_all = self._model(return_verts=False, return_tensor=False, **params)   # (T, 25, 3)
+            verts_all = self._model(return_verts=True, return_tensor=False, **params)  # (T_fit, 6890, 3)
+            j25_all = self._model(return_verts=False, return_tensor=False, **params)   # (T_fit, 25, 3)
             j24_all = self._model(
                 return_verts=False, return_tensor=False,
                 return_smpl_joints=True, **params
-            )                                                                          # (T, 24, 3)
+            )                                                                          # (T_fit, 24, 3)
 
-        results: List[dict] = []
-        for t in range(T):
+        results: List[Optional[dict]] = [None] * T
+        for t in range(T_fit):
             p = select_nf(params, t)
-            results.append({
+            results[first + t] = {
                 "vertices": np.asarray(verts_all[t], dtype=np.float64),
                 "joints": np.asarray(j24_all[t], dtype=np.float64),
                 "joints_body25": np.asarray(j25_all[t], dtype=np.float64),
                 "faces": self._faces,
                 "params": {k: np.asarray(v) for k, v in p.items()},
-            })
+            }
         return results
