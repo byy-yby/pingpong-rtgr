@@ -141,6 +141,10 @@ def build_args():
                     help="人检测置信度阈值（yolo11n bbox；黑衣服/低亮度人易被漏检，离线降到 0.2 少丢人）")
     ap.add_argument("--fit-conf", type=float, default=0.15,
                     help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此被丢弃；黑衣服人关键点偏低，降到 0.15 保留更多约束）")
+    ap.add_argument("--pose-model", default="rtmpose-x-halpe26",
+                    help="姿态模型：rtmpose-x-halpe26（默认，384×288 更高精度，脚部更准）/ rtmpose-l-halpe26（256×192 更快）")
+    ap.add_argument("--pose-input-size", type=int, nargs=2, default=(288, 384),
+                    metavar=("H", "W"), help="姿态模型输入尺寸 (H, W)，默认 288 384（对应 384×288）")
     ap.add_argument("--person-groups", default="[[0,2],[1,3]]",
                     help="相机分组 JSON：每个组=一个人，组内相机拍同一个人（仿 live_control P）")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
@@ -483,8 +487,11 @@ def main() -> None:
     else:
         from tabletennis.vision.pose.rtmpose_pose import RTMPoseDetector
         detector = RTMPoseDetector(device="cuda", backend="tensorrt",
-                                   score_thr=args.det_conf)
-        print(f"  人检测置信度阈值：{args.det_conf}")
+                                   score_thr=args.det_conf,
+                                   model=args.pose_model,
+                                   input_size=tuple(args.pose_input_size))
+        print(f"  人检测置信度阈值：{args.det_conf} | 姿态模型：{args.pose_model} "
+              f"输入 {tuple(args.pose_input_size)}")
     if detector is None and not args.fake_poses:
         print("✗ 姿态检测器未就绪")
         sys.exit(1)
