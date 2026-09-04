@@ -19,6 +19,22 @@
   当前位置红球 + 到 t 为止的轨迹线（``defaultUnlit`` 红球 + ``unlitLine`` 亮橙，
   按「缺测 >5 帧」断开，不把不同回合连成一条大线）。
 
+动态层（人体/影子/骨骼/球/轨迹）在 Open3D 0.19 Filament 渲染器里有两条实现路径，
+由 ``ReconScene(mode=...)`` 选择：
+
+- ``mode="mesh"``：平滑三角网格（明暗烘焙进顶点色）。但 Filament 的
+  ``Scene.update_geometry`` 此 build 只收 PointCloud，三角网格逐帧动画只能
+  remove+add——每次重挂留不可回收的引擎级残留、约 1 万次即段错误（实测 8k~11.5k
+  ops，RSS +0.52MB/op）。故 mesh 路径**只**用于 render_still：每次新建场景加一次、
+  不累积，网格安全。GUI 长播绝不能用它。
+- ``mode="points"``（GUI 回放用）：把人体表面（SMPL 顶点 + 每面质心 ≈ 20666 点）、
+  地板影（顶点沿光水平投影）、骨骼（关节连线等分点）、球（单点）、轨迹（逐采样点）
+  全部做成 ``t.geometry.PointCloud``，add 一次后每帧 ``Scene.update_geometry`` 原地
+  改顶点缓冲（0 次 remove+add → 没有实体上限，播放/暂停全程 0 churn，可无限长播）。
+  观感上点云人体替代平滑网格——用户拍板「只要点云就行」。mesh/points 两套逻辑共存：
+  ``apply_people``/``apply_ball`` 按 ``self.mode`` 分派到 ``_apply_*_mesh`` 或
+  ``_apply_*_cloud``。
+
 两个入口共用同一套 ``ReconScene``（把几何加进任意 ``Open3DScene``）：
 
 - 离线渲染单帧：``render_still(out_dir, t, ...)``（EGL headless，可出 PNG / 验证）；
@@ -77,8 +93,37 @@ _SHADOW_LAYERS = (
 # 球轨迹渲染：当前位置球（红）+ 到 t 为止的轨迹线（亮橙，缺测 >GAP 帧断开，不跨回合连线）
 _BALL_COLOR = np.array([0.95, 0.25, 0.18], np.float32)       # 当前位置球
 _BALL_TRAIL_COLOR = np.array([1.00, 0.55, 0.28], np.float32)  # 轨迹线
+_2D_FPS = 15.0                # 播放中 2D 叠加窗最大刷新率（逐帧解 4 路视频太贵，不必跟 3D）
+# mesh 路径专用（points 模式每帧原地 update，无 remove+add 残留、不需要降频）：
+_AUX_CADENCE = 3             # mesh 播放中「次层几何」（投影软影/接触盘/骨骼/球轨迹）每 N 个
+                             # 内容帧才重挂一次——Filament remove+add 每次都有不可回收残留，
+                             # 主层（人体网格/球）每帧必换，次层掉到 ~1/3 肉眼无感但把每次
+                             # 播放累积的换挂次数砍到 ~1/3（见 _apply_*_mesh）
+_MESH_HZ = 60.0              # mesh 播放中人体网格最大重挂率：显示器 60Hz，内容 100fps 时屏上
+                             # 分不到每帧一次刷新，把上限定在刷新率省 ~1/2 上传
 _BALL_RADIUS = 0.02                                          # 乒乓球半径 20mm
 _BALL_TRAIL_GAP = 5                                          # 断连阈值（帧）：缺测 >5 帧即断开
+
+# ---- 点云回放模式（GUI 主路径；消除 remove+add 的实体上限 → 永不崩/可无限长播）----
+# Filament 里 PointCloud 可用 Scene.update_geometry 原地改顶点缓冲（无新实体、无泄漏，
+# 实测 8000 次更新 RSS 平、0.07ms/次）；三角网格不行——update_geometry 本 build 只收
+# PointCloud，网格逐帧动画只能 remove+add（~1 万次后进程段错误，实测 8k~11.5k）。
+# 故 GUI 播放把**所有动态层**都做成点云、每帧原地 update：
+#   人体 = SMPL 表面顶点 + 每面质心（约 6890+13776 点，密度够实）；
+#   地板影 = 人体顶点沿光水平方向投影到地板（不透明深色点，无重叠加深）；
+#   骨骼 = 关节连线等分点；球 = 单点；轨迹 = 逐采样点。全部 add 一次、之后只
+#   update / show/hide，播放+暂停全程 0 次 remove+add → 撞不到崩溃点。
+# render_still（离线 PNG）仍用平滑三角网格：每次新建场景只加一次、无累积，网格安全。
+_CLOUD_PT_BODY = 3.0        # 人体表面点大小（屏幕 px）
+_CLOUD_PT_SHADOW = 5.0      # 地板影点大小（大点才能盖满成块）
+_CLOUD_PT_BONE = 4.0        # 骨骼点大小
+_CLOUD_PT_BALL = 7.0        # 球点大小（20mm 球在 3-6m 外本就亚像素，画个醒目红点）
+_CLOUD_PT_TRAIL = 3.0       # 球轨迹点大小
+_SHADOW_STRIDE = 2          # 地板影点抽稀步长（6890 → ~3445 点/人）
+_SHADOW_Z_OFF = 0.004       # 影点离地板高度，防与地板平面 z-fight（同旧接触盘）
+_TRAIL_CAP = 4096           # 球轨迹点云容量上限（watch 长时段也只保留最近这些）
+_BONE_DOTS = 8              # 每根骨骼线段等分点数
+_SHADOW_PT_COLOR = tuple(float(c * 0.5) for c in _FLOOR_COLOR)  # 不透明深地板色 = 影
 
 
 def _o3d():
@@ -555,9 +600,16 @@ class ReconScene:
                  table: Optional[Table3D] = None,
                  camera_rig: Optional[tuple] = None,
                  cast_shadow: bool = True,
-                 ball_trail: bool = True):
+                 ball_trail: bool = True,
+                 mode: str = "mesh"):
+        """``mode="mesh"``（默认，离线 render_still 用）：平滑三角网格，remove+add 更新，
+        仅适用于每次新建场景、调用次数少的离屏渲染；``mode="points"``（GUI 回放用）：
+        全部动态层为点云、``Scene.update_geometry`` 原地更新，无 remove+add —— 唯一能
+        扛住长时间/反复播放不段错误的路径（见模块 docstring「点云回放模式」）。
+        """
         o3d = _o3d()
         self.o3d = o3d
+        self.mode = mode
         self.tl = tl
         self.table = table or Table3D()
         self.floor_z = -self.table.height
@@ -577,7 +629,31 @@ class ReconScene:
         self._last_t = None
         self._last_n_people = 0
         self._applied_path: Optional[str] = None   # 上一帧显示的人体 npz 路径（复用则跳过重建）
+        self._seq = 0                # 内容帧序号：次层几何按 _AUX_CADENCE 降频重挂
+        self._last_mesh_up = 0.0     # 人体网格上一次重挂的墙钟（播放中按 _MESH_HZ 限频）
         self.n_added = 0
+        # —— mesh 路径（render_still 离屏）的持久对象池。GUI 播放走点云路径
+        #    （mode="points"，见下 _cl_* 状态），不需要这些槽；这里只服务网格模式。 ——
+        # 每帧 NEW 一个 TriangleMesh 再 remove+add 会给 Open3D 场景/Filament 留下
+        # ~1MB/帧引擎级残留、~1300 次全场景内容迭代即段错误。故按 (person 槽位) 复用
+        # 同一对象就地改写顶点缓冲后 remove+add：视觉上仍是三角网格正确更新的唯一途径
+        # （update_geometry 此 build 只收 PointCloud），但 remove+add 的引擎级残留
+        # clear_geometry / 换新 Open3DScene 都清不掉，只能靠压低重挂频率推迟——mesh 模式
+        # 因此**只**用于 render_still（每次新建场景调用少数次、不累积）。
+        self._faces_i32 = (np.asarray(self.faces, np.int32)
+                           if self.faces is not None else None)
+        self._slots: List[Optional[dict]] = []   # 每槽：{mesh,bones,cast,discs,mat_bones}
+        self._ball_mesh: Optional["object"] = None
+        self._ball_base: Optional[np.ndarray] = None
+        self._trail_ls: Optional["object"] = None
+        # —— 点云回放模式（mode="points"）状态 ——
+        self._cl_objs: Dict[str, dict] = {}     # 云名 -> {"pcd": t.PointCloud, "cap": int}
+        self._cl_added: Dict[str, bool] = {}    # 云名是否已 add 进当前场景
+        self._cl_vis: Dict[str, bool] = {}      # 云名当前可见性
+        self._cl_nmesh: List[Optional["object"]] = []  # 每人物槽一个 CPU 法线网格（不进场景）
+        self._cl_people_shown: int = -1         # 上帧显示的人物槽数（用于 hide 多余槽）
+        self._cl_sample: Optional[tuple] = None # (idx(N,3)int, w(N,3)f64) 人体表面加密采样表
+        self._cl_n_v = 0                        # SMPL 顶点数（6890，采样表按它建一次）
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -670,9 +746,12 @@ class ReconScene:
         # 原点坐标架（短三轴）
         self._add_axes(scene, np.zeros(3), "origin_axes", 0.25)
 
-    def _add_shadow_disc(self, scene, name: str, center: np.ndarray, e: np.ndarray,
-                         rx: float, ry: float, alpha: float, n: int = 48) -> None:
-        """在平面上加一张半透明深色椭圆盘（程序化接触阴影的一层）。"""
+    def _fill_shadow_disc(self, mesh, center: np.ndarray, e: np.ndarray,
+                          rx: float, ry: float, n: int = 48) -> None:
+        """把一张半透明深色椭圆盘（接触阴影一层）的几何填进 ``mesh``（持久复用）。
+
+        ``mesh`` 由调用方持有、跨帧复用：每帧只重写顶点环（三角拓扑固定，首帧建一次）。
+        """
         o3d = self.o3d
         nrm = float(np.hypot(e[0], e[1])) or 1.0
         ex = np.array([e[0] / nrm, e[1] / nrm, 0.0])     # 沿影方向（长半轴）
@@ -683,18 +762,14 @@ class ReconScene:
                 + np.cos(ang)[:, None] * (ex * rx)[None, :]
                 + np.sin(ang)[:, None] * (ey * ry)[None, :])
         verts = np.vstack([center3, ring])
-        tris = np.array([[0, i + 1, (i + 1) % n + 1] for i in range(n)], np.int32)
-        m = o3d.geometry.TriangleMesh()
-        m.vertices = o3d.utility.Vector3dVector(verts)
-        m.triangles = o3d.utility.Vector3iVector(tris)
-        m.compute_vertex_normals()
-        mr = o3d.visualization.rendering.MaterialRecord()
-        mr.shader = "defaultLitTransparency"          # 纯 alpha 不混合，必须显式选透明 shader
-        mr.base_color = [0.0, 0.0, 0.0, float(alpha)]
-        scene.add_geometry(name, m, mr)
+        if len(mesh.triangles) == 0:
+            tris = np.array([[0, i + 1, (i + 1) % n + 1] for i in range(n)], np.int32)
+            mesh.triangles = o3d.utility.Vector3iVector(tris)
+        mesh.vertices = o3d.utility.Vector3dVector(verts)
+        mesh.compute_vertex_normals()
 
-    def _add_cast_shadow(self, scene, verts: np.ndarray, name: str = "cast") -> None:
-        """在人物脚下画整身投影软影：顶点沿光水平方向投到地面 → 凸包填充盘。
+    def _fill_cast_shadow(self, mesh, verts: np.ndarray) -> bool:
+        """把整身投影软影的凸包填充盘几何填进 ``mesh``；False = 本帧退化画不出。
 
         两片小接触椭圆（~0.3m）在真场景里小到几乎看不见；投影整身轮廓才能给出
         一个「带身形、随姿态伸长」的影子，把 SMPL 人明显锚定在地面上。
@@ -702,14 +777,14 @@ class ReconScene:
         o3d = self.o3d
         v = np.asarray(verts, np.float64)
         if len(v) < 8:
-            return
+            return False
         # 影平面固定在大地板上（不是脚平面）：重投影的人体可能因重建浮空几厘米，
         # 影盘若贴脚平面就会悬在地板上方；画在 floor_z 才是真「影子在地上」。
         z = self.floor_z + 0.004
         proj = project_floor_shadow(v[::_CAST_SUBSAMPLE], self.floor_z)
         hull = convex_hull2d(proj)               # 2D CCW 凸包（同平面，勿用 3D qhull）
         if hull is None or len(hull) < 3:
-            return
+            return False
         # 质心 apex 三角扇填满凸多边形（凸包 CCW → 三角全 CCW → 法线 +Z 朝上）
         c = hull.mean(axis=0)
         ring = np.column_stack([hull, np.full(len(hull), z)])
@@ -717,14 +792,46 @@ class ReconScene:
         m0, m = 1, len(ring)
         tris = np.array([[0, i, i + 1] for i in range(m0, m)] + [[0, m, m0]],
                         np.int64)
-        mesh = o3d.geometry.TriangleMesh()
         mesh.vertices = o3d.utility.Vector3dVector(verts3)
         mesh.triangles = o3d.utility.Vector3iVector(tris)
         mesh.compute_vertex_normals()
+        return True
+
+    def _transp_material(self, alpha: float):
+        """半透明深色材质（接触/投影软影共用；材质非几何，无泄漏问题）。"""
+        o3d = self.o3d
         mr = o3d.visualization.rendering.MaterialRecord()
-        mr.shader = "defaultLitTransparency"
-        mr.base_color = [0.0, 0.0, 0.0, _CAST_ALPHA]
-        scene.add_geometry(name, mesh, mr)
+        mr.shader = "defaultLitTransparency"      # 纯 alpha 不混合，必须显式选透明 shader
+        mr.base_color = [0.0, 0.0, 0.0, float(alpha)]
+        return mr
+
+    def _slot(self, p: int) -> dict:
+        """第 p 个人物的持久几何槽（按需增长；跨帧复用避免每帧 NEW 网格 → 泄漏）。"""
+        while len(self._slots) <= p:
+            self._slots.append({"mesh": None, "bones": None, "cast": None,
+                                "mat_bones": None, "mat_cast": None,
+                                "discs": [None, None], "mat_discs": [None, None]})
+        return self._slots[p]
+
+    def _hide(self, scene, name: str) -> None:
+        """把某实体从场景摘掉（仅在它真在场时才 remove；不会每帧 remove → 不积 defer-free）。"""
+        if scene.has_geometry(name):
+            scene.remove_geometry(name)
+
+    def _stage(self, scene, name: str, geo, mat) -> None:
+        """remove+add 一个**持久复用**的几何对象，让画面真正换新几何。
+
+        这是 Filament GUI 里唯一有效的逐帧更新途径（实验定论）：同名 ``add_geometry``
+        是 no-op 画面永远停在第 1 帧；``Scene.update_geometry`` 本 build 只收 PointCloud，
+        不收三角网格。remove+add 会留**引擎级**（GL 上下文内）不可回收的残留，只能靠把
+        它压低来推迟段错误（clear_geometry / 换 Open3DScene 都不释放引擎缓存；关窗重启
+        进程才清零）。压低手段：① 对象持久复用（不每帧 NEW）；② 次层几何降频
+        （``_AUX_CADENCE``）；③ 人体网格播放中限速 ``_MESH_HZ``。综合后每遍播放残留
+        只剩 ~1/4（714 帧实测 +58MB vs 原 +432MB），单遍 1000+ 帧安全、反复重播也能
+        几十遍。
+        """
+        self._hide(scene, name)
+        scene.add_geometry(name, geo, mat)
 
     def _add_axes(self, scene, origin: np.ndarray, name: str, size: float) -> None:
         o3d = self.o3d
@@ -795,21 +902,37 @@ class ReconScene:
         except Exception:  # noqa: BLE001
             pass
 
-    def apply_people(self, scene, t: int) -> bool:
-        """把 t 处的（可能多个）人体喂给场景。返回 True 表示本帧有人体被显示。"""
+    def apply_people(self, scene, t: int, full: bool = True) -> bool:
+        """把 t 处的（可能多个）人体喂给场景。返回 True 表示本帧有人体被显示。
+
+        ``mode="points"``（GUI 回放）→ :meth:`_apply_people_cloud`（点云原地更新，
+        永不段错误）；``mode="mesh"``（render_still 离屏 PNG）→ :meth:`_apply_people_mesh`
+        （平滑网格 remove+add，每次新建场景只调少数次、不累积，安全）。
+        """
+        if self.mode == "points":
+            return self._apply_people_cloud(scene, t, full)
+        return self._apply_people_mesh(scene, t, full)
+
+    def _apply_people_mesh(self, scene, t: int, full: bool = True) -> bool:
+        """平滑三角网格路径（render_still 离屏 PNG；每次新建场景仅调用少数次）。
+
+        **更新语义 = remove+add（Filament 里三角网格画面真正换新的唯一途径）**：同名
+        ``add_geometry`` 是 no-op，``Scene.update_geometry`` 本 build 只收 PointCloud。
+        网格 remove+add 有引擎级残留、~1 万次后进程段错误——所以本路径**只能**用于
+        「每次新建场景、调用次数很少」的离屏渲染；GUI 播放请用点云路径。
+        """
+        o3d = self.o3d
         path = self.tl.person_path_at(t)
         if path is not None and path == self._applied_path and self._last_n_people > 0:
             return True        # 与上一帧同一份结果（hold_gaps/stride 复用）→ 几何已就位
         people = self.tl.load_people(t)
-        o3d = self.o3d
-        # 总是先移除上一帧的人体几何，再按当前状态重建（简单且无残留）
-        for p in range(max(1, self._last_n_people)):
+        do_aux = full or (self._seq % _AUX_CADENCE == 0)
+        self._seq += 1
+        # 人数比上一帧少 → 把多出来的人体实体摘掉（槽仍在，之后可再复用）
+        for p in range(len(people), self._last_n_people):
             for name in (f"person_{p}", f"bones_{p}", f"cast_{p}",
                          f"shadow0_{p}", f"shadow1_{p}"):
-                try:
-                    scene.remove_geometry(name)
-                except Exception:  # noqa: BLE001
-                    pass
+                self._hide(scene, name)
         self._last_n_people = len(people)
         self._applied_path = path
         if not people:
@@ -819,66 +942,335 @@ class ReconScene:
         for p, person in enumerate(people):
             verts = person["vertices"]
             skin = _PERSON_COLORS[p % len(_PERSON_COLORS)]
-            # 整身投影软影（把人体锚在地面）→ 再叠两片脚下接触盘（核心深影）
-            if self.cast_shadow:
-                self._add_cast_shadow(scene, verts, name=f"cast_{p}")
-            for d in contact_shadow_planes(verts, self.floor_z):
-                self._add_shadow_disc(scene, f"{d['name']}_{p}", d["center"], d["e"],
-                                      d["rx"], d["ry"], d["alpha"])
-            # 网格（按身份着色：凸凹明暗烘焙进顶点色，defaultUnlit 显示）
-            if self.faces is not None and len(verts):
-                mesh = o3d.geometry.TriangleMesh()
-                mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
-                mesh.triangles = o3d.utility.Vector3iVector(self.faces.astype(np.int32))
-                mesh.compute_vertex_normals()
-                mesh.vertex_colors = o3d.utility.Vector3dVector(
-                    bake_body_shading(np.asarray(mesh.vertex_normals), skin=skin))
-                scene.add_geometry(f"person_{p}", mesh, self._mat_smpl)
-            # 骨骼（若 npz 里有关节 24×3）
-            joints = person.get("joints")
-            if joints is not None and len(joints):
-                ls = o3d.geometry.LineSet()
-                ls.points = o3d.utility.Vector3dVector(joints[:24].astype(np.float64))
-                ls.lines = o3d.utility.Vector2iVector(np.asarray(_SMPL_EDGES, np.int32))
-                self._add_line_geo(scene, f"bones_{p}", ls, _BONE_COLOR * 0.85, 2.0)
+            slot = self._slot(p)
+            if do_aux:   # —— 次层：投影软影 + 接触盘 + 骨骼（降频，见 _AUX_CADENCE）——
+                # 整身投影软影（把人体锚在地面）→ 再叠两片脚下接触盘（核心深影）
+                if self.cast_shadow and len(verts) >= 8:
+                    if slot["cast"] is None:
+                        slot["cast"] = o3d.geometry.TriangleMesh()
+                        slot["mat_cast"] = self._transp_material(_CAST_ALPHA)
+                    if self._fill_cast_shadow(slot["cast"], verts):
+                        self._stage(scene, f"cast_{p}", slot["cast"], slot["mat_cast"])
+                    else:
+                        self._hide(scene, f"cast_{p}")   # 本帧投影退化（如透视扁平）
+                else:
+                    self._hide(scene, f"cast_{p}")
+                for k, d in enumerate(contact_shadow_planes(verts, self.floor_z)):
+                    if slot["discs"][k] is None:
+                        slot["discs"][k] = o3d.geometry.TriangleMesh()
+                        slot["mat_discs"][k] = self._transp_material(d["alpha"])
+                    self._fill_shadow_disc(slot["discs"][k], d["center"], d["e"],
+                                           d["rx"], d["ry"])
+                    self._stage(scene, f"{d['name']}_{p}", slot["discs"][k],
+                                slot["mat_discs"][k])
+                # 骨骼（若 npz 里有关节 24×3）
+                joints = person.get("joints")
+                if joints is not None and len(joints):
+                    if slot["bones"] is None:
+                        ls = o3d.geometry.LineSet()
+                        ls.lines = o3d.utility.Vector2iVector(np.asarray(_SMPL_EDGES, np.int32))
+                        slot["bones"] = ls
+                        mr = o3d.visualization.rendering.MaterialRecord()
+                        mr.shader = "unlitLine"
+                        mr.line_width = 2.0
+                        slot["mat_bones"] = mr
+                    ls = slot["bones"]
+                    ls.points = o3d.utility.Vector3dVector(joints[:24].astype(np.float64))
+                    n = len(ls.lines)
+                    if n:
+                        ls.colors = o3d.utility.Vector3dVector(
+                            np.tile(_BONE_COLOR * 0.85, (n, 1)))
+                    self._stage(scene, f"bones_{p}", ls, slot["mat_bones"])
+                else:
+                    self._hide(scene, f"bones_{p}")
+            # —— 主层：人体网格 ——
+            # 播放中按 _MESH_HZ 限频（60Hz 屏分不到 >60 次/秒，内容 100fps 时跳过多余的
+            # 中间帧，网格在下一允许时刻直接取最新姿势）；暂停/单帧/预热（full）必更新。
+            now = time.perf_counter()
+            if full or now - self._last_mesh_up >= 1.0 / _MESH_HZ or slot["mesh"] is None:
+                self._last_mesh_up = now
+                if self.faces is not None and len(verts):
+                    if slot["mesh"] is None:
+                        slot["mesh"] = o3d.geometry.TriangleMesh()
+                        slot["mesh"].triangles = o3d.utility.Vector3iVector(self._faces_i32)
+                    mesh = slot["mesh"]
+                    mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+                    mesh.compute_vertex_normals()
+                    mesh.vertex_colors = o3d.utility.Vector3dVector(
+                        bake_body_shading(np.asarray(mesh.vertex_normals), skin=skin))
+                    self._stage(scene, f"person_{p}", mesh, self._mat_smpl)
+                else:
+                    self._hide(scene, f"person_{p}")
         self._last_t = t
         return True
 
     # ------------------------------------------------------------------
+    # 点云路径（mode="points"，GUI 回放）：全部动态层 = 点云，Scene.update_geometry
+    # 原地更新顶点缓冲 —— 无 remove+add → 没有 ~1 万次段错误的实体上限，可无限长播。
+    # 每片云 add 一次（占位），之后每帧只 update + show/hide。
+    # ------------------------------------------------------------------
+    def _cl_mat(self, pt_size: float):
+        """点云材质：defaultUnlit + 顶点色，只带点大小（颜色全走逐点色）。"""
+        o3d = self.o3d
+        mr = o3d.visualization.rendering.MaterialRecord()
+        mr.shader = "defaultUnlit"
+        mr.base_color = [1.0, 1.0, 1.0, 1.0]
+        mr.point_size = float(pt_size)
+        return mr
+
+    def _cl_geo(self, scene, name: str, cap: int, mat):
+        """取（必要时 add）名为 ``name`` 的占位点云，返回其 ``t.PointCloud``。"""
+        e = self._cl_objs.get(name)
+        if e is None:
+            o3d = self.o3d
+            pcd = o3d.t.geometry.PointCloud()
+            pcd.point.positions = o3d.core.Tensor(np.zeros((cap, 3), np.float32))
+            pcd.point.colors = o3d.core.Tensor(np.zeros((cap, 3), np.float32))
+            scene.add_geometry(name, pcd, mat)
+            self._cl_objs[name] = {"pcd": pcd, "cap": cap}
+            self._cl_added[name] = True
+            e = self._cl_objs[name]
+        return e["pcd"]
+
+    def _cl_show(self, scene, name: str, vis: bool) -> None:
+        """切换点云可见性（只在变化时 show_geometry，无新实体、零残留）。"""
+        if not self._cl_added.get(name):
+            return                                  # 从未 add（空窗期没东西可藏）
+        v = bool(vis)
+        if self._cl_vis.get(name) != v:
+            scene.show_geometry(name, v)
+            self._cl_vis[name] = v
+
+    def _cl_set(self, scene, name: str, cap: int, mat, pts, cols, vis: bool) -> None:
+        """原地更新点云 ``name`` 到 ``pts/cols``（m≤cap）并设可见性。纯 update，零 remove。"""
+        o3d = self.o3d
+        pcd = self._cl_geo(scene, name, cap, mat)
+        pcd.point.positions = o3d.core.Tensor(np.ascontiguousarray(pts, np.float32))
+        pcd.point.colors = o3d.core.Tensor(np.ascontiguousarray(cols, np.float32))
+        low = scene.scene
+        low.update_geometry(name, pcd,
+                            low.UPDATE_POINTS_FLAG | low.UPDATE_COLORS_FLAG)
+        self._cl_show(scene, name, vis)
+
+    def _cl_person_nmesh(self, p: int):
+        """第 p 槽的 CPU 法线网格（只算法线不进场景；首建拓扑，跨帧只改顶点）。"""
+        while len(self._cl_nmesh) <= p:
+            self._cl_nmesh.append(None)
+        nm = self._cl_nmesh[p]
+        if nm is None and self._faces_i32 is not None:
+            o3d = self.o3d
+            nm = o3d.geometry.TriangleMesh()
+            nm.triangles = o3d.utility.Vector3iVector(self._faces_i32)
+            self._cl_nmesh[p] = nm
+        return nm
+
+    def _cl_body_sample(self, n_v: int):
+        """人体表面加密采样表：原顶点（权重 (1,0,0)）+ 每三角形质心。首建缓存。"""
+        if self._cl_sample is not None and self._cl_n_v == n_v:
+            return self._cl_sample
+        F = np.asarray(self._faces_i32, np.int64)   # (F,3)
+        vidx = np.repeat(np.arange(n_v, dtype=np.int64)[:, None], 3, axis=1)
+        vw = np.zeros((n_v, 3)); vw[:, 0] = 1.0
+        cidx = F
+        cw = np.full((len(F), 3), 1.0 / 3.0)
+        idx = np.concatenate([vidx, cidx], axis=0)
+        w = np.concatenate([vw, cw], axis=0)
+        self._cl_sample = (idx, w)
+        self._cl_n_v = n_v
+        return self._cl_sample
+
+    @staticmethod
+    def _cl_interp(attr: np.ndarray, idx: np.ndarray, w: np.ndarray) -> np.ndarray:
+        """按固定采样表 (idx,w) 从逐顶点属性 attr(V,3) 插出采样点 (N,3)。"""
+        return (attr[idx[:, 0]] * w[:, 0:1] + attr[idx[:, 1]] * w[:, 1:2]
+                + attr[idx[:, 2]] * w[:, 2:3])
+
+    @staticmethod
+    def _bone_dots(joints, edges=None) -> np.ndarray:
+        """把关节骨架画成沿线等分点：每根骨线段采 ``_BONE_DOTS`` 个点。"""
+        if joints is None or len(joints) < 2:
+            return np.empty((0, 3), np.float64)
+        j = np.asarray(joints, np.float64)
+        E = np.asarray(_SMPL_EDGES if edges is None else edges, np.int64)
+        if len(E) == 0:
+            return np.empty((0, 3), np.float64)
+        ok = (E[:, 0] < len(j)) & (E[:, 1] < len(j))
+        E = E[ok]
+        if len(E) == 0:
+            return np.empty((0, 3), np.float64)
+        ts = np.linspace(0.0, 1.0, _BONE_DOTS)[None, :, None]
+        a = j[E[:, 0]][:, None, :]           # (Ne,1,3)
+        b = j[E[:, 1]][:, None, :]
+        seg = a * (1.0 - ts) + b * ts         # (Ne,D,3)
+        return seg.reshape(-1, 3)
+
+    def _apply_people_cloud(self, scene, t: int, full: bool = True) -> bool:
+        """点云路径：人体 = 表面点 + 地板影点 + 骨骼点，全部原地更新。
+
+        所有几何都 add 一次后只 update_geometry / show_geometry —— 播放与暂停全程
+        0 次 remove+add，撞不到段错误上限（详见模块 docstring「点云回放模式」）。
+        ``full`` 仅保留签名兼容（点云路径每帧全量更新，无需降频）。
+        """
+        path = self.tl.person_path_at(t)
+        if path is not None and path == self._applied_path and self._last_n_people > 0:
+            return True            # 与上一帧同一份结果（hold_gaps/stride 复用）→ 已就位
+        people = self.tl.load_people(t)
+        self._applied_path = path
+        self._last_n_people = len(people)
+        shown = 0
+        for p, person in enumerate(people):
+            if self._cloud_person(scene, p, person):
+                shown = p + 1
+        # 隐藏超出本帧人数 / 缺内容的槽
+        for p in range(shown, max(shown, self._cl_people_shown + 1)):
+            for name in (f"body_{p}", f"shadow_{p}", f"bones_{p}"):
+                self._cl_show(scene, name, False)
+        self._cl_people_shown = max(shown, 0) if shown else -1
+        self._last_t = t
+        return shown > 0
+
+    def _cloud_person(self, scene, p: int, person: dict) -> bool:
+        """把第 p 个人的点云层更新到当前姿势。返回 True 表示有内容显示。"""
+        verts = person.get("vertices")
+        joints = person.get("joints")
+        any_show = False
+        if verts is not None and len(verts):
+            verts = np.asarray(verts, np.float64)
+            skin = _PERSON_COLORS[p % len(_PERSON_COLORS)]
+            n_v = len(verts)
+            # —— 人体表面点（bake 明暗 → 顶点色）——
+            nm = self._cl_person_nmesh(p)
+            if nm is not None:
+                nm.vertices = self.o3d.utility.Vector3dVector(verts)
+                nm.compute_vertex_normals()
+                vcols = bake_body_shading(np.asarray(nm.vertex_normals), skin=skin)
+                idx, w = self._cl_body_sample(n_v)
+                body_pts = self._cl_interp(verts, idx, w)
+                body_cols = self._cl_interp(vcols, idx, w)
+                self._cl_set(scene, f"body_{p}", len(idx),
+                             self._cl_mat(_CLOUD_PT_BODY), body_pts, body_cols, True)
+                any_show = True
+            else:
+                self._cl_show(scene, f"body_{p}", False)
+            # —— 地板影：人体顶点沿光水平投影到地板（不透明深色点）——
+            if self.cast_shadow:
+                proj = project_floor_shadow(verts[::_SHADOW_STRIDE], self.floor_z)
+                m = len(proj)
+                if m:
+                    sp = np.column_stack([proj[:, 0], proj[:, 1],
+                                          np.full(m, self.floor_z + _SHADOW_Z_OFF)])
+                    sc = np.tile(np.asarray(_SHADOW_PT_COLOR, np.float64), (m, 1))
+                    self._cl_set(scene, f"shadow_{p}", n_v, self._cl_mat(_CLOUD_PT_SHADOW),
+                                 sp, sc, True)
+                else:
+                    self._cl_show(scene, f"shadow_{p}", False)
+            else:
+                self._cl_show(scene, f"shadow_{p}", False)
+        else:
+            self._cl_show(scene, f"body_{p}", False)
+            self._cl_show(scene, f"shadow_{p}", False)
+        # —— 骨骼点 ——
+        dots = self._bone_dots(joints)
+        if len(dots):
+            m = len(dots)
+            cols = np.tile(np.asarray(_BONE_COLOR, np.float64), (m, 1))
+            self._cl_set(scene, f"bones_{p}", max(2, len(_SMPL_EDGES)) * _BONE_DOTS,
+                         self._cl_mat(_CLOUD_PT_BONE), dots, cols, True)
+            any_show = True
+        else:
+            self._cl_show(scene, f"bones_{p}", False)
+        return any_show
+
     # 球层：当前位置红球 + 到 t 为止的轨迹（分段连线）
     # ------------------------------------------------------------------
-    def apply_ball(self, scene, t: int) -> bool:
-        """把 t 处的球 + 轨迹喂给场景。返回 True 表示本帧有球显示。"""
+    def _apply_ball_cloud(self, scene, t: int, full: bool = True) -> bool:
+        """点云路径的球层：红球单点 + 轨迹逐采样点，原地更新（mesh 路径见 _apply_ball_mesh）。"""
         o3d = self.o3d
-        for name in ("ball", "ball_trail"):
-            try:
-                scene.remove_geometry(name)
-            except Exception:  # noqa: BLE001
-                pass
         if not self.tl.ball_ok:
+            self._cl_show(scene, "ball", False)
+            self._cl_show(scene, "trail", False)
             return False
         X = self.tl.ball_pos_at(t)
         if X is None:
+            self._cl_show(scene, "ball", False)
+            self._cl_show(scene, "trail", False)
             return False
-        sph = o3d.geometry.TriangleMesh.create_sphere(radius=_BALL_RADIUS)
-        sph.translate(np.asarray(X, np.float64))
-        scene.add_geometry("ball", sph, self._mat_ball)
+        self._cl_set(scene, "ball", 1, self._cl_mat(_CLOUD_PT_BALL),
+                     np.asarray(X, np.float64).reshape(1, 3),
+                     np.asarray(_BALL_COLOR, np.float64).reshape(1, 3), True)
         if self.ball_trail:
+            pts = self.tl.ball_trail_upto(t)
+            if pts:
+                allp = np.concatenate([np.asarray(s, np.float64) for s in pts], axis=0)
+                if len(allp) > _TRAIL_CAP:
+                    allp = allp[-_TRAIL_CAP:]
+                m = len(allp)
+                cols = np.tile(np.asarray(_BALL_TRAIL_COLOR, np.float64), (m, 1))
+                self._cl_set(scene, "trail", _TRAIL_CAP, self._cl_mat(_CLOUD_PT_TRAIL),
+                             allp, cols, True)
+            else:
+                self._cl_show(scene, "trail", False)
+        return True
+
+    # ------------------------------------------------------------------
+    # 球层（mesh 路径分派见上 apply_ball）
+    # ------------------------------------------------------------------
+    def apply_ball(self, scene, t: int, full: bool = True) -> bool:
+        """把 t 处的球 + 轨迹喂给场景。返回 True 表示本帧有球显示。
+
+        ``mode="points"`` → :meth:`_apply_ball_cloud`（点云原地更新）；``mode="mesh"``
+        → :meth:`_apply_ball_mesh`。球主层每帧必换（小球快速移动，逐帧才不跳）；
+        轨迹线属次层，mesh 路径里只在 ``full`` / aux 降频档重挂一次。
+        """
+        if self.mode == "points":
+            return self._apply_ball_cloud(scene, t, full)
+        return self._apply_ball_mesh(scene, t, full)
+
+    def _apply_ball_mesh(self, scene, t: int, full: bool = True) -> bool:
+        """平滑网格红球 + 轨迹线（render_still 离屏 PNG；新场景少次调用，remove+add 安全）。"""
+        o3d = self.o3d
+        if not self.tl.ball_ok:
+            self._hide(scene, "ball")
+            self._hide(scene, "ball_trail")
+            return False
+        X = self.tl.ball_pos_at(t)
+        if X is None:
+            self._hide(scene, "ball")
+            self._hide(scene, "ball_trail")
+            return False
+        if self._ball_mesh is None:
+            sph = o3d.geometry.TriangleMesh.create_sphere(radius=_BALL_RADIUS)
+            self._ball_base = np.asarray(sph.vertices, np.float64).copy()
+            self._ball_mesh = sph                    # 之后每帧只平移，不重造
+        self._ball_mesh.vertices = o3d.utility.Vector3dVector(
+            self._ball_base + np.asarray(X, np.float64))
+        self._stage(scene, "ball", self._ball_mesh, self._mat_ball)
+        do_aux = full or (self._seq % _AUX_CADENCE == 0)
+        if self.ball_trail and do_aux:
             segs = self.tl.ball_trail_upto(t)
             if segs:
                 # 多段拼进同一个 LineSet：点拼接、段内相邻连线（段间不连），
-                # 单个几何名 "ball_trail" 保证下一帧 remove_geometry 能清干净。
+                # remove+add 重挂即整段更新。
                 pts = [np.asarray(s, np.float64) for s in segs]
                 lines = [
                     np.column_stack([base + np.arange(len(s) - 1),
                                      base + np.arange(1, len(s))]).astype(np.int32)
                     for base, s in zip(np.cumsum([0] + [len(s) for s in pts[:-1]]), pts)
                 ]
-                ls = o3d.geometry.LineSet()
-                ls.points = o3d.utility.Vector3dVector(np.concatenate(pts, axis=0))
-                ls.lines = o3d.utility.Vector2iVector(np.concatenate(lines, axis=0))
-                self._add_line_geo(scene, "ball_trail", ls,
-                                   np.asarray(_BALL_TRAIL_COLOR, np.float64), 2.0)
+                if self._trail_ls is None:
+                    self._trail_ls = o3d.geometry.LineSet()
+                    self._trail_mat = o3d.visualization.rendering.MaterialRecord()
+                    self._trail_mat.shader = "unlitLine"   # 轨迹逐线着色，材质只带线宽
+                    self._trail_mat.line_width = 2.0
+                self._trail_ls.points = o3d.utility.Vector3dVector(np.concatenate(pts, axis=0))
+                self._trail_ls.lines = o3d.utility.Vector2iVector(np.concatenate(lines, axis=0))
+                n = len(self._trail_ls.lines)
+                if n:
+                    self._trail_ls.colors = o3d.utility.Vector3dVector(
+                        np.tile(np.asarray(_BALL_TRAIL_COLOR, np.float64), (n, 1)))
+                self._stage(scene, "ball_trail", self._trail_ls, self._trail_mat)
+            else:
+                self._hide(scene, "ball_trail")
         return True
 
 
@@ -1028,6 +1420,7 @@ class _PlayerApp:
         self.overlay = overlay              # 2D 检测叠加（可为 None）
         self._2d_win = None
         self._2d_img_widget = None
+        self._last_2d_wall = 0.0            # 2D 叠加刷新节流（见 _refresh_2d）
 
         self.app = gui.Application.instance
         self.app.initialize()
@@ -1040,31 +1433,33 @@ class _PlayerApp:
         self._setup()
         self._warmup()
         gc.collect()
-        gc.disable()               # 回放期间关自动 GC：实测每 ~30 帧一次 ~25ms 停顿
-        was_playing = self.playing  # （24 个临时几何/帧 × 30 帧 ≈ GC 阈值 700），关掉后
-        next_due = time.perf_counter()  # 停顿从 27/600 降到 5/600（余下来自 GPU 驱动）
+        gc.disable()               # 回放期间关自动 GC（几何持久复用后临时对象已很少；
+        was_playing = self.playing  # 真需要清积压就暂停时收一次）
+        prev_wall = time.perf_counter()   # 上一循环墙钟（含 tick/渲染耗时），驱动实时推进
         try:
             while self.app.run_one_tick():
                 now = time.perf_counter()
+                dt = min(max(0.0, now - prev_wall), 0.25)  # 单步最多追 0.25s 内容，防卡顿后瞬移
+                prev_wall = now
                 if self.watch:
                     self._watch_poll(now)
+                n = max(0, self.tl.n_ref - 1)
                 if self.playing:
-                    if not was_playing:
-                        next_due = now          # 暂停→播放：重置调度，不连补欠账
-                    self._show()
-                    self._step_forward()
-                    budget = 1.0 / max(1.0, self.speed * self.fps)
-                    next_due += budget
-                    if next_due < now:
-                        next_due = now          # 渲染慢于目标：不睡，逐帧追（不掉帧）
-                    delay = next_due - time.perf_counter()
-                    if delay > 0:
-                        time.sleep(min(delay, 0.02))
+                    if self.t >= float(n):           # 已到尾：自动停（Space 再按则从头）
+                        self.playing = False
+                    else:
+                        # 实时推进：内容时钟按墙钟跑（t += dt×fps×speed）。渲染跟不上时
+                        # 每次 tick 的 dt 变大 → t 跳过中间内容帧，仍 1.0× 实时，不会像
+                        # 旧实现那样「每帧 t+=1 追不上 → 0.71× 慢动作」。展示只看 int(t)，
+                        # 被跳过的帧本来也不会在 60Hz 屏上分得一个刷新。
+                        self.t = min(float(n), self.t + dt * self.fps * self.speed)
+                self._show()
+                if self.playing:
+                    time.sleep(0.002)     # 让出一丝调度；tick 自身 ~10ms 已是主节拍
                 else:
-                    self._show()
                     if was_playing:
-                        gc.collect()            # 刚暂停时收一次，避免长时间回放内存累积
-                    time.sleep(0.02)
+                        gc.collect()      # 刚暂停/到尾时收一次积压
+                    time.sleep(0.02)      # 暂停：低 CPU 待命
                 was_playing = self.playing
         finally:
             gc.enable()
@@ -1108,10 +1503,11 @@ class _PlayerApp:
         w.setup_camera(50.0, self.scene_b.bounds(), self.scene_b.center())
         w.set_view_controls(self.gui.SceneWidget.Controls.ROTATE_CAMERA)  # 左拖旋转/右拖平移/滚轮缩放
         w.set_on_key(self._on_key)
-        print(f"[回放] 目标 ≈{self.fps * self.speed:.0f} 帧/秒（录制 {self.fps:.0f}fps 实时）。"
-              f"每帧都渲染（跟得上=实时，跟不上=平滑慢放不跳帧）；- / + 半速/倍速可调。")
-        print("[回放] 鼠标：左拖=旋转/右拖=平移/滚轮=缩放；Space=暂停/继续，←/→=步进，"
-              "Home/End=首/尾，R=复位视角，S=从头播放，Esc=退出")
+        print(f"[回放] 目标 ≈{self.fps * self.speed:.0f} 帧/秒（录制 {self.fps:.0f}fps = 实时）。"
+              f"内容时钟按真实时间跑：渲染跟不上就在 60Hz 屏上自然跳过中间帧，绝不停顿慢放。"
+              f"- / + 半速/倍速可调。")
+        print("[回放] 鼠标：左拖=旋转/右拖=平移/滚轮=缩放；Space=播放/暂停（到尾再按=从头），"
+              "←/→=步进，Home/End=首/尾，R=复位视角，S=从头播放，Esc=退出")
         if self.overlay is not None and self.overlay.available:
             print("[回放] V=开关 2D 检测叠加窗口（四路视频 + 球框 + 关键点）")
 
@@ -1134,30 +1530,17 @@ class _PlayerApp:
             if warmed >= 3:
                 return
 
-    def _step_forward(self) -> None:
-        """前进一帧：每帧都渲染（不按墙钟跳帧），保证动作连续不顿。
-
-        目标速度 = ``speed * fps``；渲染快于目标时靠 ``run`` 里的调度休眠对齐实时，
-        渲染慢于目标时逐帧渲染、自然慢放（宁慢勿跳）。到末尾自动暂停。
-        """
-        n = max(0, self.tl.n_ref - 1)
-        if n <= 0 or self.t >= n:
-            self.t = float(n)
-            self.playing = False
-            return
-        self.t += 1.0
-        if self.t >= n:
-            self.t = float(n)
-            self.playing = False
-
     def _show(self) -> None:
         t0 = int(self.t)
         if t0 == self.last_render_t and not self._need_show:
             return
+        force2d = (not self.playing) or self._need_show   # 暂停/步进时 2D 必同步，播放则节流
         self._need_show = False
         self.last_render_t = t0
-        person = self.scene_b.apply_people(self.widget.scene, t0)
-        has_ball = self.scene_b.apply_ball(self.widget.scene, t0)
+        # 播放中次层几何（影/骨骼/轨迹）降频（apply_* 的 full=False）；暂停/单帧/预热全量
+        paused = not self.playing
+        person = self.scene_b.apply_people(self.widget.scene, t0, full=paused)
+        has_ball = self.scene_b.apply_ball(self.widget.scene, t0, full=paused)
         self.widget.force_redraw()     # 场景变了立即重绘，别等事件流捎带（否则卡/跳帧）
         rate = self.speed * self.fps
         self.win.title = (f"EasyMocap 重建回放 — {os.path.basename(self.tl.out_dir)}"
@@ -1165,7 +1548,7 @@ class _PlayerApp:
                           f"  |  {'● 人物' if person else '— 无人'}"
                           f"  |  {'● 球' if has_ball else ''}"
                           f"  |  x{self.speed:.1f} ≈{rate:.0f}帧/秒")
-        self._refresh_2d()
+        self._refresh_2d(force=force2d)
 
     # -- 2D 检测叠加窗口（V 开关）--------------------------------------
     def _toggle_2d(self) -> None:
@@ -1184,7 +1567,7 @@ class _PlayerApp:
         w.set_on_close(self._on_2d_close)
         self._2d_win = w
         self._2d_img_widget = iw
-        self._refresh_2d()
+        self._refresh_2d(force=True)
         print("[回放] 2D 检测叠加 开")
 
     def _close_2d(self) -> None:
@@ -1198,9 +1581,18 @@ class _PlayerApp:
         self._2d_win = None
         self._2d_img_widget = None
 
-    def _refresh_2d(self) -> None:
+    def _refresh_2d(self, force: bool = False) -> None:
+        """把当前 t 的四路画面推给 2D 叠加窗。
+
+        四路视频 + 画框 + resize 一次 ~15-25ms，逐帧解会把回放拖慢；播放中最多
+        ``_2D_FPS`` 次/秒（3D 每帧都换，2D 不必跟那么快），暂停/步进时 force 同步。
+        """
         if self._2d_img_widget is None or self.overlay is None:
             return
+        now = time.perf_counter()
+        if not force and now - self._last_2d_wall < 1.0 / _2D_FPS:
+            return
+        self._last_2d_wall = now
         tile = self.overlay.tile(int(self.t))
         if tile is None:
             return
@@ -1216,21 +1608,41 @@ class _PlayerApp:
         KeyName = self.gui.KeyName
         handled = True
         if k == KeyName.SPACE:
-            self.playing = not self.playing
+            n = max(0, self.tl.n_ref - 1)
+            if self.playing:
+                self.playing = False
+            elif self.t >= float(n):
+                # 停在末尾时按 Space = 从头再放（旧实现是死键：t 到 n 后 _step 直接
+                # return，再也播不起来）。残留已在每次播放里被 降频+限速 压到很小，
+                # 直接重头放即可。
+                self.t = 0.0
+                self.playing = True
+                self._need_show = True
+            else:
+                self.playing = True
+                self._need_show = True
         elif k == KeyName.LEFT:
+            self.playing = False               # 步进即暂停，精确看单帧
             self.t = max(0.0, int(self.t) - 1)
+            self._need_show = True
         elif k == KeyName.RIGHT:
-            self.t = min(self.tl.n_ref - 1, int(self.t) + 1)
+            self.playing = False
+            self.t = min(max(0, self.tl.n_ref - 1), int(self.t) + 1)
+            self._need_show = True
         elif k == KeyName.HOME:
             self.t = 0.0
+            self.playing = False
+            self._need_show = True
         elif k == KeyName.END:
             self.t = max(0, self.tl.n_ref - 1)
             self.playing = False
+            self._need_show = True
         elif k == ord("R"):
             self.widget.setup_camera(50.0, self.scene_b.bounds(), self.scene_b.center())
         elif k == ord("s") or k == ord("S"):
             self.t = 0.0
             self.playing = True
+            self._need_show = True
         elif k == ord("V") or k == ord("v"):
             self._toggle_2d()
         elif k == ord("-"):
@@ -1262,8 +1674,11 @@ def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
 
     tl = ReconTimeline(out_dir, hold_gaps=hold_gaps)
     faces = load_faces(out_dir, easymocap_root)
+    # GUI 回放走点云路径（mode="points"）：动态层全部 Scene.update_geometry 原地更新、
+    # 无 remove+add —— 不会像网格那样累积 ~1 万次即段错误（render_still 离屏才用 mesh）。
     scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root),
-                         cast_shadow=cast_shadow, ball_trail=ball_trail)
+                         cast_shadow=cast_shadow, ball_trail=ball_trail,
+                         mode="points")
     if fps <= 0:
         fps = tl.ref_rate_hz
     if not watch:
