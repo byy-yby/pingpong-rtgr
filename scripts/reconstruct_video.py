@@ -4,7 +4,8 @@
 流程（与 live_control 在线 EasyMocap 同一套检测 + 拟合，只是输入换成视频文件）
   1) 读 session 文件夹里的 ``cam{cid}.mp4``（cid = 标定相机号）＋ ts 副产物；
   2) 按设备时间戳把四路重新对齐到主时钟相机（允许编码丢帧，见 video_source 文档）；
-  3) 每个主时钟帧：各相机对齐帧 → 人检测(yolo11n-gray) + RTMPose halpe26 →
+  3) 每个主时钟帧：各相机对齐帧 → 人检测(yolo11n-gray) + 姿态模型（默认 RTMPose
+     halpe26，``--pose-model vitpose-b-coco_25`` 切 ViTPose，输出同样重排成 halpe26）→
      每相机取最高置信度的人 → SMPL 拟合（默认官方多帧批量，激活帧间平滑）；
   4) 球轨迹（独立一遍，默认开启）：逐帧各相机球检测（经典 / YOLO）→ DLT 三角化
      → 3D 球心，写 ``ball_trajectory.npz``（供 visualize_recon.py 渲染红球 + 轨迹线）；
@@ -142,7 +143,9 @@ def build_args():
     ap.add_argument("--fit-conf", type=float, default=0.15,
                     help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此被丢弃；黑衣服人关键点偏低，降到 0.15 保留更多约束）")
     ap.add_argument("--pose-model", default="rtmpose-x-halpe26",
-                    help="姿态模型：rtmpose-x-halpe26（默认，384×288 更高精度，脚部更准）/ rtmpose-l-halpe26（256×192 更快）")
+                    help="姿态模型：rtmpose-x-halpe26（默认，384×288 更高精度，脚部更准）/ "
+                         "rtmpose-l-halpe26（256×192 更快）/ vitpose-b-coco_25 等（ViTPose，"
+                         "coco_25 25 点含脚，输出重排成 halpe26；vitpose-s 最快 / b 甜点 / l 最强）")
     ap.add_argument("--pose-input-size", type=int, nargs=2, default=(288, 384),
                     metavar=("H", "W"), help="姿态模型输入尺寸 (H, W)，默认 288 384（对应 384×288）")
     ap.add_argument("--vposer", action="store_true",
@@ -496,6 +499,12 @@ def main() -> None:
         sys.exit(1)
     if args.fake_poses:
         detector = None
+    elif args.pose_model.startswith("vitpose"):
+        # ViTPose：easy_ViTPose coco_25（25 点含脚）ONNX，输出重排成 halpe26。
+        from tabletennis.vision.pose.vitpose_pose import ViTPosePoseDetector
+        detector = ViTPosePoseDetector(model=args.pose_model, device="cuda",
+                                       backend="cuda", score_thr=args.det_conf)
+        print(f"  人检测置信度阈值：{args.det_conf} | 姿态模型：{args.pose_model}（ViTPose）")
     else:
         from tabletennis.vision.pose.rtmpose_pose import RTMPoseDetector
         detector = RTMPoseDetector(device="cuda", backend="tensorrt",
