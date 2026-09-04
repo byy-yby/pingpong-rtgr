@@ -19,9 +19,11 @@ FOV 垂直」三个滑动条做 what-if：改镜头焦距（或直接改视场�
   垂直」各自独立改 fx / fy（可做成各向异性、非方形像素）。拖动任意一个，其余两个
   的显示值自动同步，无矛盾。
 
-覆盖锥几何：4 条角射线打到桌面平面 z=0 的 4 个交点围成足迹四边形，足迹边缘线 +
-光心到 4 角的 4 条棱构成线框，锥体侧面 + 足迹底面用半透明颜色填充（「空间里能拍到
-的地方」）。角射线打不到桌面时退到远平面兜底点。
+覆盖几何用**点云**（``defaultUnlit`` + 逐点色）替代表现「半透明覆盖」：4 条角射线
+打到桌面平面 z=0 的 4 个交点围成足迹四边形，4 条角射线 + 4 条足迹边用**全亮**相机
+色点，锥体侧面/足迹内部的点用相机颜色向背景混色的**淡色**点——明暗即区分，等价于
+半透明效果。点云 ``add`` 一次后 ``update_geometry`` 原地改顶点、零 remove+add，避免
+交互 GL 下三角网格 / 透明材质反复重挂导致的段错误。角射线打不到桌面时退到远平面兜底点。
 
 用法：
     python scripts/visualize_fov.py                      # 交互窗口（滑动条 + 相机勾选）
@@ -73,8 +75,15 @@ _GRID_COLOR = [0.35, 0.35, 0.42]
 _FRUSTUM_DEPTH_FACTOR = 1.3
 _FRUSTUM_DEPTH_MIN_M = 2.5
 _FRUSTUM_DEPTH_MAX_M = 6.0
-# 覆盖锥（「空间里能拍到的地方」）的半透明填充透明度
-_COVERAGE_ALPHA = 0.12
+# 覆盖点云采样密度（点云方式，无 remove+add、无透明材质）
+_COV_POINT_SIZE = 3.0     # 点大小（像素）
+_COV_RAY_DOTS = 60        # 每条角射线的采样点数
+_COV_EDGE_DOTS = 40       # 每条足迹边的采样点数
+_COV_GRID_X = 18          # 锥体内部网格（图像平面 u 方向）
+_COV_GRID_Y = 13          # 锥体内部网格（图像平面 v 方向）
+_COV_GRID_STEPS = 10      # 每条内部射线沿程采样点数
+_COV_FAINT = 0.30         # 淡色点：相机颜色向背景混色的保留比例
+_BG_COLOR = [0.10, 0.11, 0.14]
 
 
 # =========================================================================
@@ -118,10 +127,10 @@ def camera_center(ext: CameraExtrinsics) -> np.ndarray:
 
 
 class SceneModel:
-    """把「桌面系外参 + 可调焦距」转成 Open3D 场景几何（静态 + 射线区域两层）。
+    """把「桌面系外参 + 可调焦距」转成 Open3D 场景几何（静态 + 覆盖点云两层）。
 
-    静态层（球桌/地面/相机光心小球/坐标架）只建一次；射线层随 fx/fy 变化，
-    :meth:`set_frustums` remove+add 对应的 LineSet。
+    静态层（球桌/地面/相机光心小球/坐标架）只建一次；覆盖点云层随 fx/fy 变化，
+    :meth:`update_coverage` 原地改顶点（``Scene.update_geometry``，零 remove+add）。
     """
 
     def __init__(self, intrinsics: Dict[int, CameraIntrinsics],
@@ -159,6 +168,9 @@ class SceneModel:
         self.base_fy = float(ref.K[1, 1])
         self.W = ref.width
         self.H = ref.height
+        # 覆盖点云（t.PointCloud）按 cid 缓存，add 一次后原地更新
+        self._cov_pcds: Dict[int, "object"] = {}
+        self._cov_cap: Dict[int, int] = {}
 
     def default_fov(self) -> Tuple[float, float, float]:
         return fov_from_fx_fy(self.base_fx, self.base_fy, self.W, self.H)
@@ -170,6 +182,7 @@ class SceneModel:
         self._add_axes(scene, np.zeros(3), "world_axes", 0.25)
         for cam in self.cams:
             self._add_camera_body(scene, cam)
+        self.add_coverage_layers(scene)
 
     def _add_table(self, scene) -> None:
         t = self.table
@@ -262,39 +275,53 @@ class SceneModel:
         mr.line_width = 2.0
         scene.add_geometry(name, ls, mr)
 
-    # ---- 覆盖锥层 ---------------------------------------------------
-    def set_frustums(self, scene, fx: float, fy: float,
-                     enabled: Optional[List[bool]] = None) -> None:
-        """按当前 fx/fy 重建**启用**相机的覆盖锥；停用的相机隐藏本体并移除覆盖锥。
+    # ---- 覆盖点云层（安全：add 一次，update_geometry 原地更新）---------
+    def add_coverage_layers(self, scene) -> None:
+        """为每台相机 add 一个占位覆盖点云（``t.PointCloud``），之后只原地更新顶点。
 
-        覆盖锥 = 光心 + 4 条角射线与桌面平面 z=0 的交点（打不到桌面则退到远平面点），
-        由「4 条角射线 + 4 条桌面足迹边缘」的 LineSet 和「锥体侧面 + 足迹底面」的
-        半透明 TriangleMesh 组成——只画最边缘 4 角，不再画整束网格。
+        覆盖用点云而非半透明三角网格 / 动态 LineSet：交互 GL 下反复 remove+add
+        三角网格或 ``defaultLitTransparency`` 会段错误（recon_player 踩过的坑），
+        点云可用 ``Scene.update_geometry`` 原地改顶点缓冲、零实体残留。
         """
+        for cam in self.cams:
+            cid = cam["cid"]
+            cap = self._coverage_capacity()
+            pcd = o3d.t.geometry.PointCloud()
+            pcd.point.positions = o3d.core.Tensor(np.zeros((cap, 3), np.float32))
+            pcd.point.colors = o3d.core.Tensor(np.zeros((cap, 3), np.float32))
+            scene.add_geometry(f"cam_{cid}_cov", pcd, _unlit_point_material(_COV_POINT_SIZE))
+            self._cov_pcds[cid] = pcd
+            self._cov_cap[cid] = cap
+
+    def _coverage_capacity(self) -> int:
+        return (4 * _COV_RAY_DOTS + 4 * _COV_EDGE_DOTS
+                + _COV_GRID_X * _COV_GRID_Y * _COV_GRID_STEPS)
+
+    def update_coverage(self, scene, fx: float, fy: float,
+                        enabled: Optional[List[bool]] = None) -> None:
+        """按当前 fx/fy 原地更新**启用**相机的覆盖点云；停用则隐藏本体 + 覆盖点云。"""
         if enabled is None:
             enabled = [True] * len(self.cams)
         for cam in self.cams:
             cid = cam["cid"]
             on = bool(enabled[cid]) if cid < len(enabled) else True
-            # 相机本体（光心小球 + 朝向坐标架）显隐
             scene.show_geometry(f"cam_{cid}_sph", on)
             scene.show_geometry(f"cam_{cid}_axes", on)
             if on:
-                self._remove_coverage(scene, cid)
-                ls, mesh = self._coverage_cone(cam, fx, fy)
-                _add_line_geo(scene, f"cam_{cid}_cone", ls, cam["color"], 1.5)
-                scene.add_geometry(
-                    f"cam_{cid}_foot", mesh,
-                    _transp_material(cam["color"], _COVERAGE_ALPHA))
-            else:
-                self._remove_coverage(scene, cid)
-
-    def _remove_coverage(self, scene, cid: int) -> None:
-        for name in (f"cam_{cid}_cone", f"cam_{cid}_foot"):
-            try:
-                scene.remove_geometry(name)
-            except Exception:  # noqa: BLE001  首次可能尚未 add
-                pass
+                pts, cols = self._coverage_points(cam, fx, fy)
+                cap = self._cov_cap[cid]
+                n = min(len(pts), cap)
+                pos = np.zeros((cap, 3), np.float32)
+                col = np.zeros((cap, 3), np.float32)
+                pos[:n] = pts[:n]
+                col[:n] = cols[:n]
+                pcd = self._cov_pcds[cid]
+                pcd.point.positions = o3d.core.Tensor(pos)
+                pcd.point.colors = o3d.core.Tensor(col)
+                low = scene.scene
+                low.update_geometry(f"cam_{cid}_cov", pcd,
+                                    low.UPDATE_POINTS_FLAG | low.UPDATE_COLORS_FLAG)
+            scene.show_geometry(f"cam_{cid}_cov", on)
 
     def _corner_dirs(self, cam: dict, fx: float, fy: float) -> np.ndarray:
         """4 个图像角的单位射线方向（世界系）(4,3)。"""
@@ -305,43 +332,66 @@ class SceneModel:
         dirs = (cam["Rw"] @ dirs.T).T               # 世界系
         return dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
 
-    def _coverage_cone(self, cam: dict, fx: float, fy: float):
-        """单相机覆盖锥 ``(LineSet, TriangleMesh)``。
-
-        LineSet：光心 → 4 个角点的 4 条角射线 + 4 条桌面足迹边缘（闭合四边形）。
-        TriangleMesh：锥体 4 个侧面 + 桌面足迹底面（半透明，表现「空间里能拍到的地方」）。
-        """
+    def _ray_ends(self, cam: dict, dirs: np.ndarray) -> np.ndarray:
+        """每条单位射线 ``(N,3)`` 与桌面 z=0 的交点；打不到则退到远平面点。"""
         C = cam["C"]
-        dirs = self._corner_dirs(cam, fx, fy)
-        corners = np.empty((4, 3), np.float64)
+        ends = np.empty_like(dirs)
         for i, d in enumerate(dirs):
             dz = d[2]
             if dz < -1e-9:
-                s = (0.0 - C[2]) / dz           # 与桌面平面 z=0 的交点参数
+                s = (0.0 - C[2]) / dz
                 if s > 0.0:
-                    corners[i] = C + s * d
+                    ends[i] = C + s * d
                     continue
-            corners[i] = C + cam["depth"] * d   # 打不到桌面：退到远平面点
+            ends[i] = C + cam["depth"] * d
+        return ends
 
-        apex = C.reshape(1, 3)
-        pts = np.vstack([apex, corners])        # 点 0 = 光心，1..4 = 4 个角点
-        lines = np.array([[0, 1], [0, 2], [0, 3], [0, 4],   # 4 条角射线
-                          [1, 2], [2, 3], [3, 4], [4, 1]], np.int32)  # 桌面足迹边缘
-        ls = o3d.geometry.LineSet()
-        ls.points = o3d.utility.Vector3dVector(pts)
-        ls.lines = o3d.utility.Vector2iVector(lines)
+    def _coverage_points(self, cam: dict, fx: float, fy: float):
+        """单相机覆盖点云 ``(pts, colors)``：亮 = 4 角射线 + 4 足迹边，淡 = 锥体/足迹内部。
 
-        # 锥体：4 个侧面（光心 + 相邻两角）+ 足迹底面（两三角）
-        verts = np.vstack([C, corners])
-        tris = np.array([
-            [0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 1],   # 侧面
-            [1, 2, 3], [1, 3, 4],                          # 底面
-        ], np.int32)
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(verts)
-        mesh.triangles = o3d.utility.Vector3iVector(tris)
-        mesh.compute_vertex_normals()
-        return ls, mesh
+        点云（``defaultUnlit`` + 逐点色）替代表现「半透明覆盖」：内部点用相机颜色
+        向背景混色的**淡色**，4 角射线与足迹边缘用**全亮**相机色，明暗即区分。
+        """
+        C = cam["C"]
+        dirs = self._corner_dirs(cam, fx, fy)
+        corners = self._ray_ends(cam, dirs)
+
+        bright = cam["color"]
+        faint = (cam["color"] * _COV_FAINT
+                 + np.asarray(_BG_COLOR, np.float64) * (1.0 - _COV_FAINT))
+
+        pts: List[np.ndarray] = []
+        cols: List[np.ndarray] = []
+        # 1) 4 条角射线（光心 -> 角点）
+        t_ray = np.linspace(0.0, 1.0, _COV_RAY_DOTS)[:, None]
+        for i in range(4):
+            seg = C[None, :] * (1.0 - t_ray) + corners[i][None, :] * t_ray
+            pts.append(seg)
+            cols.append(np.tile(bright, (_COV_RAY_DOTS, 1)))
+        # 2) 4 条足迹边缘（角点 -> 下一个角点）
+        t_edge = np.linspace(0.0, 1.0, _COV_EDGE_DOTS)[:, None]
+        for i in range(4):
+            j = (i + 1) % 4
+            seg = corners[i][None, :] * (1.0 - t_edge) + corners[j][None, :] * t_edge
+            pts.append(seg)
+            cols.append(np.tile(bright, (_COV_EDGE_DOTS, 1)))
+        # 3) 锥体内部 + 足迹面：图像平面网格射线沿程采样（淡色）
+        W, H = cam["W"], cam["H"]
+        K = np.array([[fx, 0, cam["cx"]], [0, fy, cam["cy"]], [0, 0, 1]], np.float64)
+        us = np.linspace(0.0, W, _COV_GRID_X)
+        vs = np.linspace(0.0, H, _COV_GRID_Y)
+        uv = np.array([[u, v, 1.0] for v in vs for u in us], np.float64)
+        dgrid = (np.linalg.inv(K) @ uv.T).T
+        dgrid = (cam["Rw"] @ dgrid.T).T
+        dgrid = dgrid / np.linalg.norm(dgrid, axis=1, keepdims=True)
+        ends = self._ray_ends(cam, dgrid)                        # (G,3)
+        t_int = np.linspace(0.0, 1.0, _COV_GRID_STEPS)[None, :, None]
+        segs = C[None, None, :] * (1.0 - t_int) + ends[:, None, :] * t_int  # (G,S,3)
+        n_int = segs.shape[0] * _COV_GRID_STEPS
+        pts.append(segs.reshape(-1, 3))
+        cols.append(np.tile(faint, (n_int, 1)))
+
+        return np.vstack(pts), np.vstack(cols)
 
 
 def _lit_material(color, roughness: float = 0.7):
@@ -352,13 +402,12 @@ def _lit_material(color, roughness: float = 0.7):
     return mr
 
 
-def _transp_material(color, alpha: float):
-    """半透明材质（覆盖锥填充用）：必须显式 ``defaultLitTransparency`` 才混合。"""
+def _unlit_point_material(point_size: float):
+    """点云材质：``defaultUnlit`` + 点大小（颜色走逐点色，不参与光照）。"""
     mr = o3d.visualization.rendering.MaterialRecord()
-    mr.shader = "defaultLitTransparency"
-    mr.base_color = [float(color[0]), float(color[1]), float(color[2]), float(alpha)]
-    mr.base_roughness = 0.9
-    mr.base_metallic = 0.0
+    mr.shader = "defaultUnlit"
+    mr.base_color = [1.0, 1.0, 1.0, 1.0]
+    mr.point_size = float(point_size)
     return mr
 
 
@@ -392,7 +441,7 @@ def render_offscreen(model: SceneModel, out_path: str, fx: float, fy: float,
     scene = renderer.scene
     scene.set_background(np.array([0.10, 0.11, 0.14, 1.0], np.float32))
     model.add_static(scene)
-    model.set_frustums(scene, fx, fy)
+    model.update_coverage(scene, fx, fy)
 
     _, center = _scene_bounds_center(model)
     t = model.table
@@ -432,7 +481,7 @@ class FovViewerApp:
         self.widget.scene = self.scene
 
         model.add_static(self.scene)
-        model.set_frustums(self.scene, self.fx, self.fy, self.enabled)
+        model.update_coverage(self.scene, self.fx, self.fy, self.enabled)
 
         bounds, center = _scene_bounds_center(model)
         self.widget.setup_camera(60.0, bounds, center)
@@ -542,7 +591,7 @@ class FovViewerApp:
         )
 
     def _apply_fov(self) -> None:
-        self.model.set_frustums(self.scene, self.fx, self.fy, self.enabled)
+        self.model.update_coverage(self.scene, self.fx, self.fy, self.enabled)
         self.widget.force_redraw()
         fov_h, fov_v, f_mm = fov_from_fx_fy(self.fx, self.fy, self.model.W, self.model.H)
         self.win.title = (f"相机视场角 / 焦距可视化  |  f={f_mm:.2f}mm  "
