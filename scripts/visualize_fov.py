@@ -1,10 +1,12 @@
 #!/usr/bin/env python
-"""3D 视场角 / 焦距可视化：相机朝向 + 射线覆盖区域 + 球桌，滑动条控制焦距与 FOV H/V。
+"""3D 视场角 / 焦距可视化：相机朝向 + 覆盖锥 + 球桌，滑动条控制焦距与 FOV H/V。
 
 对着 4 台相机的**桌面系外参**（``data/extrinsics/table_extrinsics.yaml``）和**内参**
-（``data/calibration/cam_N.yaml``）把整场建到 Open3D 场景里，然后用两个「焦距 / FOV」
-滑动条做 what-if：改镜头焦距（或直接改水平/垂直视场角），实时看每台相机的**射线覆盖
-区域**（视锥 = 光心发出的射线束 + 远平面窗口）怎么收窄/放大、覆盖到球桌哪里。
+（``data/calibration/cam_N.yaml``）把整场建到 Open3D 场景里，然后用「焦距 / FOV 水平 /
+FOV 垂直」三个滑动条做 what-if：改镜头焦距（或直接改视场角），实时看每台相机的覆盖
+范围怎么收窄/放大、落到球桌哪里。每台相机只画**最边缘的 4 条角射线**，覆盖范围用
+**半透明锥体**（从光心延伸到桌面平面，淡淡地涂成该相机颜色）呈现，避免整束射线网格
+铺满画面太乱；可在「镜头参数」窗里**勾选**只渲染其中某几台相机。
 
 物理约定（与重建管道一致）：
 - 世界系 = 桌面系：原点在桌角标记，X 短边(宽 1.525m)、Y 长边(长 2.74m)、Z 竖直向上，桌面 z=0。
@@ -17,12 +19,12 @@
   垂直」各自独立改 fx / fy（可做成各向异性、非方形像素）。拖动任意一个，其余两个
   的显示值自动同步，无矛盾。
 
-射线区域只画成 ``LineSet``（光心 → 远平面网格点的射线束 + 远平面窗口线框），滑动时
-只 remove+add 这些线条、**不重挂三角网格**——绕开 Filament 里 TriangleMesh 反复
-remove+add 会累积引擎级残留、~1 万次段错误的坑（见 recon_player.py 的教训）。
+覆盖锥几何：4 条角射线打到桌面平面 z=0 的 4 个交点围成足迹四边形，足迹边缘线 +
+光心到 4 角的 4 条棱构成线框，锥体侧面 + 足迹底面用半透明颜色填充（「空间里能拍到
+的地方」）。角射线打不到桌面时退到远平面兜底点。
 
 用法：
-    python scripts/visualize_fov.py                      # 交互窗口（滑动条）
+    python scripts/visualize_fov.py                      # 交互窗口（滑动条 + 相机勾选）
     python scripts/visualize_fov.py --offscreen out.png  # 无头渲染一帧 PNG（默认内参）
 
 依赖：``open3d 0.19``（``tt`` 环境）。交互窗口需要显示；``--offscreen`` 走 EGL 无头。
@@ -58,6 +60,7 @@ _CAM_COLORS = [
     [0.45, 1.00, 0.45],   # 绿
     [1.00, 0.85, 0.25],   # 黄
 ]
+_CAM_COLOR_NAMES = ["红", "蓝", "绿", "黄"]
 _TABLE_TOP_COLOR = [0.10, 0.45, 0.30]
 _TABLE_EDGE_COLOR = [0.05, 0.28, 0.20]
 _TABLE_LINE_COLOR = [0.15, 0.85, 0.30]
@@ -66,14 +69,12 @@ _TABLE_NET_COLOR = [0.20, 0.85, 0.90]
 _FLOOR_COLOR = [0.24, 0.24, 0.26]
 _GRID_COLOR = [0.35, 0.35, 0.42]
 
-# 射线束远平面（成像窗口）距离：= clamp(因子 × 相机到球桌中心距离)。只依赖相机位置，
-# 不随 FOV 变，保证 FOV 变化时窗口大小直接可比。
+# 远平面深度（角射线打不到桌面时的兜底终点）：= clamp(因子 × 相机到球桌中心距离)。
 _FRUSTUM_DEPTH_FACTOR = 1.3
 _FRUSTUM_DEPTH_MIN_M = 2.5
 _FRUSTUM_DEPTH_MAX_M = 6.0
-# 射线束在成像面上的网格密度（点行列数）
-_RAY_GX = 7
-_RAY_GY = 5
+# 覆盖锥（「空间里能拍到的地方」）的半透明填充透明度
+_COVERAGE_ALPHA = 0.12
 
 
 # =========================================================================
@@ -114,17 +115,6 @@ def camera_center(ext: CameraExtrinsics) -> np.ndarray:
     R = np.asarray(ext.R, dtype=np.float64)
     t = np.asarray(ext.t, dtype=np.float64).reshape(3)
     return -(R.T @ t)
-
-
-def image_plane_points(K: np.ndarray, W: int, H: int, depth: float,
-                       gx: int = _RAY_GX, gy: int = _RAY_GY) -> np.ndarray:
-    """相机系里、z=depth 成像面上的 ``gx×gy`` 网格点坐标（射线方向归一后乘 depth）。"""
-    Kinv = np.linalg.inv(K)
-    us = np.linspace(0, W, gx)
-    vs = np.linspace(0, H, gy)
-    uv = np.array([[u, v, 1.0] for v in vs for u in us], dtype=np.float64)
-    pts = (Kinv @ uv.T).T        # (N,3)，z=1
-    return pts * depth           # z=depth
 
 
 class SceneModel:
@@ -272,57 +262,102 @@ class SceneModel:
         mr.line_width = 2.0
         scene.add_geometry(name, ls, mr)
 
-    # ---- 射线区域层 ---------------------------------------------------
-    def set_frustums(self, scene, fx: float, fy: float) -> None:
-        """按当前 fx/fy 重建所有相机的射线覆盖区域（remove+add 各 LineSet）。"""
-        self.remove_frustums(scene)
-        for cam in self.cams:
-            ls = self._ray_region(cam, fx, fy)
-            _add_line_geo(scene, f"cam_{cam['cid']}_rays", ls, cam["color"], 1.5)
+    # ---- 覆盖锥层 ---------------------------------------------------
+    def set_frustums(self, scene, fx: float, fy: float,
+                     enabled: Optional[List[bool]] = None) -> None:
+        """按当前 fx/fy 重建**启用**相机的覆盖锥；停用的相机隐藏本体并移除覆盖锥。
 
-    def remove_frustums(self, scene) -> None:
-        for cam in self.cams:
-            scene.remove_geometry(f"cam_{cam['cid']}_rays")
-
-    def _ray_region(self, cam: dict, fx: float, fy: float) -> "object":
-        """单相机射线覆盖区域 LineSet：光心发出的射线束 + 远平面窗口线框。
-
-        世界系里：光心 ``C``，远平面网格点 ``X_w = Rw @ (p_cam - t)``。射线束覆盖的
-        就是该相机在远平面上的可视窗口，FOV 变大 → 窗口变大 → 覆盖球桌范围变宽。
+        覆盖锥 = 光心 + 4 条角射线与桌面平面 z=0 的交点（打不到桌面则退到远平面点），
+        由「4 条角射线 + 4 条桌面足迹边缘」的 LineSet 和「锥体侧面 + 足迹底面」的
+        半透明 TriangleMesh 组成——只画最边缘 4 角，不再画整束网格。
         """
-        W, H, depth = cam["W"], cam["H"], cam["depth"]
-        Rw = cam["Rw"]
+        if enabled is None:
+            enabled = [True] * len(self.cams)
+        for cam in self.cams:
+            cid = cam["cid"]
+            on = bool(enabled[cid]) if cid < len(enabled) else True
+            # 相机本体（光心小球 + 朝向坐标架）显隐
+            scene.show_geometry(f"cam_{cid}_sph", on)
+            scene.show_geometry(f"cam_{cid}_axes", on)
+            if on:
+                self._remove_coverage(scene, cid)
+                ls, mesh = self._coverage_cone(cam, fx, fy)
+                _add_line_geo(scene, f"cam_{cid}_cone", ls, cam["color"], 1.5)
+                scene.add_geometry(
+                    f"cam_{cid}_foot", mesh,
+                    _transp_material(cam["color"], _COVERAGE_ALPHA))
+            else:
+                self._remove_coverage(scene, cid)
+
+    def _remove_coverage(self, scene, cid: int) -> None:
+        for name in (f"cam_{cid}_cone", f"cam_{cid}_foot"):
+            try:
+                scene.remove_geometry(name)
+            except Exception:  # noqa: BLE001  首次可能尚未 add
+                pass
+
+    def _corner_dirs(self, cam: dict, fx: float, fy: float) -> np.ndarray:
+        """4 个图像角的单位射线方向（世界系）(4,3)。"""
+        W, H = cam["W"], cam["H"]
         K = np.array([[fx, 0, cam["cx"]], [0, fy, cam["cy"]], [0, 0, 1]], np.float64)
-        grid_cam = image_plane_points(K, W, H, depth, _RAY_GX, _RAY_GY)  # (gx*gy,3) 相机系
-        # 相机系 -> 世界系：X_w = Rw @ (X_cam - t)，其中 C = -Rw @ t => t = -Rw^T @ C
-        t = -(Rw.T @ cam["C"])
-        grid_world = (Rw @ (grid_cam - t).T).T
-        apex = cam["C"].reshape(1, 3)
-        pts = np.vstack([apex, grid_world])     # 点 0 = 光心，1..N = 远平面网格
+        uv = np.array([[0, 0, 1], [W, 0, 1], [W, H, 1], [0, H, 1]], np.float64)
+        dirs = (np.linalg.inv(K) @ uv.T).T          # (4,3) 相机系方向
+        dirs = (cam["Rw"] @ dirs.T).T               # 世界系
+        return dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
 
-        gx, gy = _RAY_GX, _RAY_GY
-        lines: List[List[int]] = []
-        # 射线束：光心 -> 每个网格点
-        for i in range(gx * gy):
-            lines.append([0, 1 + i])
-        # 远平面窗口线框：横向（每行） + 纵向（每列）填满成像面
-        for j in range(gy):
-            for i in range(gx - 1):
-                lines.append([1 + j * gx + i, 1 + j * gx + i + 1])
-        for i in range(gx):
-            for j in range(gy - 1):
-                lines.append([1 + j * gx + i, 1 + (j + 1) * gx + i])
+    def _coverage_cone(self, cam: dict, fx: float, fy: float):
+        """单相机覆盖锥 ``(LineSet, TriangleMesh)``。
 
+        LineSet：光心 → 4 个角点的 4 条角射线 + 4 条桌面足迹边缘（闭合四边形）。
+        TriangleMesh：锥体 4 个侧面 + 桌面足迹底面（半透明，表现「空间里能拍到的地方」）。
+        """
+        C = cam["C"]
+        dirs = self._corner_dirs(cam, fx, fy)
+        corners = np.empty((4, 3), np.float64)
+        for i, d in enumerate(dirs):
+            dz = d[2]
+            if dz < -1e-9:
+                s = (0.0 - C[2]) / dz           # 与桌面平面 z=0 的交点参数
+                if s > 0.0:
+                    corners[i] = C + s * d
+                    continue
+            corners[i] = C + cam["depth"] * d   # 打不到桌面：退到远平面点
+
+        apex = C.reshape(1, 3)
+        pts = np.vstack([apex, corners])        # 点 0 = 光心，1..4 = 4 个角点
+        lines = np.array([[0, 1], [0, 2], [0, 3], [0, 4],   # 4 条角射线
+                          [1, 2], [2, 3], [3, 4], [4, 1]], np.int32)  # 桌面足迹边缘
         ls = o3d.geometry.LineSet()
         ls.points = o3d.utility.Vector3dVector(pts)
-        ls.lines = o3d.utility.Vector2iVector(np.asarray(lines, np.int32))
-        return ls
+        ls.lines = o3d.utility.Vector2iVector(lines)
+
+        # 锥体：4 个侧面（光心 + 相邻两角）+ 足迹底面（两三角）
+        verts = np.vstack([C, corners])
+        tris = np.array([
+            [0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 1],   # 侧面
+            [1, 2, 3], [1, 3, 4],                          # 底面
+        ], np.int32)
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts)
+        mesh.triangles = o3d.utility.Vector3iVector(tris)
+        mesh.compute_vertex_normals()
+        return ls, mesh
 
 
 def _lit_material(color, roughness: float = 0.7):
     mr = o3d.visualization.rendering.MaterialRecord()
     mr.base_color = [float(color[0]), float(color[1]), float(color[2]), 1.0]
     mr.base_roughness = float(roughness)
+    mr.base_metallic = 0.0
+    return mr
+
+
+def _transp_material(color, alpha: float):
+    """半透明材质（覆盖锥填充用）：必须显式 ``defaultLitTransparency`` 才混合。"""
+    mr = o3d.visualization.rendering.MaterialRecord()
+    mr.shader = "defaultLitTransparency"
+    mr.base_color = [float(color[0]), float(color[1]), float(color[2]), float(alpha)]
+    mr.base_roughness = 0.9
     mr.base_metallic = 0.0
     return mr
 
@@ -381,6 +416,7 @@ class FovViewerApp:
         self.model = model
         self.fx = model.base_fx
         self.fy = model.base_fy
+        self.enabled = [True] * len(model.cams)
         self._syncing = False
         self._done = False
 
@@ -396,14 +432,14 @@ class FovViewerApp:
         self.widget.scene = self.scene
 
         model.add_static(self.scene)
-        model.set_frustums(self.scene, self.fx, self.fy)
+        model.set_frustums(self.scene, self.fx, self.fy, self.enabled)
 
         bounds, center = _scene_bounds_center(model)
         self.widget.setup_camera(60.0, bounds, center)
         self.widget.set_view_controls(self.gui.SceneWidget.Controls.ROTATE_CAMERA)
 
         # 副窗口：控制面板
-        self.panel_win = self.app.create_window("镜头参数", 360, 260)
+        self.panel_win = self.app.create_window("镜头参数", 360, 470)
         self.panel_win.set_on_close(lambda: setattr(self, "_done", True))
         self.win.set_on_close(lambda: setattr(self, "_done", True))
         self._build_panel()
@@ -434,6 +470,17 @@ class FovViewerApp:
         self._sl_fov_v.set_limits(5.0, 150.0)
         self._sl_fov_v.set_on_value_changed(self._on_fov_v)
         panel.add_child(self._sl_fov_v)
+
+        # 相机选择：勾选渲染哪几台
+        panel.add_child(gui.Label("渲染相机（勾选显示）"))
+        self._cam_cbs = []
+        for cam in self.model.cams:
+            cid = cam["cid"]
+            cb = gui.Checkbox(f"相机 {cid}（{_CAM_COLOR_NAMES[cid % 4]}）")
+            cb.checked = True
+            cb.set_on_checked(lambda checked, cid=cid: self._on_toggle(cid, checked))
+            self._cam_cbs.append(cb)
+            panel.add_child(cb)
 
         # 读值标签
         self._readout = gui.Label("")
@@ -475,6 +522,10 @@ class FovViewerApp:
         self._sync_sliders_from_state()
         self._apply_fov()
 
+    def _on_toggle(self, cid: int, checked: bool) -> None:
+        self.enabled[cid] = bool(checked)
+        self._apply_fov()
+
     def _sync_sliders_from_state(self) -> None:
         """把当前 fx/fy 反推的 f/FOV 值写回三个滑动条（带重入保护）。"""
         fov_h, fov_v, f_mm = fov_from_fx_fy(self.fx, self.fy, self.model.W, self.model.H)
@@ -491,7 +542,7 @@ class FovViewerApp:
         )
 
     def _apply_fov(self) -> None:
-        self.model.set_frustums(self.scene, self.fx, self.fy)
+        self.model.set_frustums(self.scene, self.fx, self.fy, self.enabled)
         self.widget.force_redraw()
         fov_h, fov_v, f_mm = fov_from_fx_fy(self.fx, self.fy, self.model.W, self.model.H)
         self.win.title = (f"相机视场角 / 焦距可视化  |  f={f_mm:.2f}mm  "
@@ -499,7 +550,7 @@ class FovViewerApp:
 
     def run(self) -> None:
         print("[视场角] 鼠标：左拖=旋转 / 右拖=平移 / 滚轮=缩放。"
-              "在「镜头参数」窗里拖滑动条改焦距/FOV。")
+              "在「镜头参数」窗里拖滑动条改焦距/FOV，勾选框选要渲染的相机。")
         try:
             while not self._done and self.app.run_one_tick():
                 pass
