@@ -4,8 +4,9 @@
 流程（与 live_control 在线 EasyMocap 同一套检测 + 拟合，只是输入换成视频文件）
   1) 读 session 文件夹里的 ``cam{cid}.mp4``（cid = 标定相机号）＋ ts 副产物；
   2) 按设备时间戳把四路重新对齐到主时钟相机（允许编码丢帧，见 video_source 文档）；
-  3) 每个主时钟帧：各相机对齐帧 → 人检测(yolo11n-gray) + 姿态模型（默认 RTMPose
-     halpe26，``--pose-model vitpose-b-coco_25`` 切 ViTPose，输出同样重排成 halpe26）→
+  3) 每个主时钟帧：各相机对齐帧 → 人检测(yolo11n-gray) + 姿态模型（默认
+     ViTPose vitpose-b，``--pose-model rtmpose-x-halpe26`` 切回 RTMPose；
+     两者输出都重排成 halpe26 布局）→
      每相机取最高置信度的人 → SMPL 拟合（默认官方多帧批量，激活帧间平滑）；
   4) 球轨迹（独立一遍，默认开启）：逐帧各相机球检测（经典 / YOLO）→ DLT 三角化
      → 3D 球心，写 ``ball_trajectory.npz``（供 visualize_recon.py 渲染红球 + 轨迹线）；
@@ -142,12 +143,13 @@ def build_args():
                     help="人检测置信度阈值（yolo11n bbox；黑衣服/低亮度人易被漏检，离线降到 0.2 少丢人）")
     ap.add_argument("--fit-conf", type=float, default=0.15,
                     help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此被丢弃；黑衣服人关键点偏低，降到 0.15 保留更多约束）")
-    ap.add_argument("--pose-model", default="rtmpose-x-halpe26",
-                    help="姿态模型：rtmpose-x-halpe26（默认，384×288 更高精度，脚部更准）/ "
-                         "rtmpose-l-halpe26（256×192 更快）/ vitpose-b-coco_25 等（ViTPose，"
-                         "coco_25 25 点含脚，输出重排成 halpe26；vitpose-s 最快 / b 甜点 / l 最强）")
+    ap.add_argument("--pose-model", default="vitpose-b-coco_25",
+                    help="姿态模型（默认 vitpose-b-coco_25，ViTPose：coco_25 25 点含脚，"
+                         "输出重排成 halpe26；vitpose-s 最快 / b 甜点 / l 最强）/ "
+                         "rtmpose-x-halpe26（384×288，RTMPose）/ rtmpose-l-halpe26（256×192）")
     ap.add_argument("--pose-input-size", type=int, nargs=2, default=(288, 384),
-                    metavar=("H", "W"), help="姿态模型输入尺寸 (H, W)，默认 288 384（对应 384×288）")
+                    metavar=("H", "W"), help="姿态模型输入尺寸 (H, W)（RTMPose 用，默认 288 384；"
+                    "ViTPose 忽略此参数，直接读 onnx 静态输入）")
     ap.add_argument("--vposer", action="store_true",
                     help="用 VPoser 潜空间拟合姿态（治本：姿态恒在自然流形，消腿扭/翻转），替代官方 batch 拟合")
     ap.add_argument("--vposer-ckpt", default=None,
