@@ -3,9 +3,10 @@
 
 对着 4 台相机的**桌面系外参**（``data/extrinsics/table_extrinsics.yaml``）和**内参**
 （``data/calibration/cam_N.yaml``）用 matplotlib 的 ``mplot3d`` 建 3D 场景，再用
-``Slider`` / ``CheckButtons`` 做交互：拖「焦距 / FOV 水平 / FOV 垂直」三个滑动条
-实时看每台相机的覆盖范围（4 条角射线 + 桌面足迹四边形 + 半透明锥体）怎么收窄/放大，
-勾选框选要渲染的相机。
+``Slider`` / ``RadioButtons`` / ``CheckButtons`` 做交互：拖「焦距 / FOV 水平 /
+FOV 垂直」三个滑动条实时看每台相机的覆盖范围（4 条角射线 + 桌面足迹四边形 + 半透明
+锥体）怎么收窄/放大；勾选框选要渲染的相机；右侧单选选中一台相机后，用 X/Y/Z +
+yaw/pitch/roll 滑动条**移动 / 转动**它，实时看覆盖范围随位姿变化。
 
 改用 matplotlib 的原因：Open3D 的交互窗口在本机 GL 后端反复段错误（覆盖层用透明材质
 / 三角网格重挂触发，与 recon_player 记录的同一类问题）。matplotlib 纯 CPU 软件渲染，
@@ -121,6 +122,7 @@ def build_cameras(intrinsics, extrinsics, table: Table3D) -> List[dict]:
         t = np.asarray(ext.t, dtype=np.float64).reshape(3)
         Rw = R.T
         C = -Rw @ t
+        yaw, pitch, roll = rot_to_ypr(Rw)
         depth = float(np.clip(
             _FRUSTUM_DEPTH_FACTOR * np.linalg.norm(C - table_center),
             _FRUSTUM_DEPTH_MIN_M, _FRUSTUM_DEPTH_MAX_M))
@@ -128,6 +130,9 @@ def build_cameras(intrinsics, extrinsics, table: Table3D) -> List[dict]:
             "cid": cid,
             "Rw": Rw,
             "C": C,
+            "yaw": yaw, "pitch": pitch, "roll": roll,   # 当前朝向（可编辑）
+            "C0": C.copy(), "Rw0": Rw.copy(),             # 标定基准（复位用）
+            "yaw0": yaw, "pitch0": pitch, "roll0": roll,
             "cx": float(K.K[0, 2]),
             "cy": float(K.K[1, 2]),
             "W": int(K.width),
@@ -167,6 +172,28 @@ def cone_corners(cam: dict, fx: float, fy: float) -> Tuple[np.ndarray, np.ndarra
     """光心 C 与 4 个足迹角点 corners(4,3)（世界系）。"""
     C = cam["C"]
     return C, ray_ends(cam, corner_dirs(cam, fx, fy))
+
+
+def rot_to_ypr(R: np.ndarray) -> Tuple[float, float, float]:
+    """旋转矩阵 → 世界系 ZYX 欧拉角（yaw/pitch/roll，度）。"""
+    R = np.asarray(R, np.float64)
+    yaw = math.degrees(math.atan2(R[1, 0], R[0, 0]))
+    pitch = math.degrees(math.atan2(-R[2, 0], math.hypot(R[0, 0], R[1, 0])))
+    roll = math.degrees(math.atan2(R[2, 1], R[2, 2]))
+    return yaw, pitch, roll
+
+
+def ypr_to_rot(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
+    """世界系 ZYX 欧拉角（度）→ 旋转矩阵 ``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``。"""
+    y, p, r = math.radians(yaw_deg), math.radians(pitch_deg), math.radians(roll_deg)
+    cy, sy = math.cos(y), math.sin(y)
+    cp, sp = math.cos(p), math.sin(p)
+    cr, sr = math.cos(r), math.sin(r)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp,     cp * sr,                cp * cr],
+    ], np.float64)
 
 
 # =========================================================================
@@ -280,12 +307,12 @@ def fit_view(ax, cams, table: Table3D, enabled: List[bool], fx: float, fy: float
 # 交互窗口
 # =========================================================================
 class FovViewer:
-    """matplotlib 交互窗口：3D 场景 + 滑动条（焦距/FOV）+ 相机勾选 + 复位按钮。"""
+    """matplotlib 交互窗口：3D 场景 + 焦距/FOV 滑动条 + 相机位姿编辑 + 勾选 + 复位。"""
 
     def __init__(self, cams: List[dict], table: Table3D,
                  base_fx: float, base_fy: float, W: int, H: int):
         import matplotlib.pyplot as plt
-        from matplotlib.widgets import Slider, CheckButtons, Button
+        from matplotlib.widgets import Slider, CheckButtons, Button, RadioButtons
         self.plt = plt
         self.cams = cams
         self.table = table
@@ -295,50 +322,77 @@ class FovViewer:
         self._base_fx = base_fx
         self._base_fy = base_fy
         self.enabled = [True] * len(cams)
-        self._syncing = False
-        self._cone_arts: Dict[int, List] = {}
+        self._edit_idx = 0                       # 当前编辑（移动/转动）的相机索引
+        self._syncing = False                    # 焦距/FOV 滑动条重入保护
+        self._syncing_pose = False               # 位姿滑动条重入保护
+        self._dyn_arts: List[List] = []          # 动态图层（相机本体 + 覆盖锥）
 
-        self.fig = plt.figure(figsize=(11.5, 8.5))
+        self.fig = plt.figure(figsize=(13.5, 10))
         self.ax = self.fig.add_subplot(111, projection="3d")
-
-        # 静态层：球桌 + 相机本体（位置点 + 坐标架）
         draw_table(self.ax, table)
-        self._cam_bodies = {cam["cid"]: draw_camera_body(self.ax, cam) for cam in cams}
         setup_view(self.ax, table)
-        fit_view(self.ax, cams, table, self.enabled, self.fx, self.fy)
 
-        # 初始覆盖锥
-        for cam in cams:
-            self._cone_arts[cam["cid"]] = draw_cone(self.ax, cam, self.fx, self.fy)
-
-        # 底部控件
         fov_h, fov_v, f_mm = fov_from_fx_fy(base_fx, base_fy, W, H)
-        self.fig.subplots_adjust(left=0.02, right=0.98, top=0.96, bottom=0.30)
-        self.ax.set_position([0.02, 0.32, 0.74, 0.66])
+        self.fig.subplots_adjust(left=0.02, right=0.98, top=0.97, bottom=0.42)
+        self.ax.set_position([0.02, 0.42, 0.66, 0.55])
 
-        self._sl_focal = Slider(self.plt.axes([0.10, 0.20, 0.52, 0.03]),
+        # 列 1：镜头（焦距 / FOV）
+        self._sl_focal = Slider(self.plt.axes([0.02, 0.34, 0.20, 0.025]),
                                 "focal f [mm]", 1.0, 25.0, valinit=f_mm)
-        self._sl_fov_h = Slider(self.plt.axes([0.10, 0.14, 0.52, 0.03]),
+        self._sl_fov_h = Slider(self.plt.axes([0.02, 0.27, 0.20, 0.025]),
                                 "FOV horiz [deg]", 5.0, 150.0, valinit=fov_h)
-        self._sl_fov_v = Slider(self.plt.axes([0.10, 0.08, 0.52, 0.03]),
+        self._sl_fov_v = Slider(self.plt.axes([0.02, 0.20, 0.20, 0.025]),
                                 "FOV vert [deg]", 5.0, 150.0, valinit=fov_v)
+        self._btn_reset = Button(self.plt.axes([0.02, 0.12, 0.20, 0.035]), "Reset")
         self._sl_focal.on_changed(self._on_focal)
         self._sl_fov_h.on_changed(self._on_fov_h)
         self._sl_fov_v.on_changed(self._on_fov_v)
+        self._btn_reset.on_clicked(self._on_reset)
 
+        # 列 2：选中相机的位置（世界系，米）
+        self._sl_cx = Slider(self.plt.axes([0.25, 0.34, 0.20, 0.025]),
+                             "X [m]", -4.0, 6.0, valinit=cams[0]["C"][0])
+        self._sl_cy = Slider(self.plt.axes([0.25, 0.27, 0.20, 0.025]),
+                             "Y [m]", -5.0, 8.0, valinit=cams[0]["C"][1])
+        self._sl_cz = Slider(self.plt.axes([0.25, 0.20, 0.20, 0.025]),
+                             "Z [m]", 0.5, 5.0, valinit=cams[0]["C"][2])
+        self._sl_cx.on_changed(self._on_cx)
+        self._sl_cy.on_changed(self._on_cy)
+        self._sl_cz.on_changed(self._on_cz)
+
+        # 列 3：选中相机的朝向（世界系 ZYX 欧拉角，度）
+        self._sl_yaw = Slider(self.plt.axes([0.48, 0.34, 0.20, 0.025]),
+                              "yaw [deg]", -180.0, 180.0, valinit=cams[0]["yaw"])
+        self._sl_pitch = Slider(self.plt.axes([0.48, 0.27, 0.20, 0.025]),
+                                "pitch [deg]", -90.0, 90.0, valinit=cams[0]["pitch"])
+        self._sl_roll = Slider(self.plt.axes([0.48, 0.20, 0.20, 0.025]),
+                               "roll [deg]", -180.0, 180.0, valinit=cams[0]["roll"])
+        self._sl_yaw.on_changed(self._on_yaw)
+        self._sl_pitch.on_changed(self._on_pitch)
+        self._sl_roll.on_changed(self._on_roll)
+
+        # 列 4：选相机（编辑对象）+ 勾选渲染
+        self._radio_labels = [f"cam {c['cid']}" for c in cams]
+        self._radio = RadioButtons(self.plt.axes([0.72, 0.26, 0.26, 0.15]),
+                                   self._radio_labels, active=0)
+        self._radio.on_clicked(self._on_radio)
         self._check_labels = [f"cam {cam['cid']} ({_CAM_COLOR_NAMES[cam['cid'] % 4]})"
                               for cam in cams]
-        self._check = CheckButtons(self.plt.axes([0.80, 0.06, 0.17, 0.20]),
+        self._check = CheckButtons(self.plt.axes([0.72, 0.04, 0.26, 0.20]),
                                    self._check_labels, [True] * len(cams))
         self._check.on_clicked(self._on_check)
 
-        self._btn_reset = Button(self.plt.axes([0.10, 0.02, 0.14, 0.04]), "Reset")
-        self._btn_reset.on_clicked(self._on_reset)
+        # 分节标题
+        self.fig.text(0.02, 0.385, "LENS", fontsize=9, color="#888")
+        self.fig.text(0.25, 0.385, "MOVE (selected cam) [m]", fontsize=9, color="#888")
+        self.fig.text(0.48, 0.385, "ROTATE (selected cam) [deg]", fontsize=9, color="#888")
+        self.fig.text(0.72, 0.385, "EDIT / SHOW", fontsize=9, color="#888")
 
         self._title = self.fig.suptitle("", fontsize=11)
         self._sync_title()
+        self._update()          # 初始绘制相机本体 + 覆盖锥 + 适配视图
 
-    # ---- 回调 -------------------------------------------------------
+    # ---- 焦距 / FOV 回调 --------------------------------------------
     def _on_focal(self, v: float) -> None:
         if self._syncing:
             return
@@ -360,6 +414,56 @@ class FovViewer:
         self._sync_sliders()
         self._update()
 
+    # ---- 相机位姿回调 ------------------------------------------------
+    def _on_cx(self, v: float) -> None:
+        if self._syncing_pose:
+            return
+        self.cams[self._edit_idx]["C"][0] = v
+        self._update()
+
+    def _on_cy(self, v: float) -> None:
+        if self._syncing_pose:
+            return
+        self.cams[self._edit_idx]["C"][1] = v
+        self._update()
+
+    def _on_cz(self, v: float) -> None:
+        if self._syncing_pose:
+            return
+        self.cams[self._edit_idx]["C"][2] = v
+        self._update()
+
+    def _on_yaw(self, v: float) -> None:
+        if self._syncing_pose:
+            return
+        cam = self.cams[self._edit_idx]
+        cam["yaw"] = v
+        cam["Rw"] = ypr_to_rot(cam["yaw"], cam["pitch"], cam["roll"])
+        self._update()
+
+    def _on_pitch(self, v: float) -> None:
+        if self._syncing_pose:
+            return
+        cam = self.cams[self._edit_idx]
+        cam["pitch"] = v
+        cam["Rw"] = ypr_to_rot(cam["yaw"], cam["pitch"], cam["roll"])
+        self._update()
+
+    def _on_roll(self, v: float) -> None:
+        if self._syncing_pose:
+            return
+        cam = self.cams[self._edit_idx]
+        cam["roll"] = v
+        cam["Rw"] = ypr_to_rot(cam["yaw"], cam["pitch"], cam["roll"])
+        self._update()
+
+    def _on_radio(self, label: str) -> None:
+        idx = self._radio_labels.index(label)
+        if idx == self._edit_idx:
+            return
+        self._edit_idx = idx
+        self._sync_pose_sliders()
+
     def _on_check(self, label: str) -> None:
         i = self._check_labels.index(label)
         self.enabled[i] = not self.enabled[i]
@@ -367,9 +471,15 @@ class FovViewer:
 
     def _on_reset(self, event=None) -> None:
         self.fx, self.fy = self._base_fx, self._base_fy
+        for cam in self.cams:
+            cam["C"][:] = cam["C0"]
+            cam["yaw"], cam["pitch"], cam["roll"] = cam["yaw0"], cam["pitch0"], cam["roll0"]
+            cam["Rw"] = cam["Rw0"].copy()
         self._sync_sliders()
+        self._sync_pose_sliders()
         self._update()
 
+    # ---- 同步 / 重绘 -------------------------------------------------
     def _sync_sliders(self) -> None:
         """把当前 fx/fy 反推的 f/FOV 写回三个滑动条（带重入保护）。"""
         fov_h, fov_v, f_mm = fov_from_fx_fy(self.fx, self.fy, self.W, self.H)
@@ -382,32 +492,46 @@ class FovViewer:
             self._syncing = False
         self._sync_title()
 
+    def _sync_pose_sliders(self) -> None:
+        """把选中相机的位姿写回 6 个位姿滑动条（带重入保护）。"""
+        cam = self.cams[self._edit_idx]
+        self._syncing_pose = True
+        try:
+            self._sl_cx.set_val(cam["C"][0])
+            self._sl_cy.set_val(cam["C"][1])
+            self._sl_cz.set_val(cam["C"][2])
+            self._sl_yaw.set_val(cam["yaw"])
+            self._sl_pitch.set_val(cam["pitch"])
+            self._sl_roll.set_val(cam["roll"])
+        finally:
+            self._syncing_pose = False
+
     def _sync_title(self) -> None:
         fov_h, fov_v, f_mm = fov_from_fx_fy(self.fx, self.fy, self.W, self.H)
+        cid = self.cams[self._edit_idx]["cid"]
         self._title.set_text(
-            f"f = {f_mm:.2f} mm   FOV_h = {fov_h:.1f} deg   FOV_v = {fov_v:.1f} deg")
+            f"f = {f_mm:.2f} mm   FOV_h = {fov_h:.1f} deg   FOV_v = {fov_v:.1f} deg"
+            f"   |   editing cam {cid}")
 
     def _update(self) -> None:
-        """重建覆盖锥 + 相机本体显隐。"""
-        for arts in self._cone_arts.values():
+        """重建相机本体 + 覆盖锥（两者都随位姿/焦距变化），并适配视图。"""
+        for arts in self._dyn_arts:
             for a in arts:
                 a.remove()
-        self._cone_arts = {}
+        self._dyn_arts = []
         for cam in self.cams:
-            cid = cam["cid"]
-            on = self.enabled[cid]
-            marker, axes = self._cam_bodies[cid]
-            marker.set_visible(on)
-            for a in axes:
-                a.set_visible(on)
-            if on:
-                self._cone_arts[cid] = draw_cone(self.ax, cam, self.fx, self.fy)
+            if not self.enabled[cam["cid"]]:
+                continue
+            marker, axes = draw_camera_body(self.ax, cam)
+            cone = draw_cone(self.ax, cam, self.fx, self.fy)
+            self._dyn_arts.append([marker] + axes + cone)
         fit_view(self.ax, self.cams, self.table, self.enabled, self.fx, self.fy)
         self.fig.canvas.draw_idle()
 
     def run(self) -> None:
-        print("[视场角] 鼠标：左拖=旋转 / 右拖=缩放 / 中拖=平移。"
-              "底部滑动条改焦距/FOV，勾选框选要渲染的相机。")
+        print("[视场角] 鼠标：左拖=旋转 / 右拖=缩放 / 中拖=平移。")
+        print("        左列滑动条改焦距/FOV；右侧单选「EDIT」选要移动/转动的相机，")
+        print("        中间两列 X/Y/Z + yaw/pitch/roll 移动/转动它；SHOW 勾选渲染。")
         self.plt.show()
 
 
