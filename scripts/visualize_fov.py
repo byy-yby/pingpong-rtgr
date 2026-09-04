@@ -76,6 +76,8 @@ _FRUSTUM_DEPTH_MIN_M = 2.5
 _FRUSTUM_DEPTH_MAX_M = 6.0
 # 覆盖锥半透明填充透明度
 _FILL_ALPHA = 0.10
+# 视图自动适配时，足迹点相对球桌中心的最大水平距离（米）——超广角足迹裁到此，避免视图爆炸
+_MAX_FIT_R = 10.0
 
 _AXIS_COLORS = ["#ff3b3b", "#2ecc40", "#3b6bff"]   # 坐标架 X/Y/Z
 
@@ -230,19 +232,48 @@ def _draw_axes(ax, origin: np.ndarray, Rw: np.ndarray, size: float) -> List:
     return lines
 
 
-def setup_view(ax, cams, table: Table3D) -> None:
-    """按相机 + 球桌范围设坐标轴限与等比例，取一个舒服的斜俯视视角。"""
-    xs = [c["C"][0] for c in cams] + [0.0, table.width]
-    ys = [c["C"][1] for c in cams] + [0.0, table.length]
-    zs = [c["C"][2] for c in cams] + [0.0, -table.height]
-    m = 1.4
-    xlim = (min(xs) - m, max(xs) + m)
-    ylim = (min(ys) - m, max(ys) + m)
-    zlim = (min(zs) - 0.4, max(zs) + 0.6)
-    ax.set_xlim(xlim); ax.set_ylim(ylim); ax.set_zlim(zlim)
-    ax.set_box_aspect((xlim[1] - xlim[0], ylim[1] - ylim[0], zlim[1] - zlim[0]))
+def setup_view(ax, table: Table3D) -> None:
+    """设坐标轴标签与默认斜俯视视角（限值由 :func:`fit_view` 按覆盖范围动态设）。"""
     ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]"); ax.set_zlabel("Z [m]")
     ax.view_init(elev=22.0, azim=-58.0)
+
+
+def fit_view(ax, cams, table: Table3D, enabled: List[bool], fx: float, fy: float) -> None:
+    """按相机 + 球桌 + 当前足迹范围自动适配坐标轴限与等比例。
+
+    足迹随 FOV 变化（焦距越小足迹越大），所以每次 FOV 变化都重算一次限值，保证覆盖
+    范围始终完整显示；超广角足迹水平方向裁到 ``_MAX_FIT_R``、竖直裁到合理区间，避免
+    视图被极远点撑爆。
+    """
+    center2 = np.array([table.width / 2.0, table.length / 2.0])
+    pts: List[List[float]] = []
+    for cam in cams:
+        pts.append([cam["C"][0], cam["C"][1], cam["C"][2]])
+    for cam in cams:
+        if not enabled[cam["cid"]]:
+            continue
+        _, corners = cone_corners(cam, fx, fy)
+        for p in corners:
+            dx, dy = p[0] - center2[0], p[1] - center2[1]
+            r = math.hypot(dx, dy)
+            if r > _MAX_FIT_R:
+                dx *= _MAX_FIT_R / r
+                dy *= _MAX_FIT_R / r
+                p = [center2[0] + dx, center2[1] + dy, p[2]]
+            pz = min(max(p[2], -table.height - 0.5), 4.5)
+            pts.append([p[0], p[1], pz])
+    for c in table.top_corners:
+        pts.append([c[0], c[1], c[2]])
+    pts.append([0.0, 0.0, -table.height])
+    pts.append([table.width, table.length, -table.height])
+    a = np.asarray(pts, np.float64)
+    lo, hi = a.min(axis=0), a.max(axis=0)
+    span = max(hi[0] - lo[0], hi[1] - lo[1], 1.0)
+    m = 0.12 * span
+    ax.set_xlim(lo[0] - m, hi[0] + m)
+    ax.set_ylim(lo[1] - m, hi[1] + m)
+    ax.set_zlim(lo[2] - 0.3, hi[2] + 0.6)
+    ax.set_box_aspect((hi[0] - lo[0] + 2 * m, hi[1] - lo[1] + 2 * m, hi[2] - lo[2] + 0.9))
 
 
 # =========================================================================
@@ -273,7 +304,8 @@ class FovViewer:
         # 静态层：球桌 + 相机本体（位置点 + 坐标架）
         draw_table(self.ax, table)
         self._cam_bodies = {cam["cid"]: draw_camera_body(self.ax, cam) for cam in cams}
-        setup_view(self.ax, cams, table)
+        setup_view(self.ax, table)
+        fit_view(self.ax, cams, table, self.enabled, self.fx, self.fy)
 
         # 初始覆盖锥
         for cam in cams:
@@ -370,6 +402,7 @@ class FovViewer:
                 a.set_visible(on)
             if on:
                 self._cone_arts[cid] = draw_cone(self.ax, cam, self.fx, self.fy)
+        fit_view(self.ax, self.cams, self.table, self.enabled, self.fx, self.fy)
         self.fig.canvas.draw_idle()
 
     def run(self) -> None:
@@ -392,7 +425,8 @@ def render_offscreen(cams, table, base_fx, base_fy, W, H, out_path: str,
     for cam in cams:
         draw_camera_body(ax, cam)
         draw_cone(ax, cam, base_fx, base_fy)
-    setup_view(ax, cams, table)
+    setup_view(ax, table)
+    fit_view(ax, cams, table, [True] * len(cams), base_fx, base_fy)
     fig.savefig(out_path, dpi=100)
     plt.close(fig)
     return out_path
