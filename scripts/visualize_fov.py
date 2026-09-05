@@ -267,12 +267,12 @@ def draw_environment(ax, table: Table3D) -> None:
     ax.add_collection3d(Poly3DCollection(
         [[[gx0, gy0, -H], [gx1, gy0, -H], [gx1, gy1, -H], [gx0, gy1, -H]]],
         alpha=0.25, facecolor="#26262e", edgecolor="none"))
-    # 两面墙（X=xw 竖直面，Y 方向与地面同范围）
+    # 两面墙（X=xw 竖直面，Y 方向与地面同范围；白色，区别于彩色虚线投影）
     y0, y1 = _GROUND_Y
     for xw in wall_xs(table):
         ax.add_collection3d(Poly3DCollection(
             [[[xw, y0, -H], [xw, y1, -H], [xw, y1, _WALL_HEIGHT], [xw, y0, _WALL_HEIGHT]]],
-            alpha=0.25, facecolor="#3a3a48", edgecolor="none"))
+            alpha=0.85, facecolor="#ffffff", edgecolor="#b0b0b8", linewidths=0.6))
 
 
 def draw_camera_body(ax, cam: dict):
@@ -282,6 +282,12 @@ def draw_camera_body(ax, cam: dict):
                         depthshade=False, edgecolors="k", linewidths=0.5)
     axes = _draw_axes(ax, C, Rw, 0.28)
     return marker, axes
+
+
+def _darken(hex_color: str, factor: float = 0.55) -> str:
+    """把 ``#rrggbb`` 颜色压暗到 ``factor`` 倍（虚线投影用，避免和实线/白墙混淆）。"""
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return f"#{int(r * factor):02x}{int(g * factor):02x}{int(b * factor):02x}"
 
 
 def draw_cone(ax, cam: dict, fx: float, fy: float, table: Table3D) -> List:
@@ -306,18 +312,19 @@ def draw_cone(ax, cam: dict, fx: float, fy: float, table: Table3D) -> List:
         ln, = ax.plot([P_tables[i, 0], P_tables[j, 0]], [P_tables[i, 1], P_tables[j, 1]],
                       [P_tables[i, 2], P_tables[j, 2]], color=color, linewidth=1.1)
         arts.append(ln)
-    # 3) 虚线延长线：P_table -> P_term（投到地面/墙）
+    # 3) 虚线延长线：P_table -> P_term（投到地面/墙；暗色加粗）
+    dark = _darken(color)
     for i in range(4):
         ln, = ax.plot([P_tables[i, 0], P_terms[i, 0]], [P_tables[i, 1], P_terms[i, 1]],
-                      [P_tables[i, 2], P_terms[i, 2]], color=color, linewidth=0.9,
+                      [P_tables[i, 2], P_terms[i, 2]], color=dark, linewidth=2.0,
                       linestyle="--")
         arts.append(ln)
-    # 4) 落点边界（地面/墙上的覆盖范围，点线）
+    # 4) 落点边界（地面/墙上的覆盖范围，虚线）
     for i in range(4):
         j = (i + 1) % 4
         ln, = ax.plot([P_terms[i, 0], P_terms[j, 0]], [P_terms[i, 1], P_terms[j, 1]],
-                      [P_terms[i, 2], P_terms[j, 2]], color=color, linewidth=0.9,
-                      linestyle=":")
+                      [P_terms[i, 2], P_terms[j, 2]], color=dark, linewidth=2.0,
+                      linestyle="--")
         arts.append(ln)
     # 5) 半透明锥体（桌面足迹 + 侧面）
     faces = [
@@ -638,6 +645,8 @@ class FovViewer:
             self._apply_zoom()
 
     def _on_zoom(self, v: float) -> None:
+        if self._syncing:
+            return
         self._zoom = v
         self._apply_zoom()
 
@@ -658,9 +667,36 @@ class FovViewer:
         self.fig.canvas.draw_idle()
 
     def _setup_mouse(self) -> None:
+        # 禁用 mplot3d 内置平移/缩放（会和自定义 handler 冲突），只留左键旋转；
+        # 自定义：滚轮缩放 + 中键平移。
+        self.ax.mouse_init(rotate_btn=1, pan_btn=[], zoom_btn=[])
+        self.fig.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.fig.canvas.mpl_connect("button_press_event", self._on_press)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
+
+    def _on_scroll(self, event) -> None:
+        """滚轮缩放：相对当前视图（保留平移），并同步 zoom 滑动条显示。"""
+        if event.inaxes is not self.ax:
+            return
+        factor = 0.85 if event.button == "up" else 1.18
+        self._zoom = float(np.clip(self._zoom * factor, 0.3, 5.0))
+        self._syncing = True
+        try:
+            self._sl_zoom.set_val(self._zoom)
+        finally:
+            self._syncing = False
+        self._scale_current(factor)
+
+    def _scale_current(self, factor: float) -> None:
+        def sc(lim):
+            c = 0.5 * (lim[0] + lim[1])
+            h = 0.5 * (lim[1] - lim[0]) * factor
+            return (c - h, c + h)
+        self.ax.set_xlim(*sc(self.ax.get_xlim()))
+        self.ax.set_ylim(*sc(self.ax.get_ylim()))
+        self.ax.set_zlim(*sc(self.ax.get_zlim()))
+        self.fig.canvas.draw_idle()
 
     def _on_press(self, event) -> None:
         if event.button == 2 and event.inaxes is self.ax:
