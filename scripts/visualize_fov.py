@@ -79,6 +79,11 @@ _FRUSTUM_DEPTH_MAX_M = 6.0
 _FILL_ALPHA = 0.10
 # 视图自动适配时，足迹点相对球桌中心的最大水平距离（米）——超广角足迹裁到此，避免视图爆炸
 _MAX_FIT_R = 10.0
+# 环境：长边两侧各 _WALL_DIST 米的两面墙（承接相机投影）+ 地面
+_WALL_DIST = 1.25          # 墙离长边（X 方向）的距离（米）
+_WALL_HEIGHT = 3.0         # 墙高（米，从桌面 z=0 起）
+_GROUND_X = (-3.5, 5.0)    # 地面 X 范围
+_GROUND_Y = (-3.5, 6.5)    # 地面 Y 范围（墙沿 Y 方向同此范围）
 
 _AXIS_COLORS = ["#ff3b3b", "#2ecc40", "#3b6bff"]   # 坐标架 X/Y/Z
 
@@ -168,6 +173,47 @@ def ray_ends(cam: dict, dirs: np.ndarray) -> np.ndarray:
     return ends
 
 
+def wall_xs(table: Table3D) -> List[float]:
+    """长边两侧两面墙的 X 坐标。"""
+    return [-_WALL_DIST, table.width + _WALL_DIST]
+
+
+def ray_hit(cam: dict, d: np.ndarray, table: Table3D) -> Tuple[np.ndarray, np.ndarray]:
+    """单射线：返回 ``(P_table, P_term)``。
+
+    ``P_table`` 是射线与桌面平面 z=0 的交点（打不到则兜底远平面点）；``P_term`` 是
+    射线继续延伸后最终落到的地方——地面 z=-H 或某面墙 X=xw（谁先到）。
+    """
+    C = cam["C"]
+    H = table.height
+    dz = d[2]
+    if dz < -1e-9:
+        s0 = -C[2] / dz
+        P_table = C + s0 * d if s0 > 0 else C + cam["depth"] * d
+    else:
+        P_table = C + cam["depth"] * d
+    # 地面 z = -H
+    s_ground = -(C[2] + H) / dz if dz < -1e-9 else None
+    # 墙（射线朝 X 方向偏时命中一侧）
+    s_wall = None
+    for xw in wall_xs(table):
+        if abs(d[0]) < 1e-9:
+            continue
+        s = (xw - C[0]) / d[0]
+        if s <= 0:
+            continue
+        z_hit = C[2] + s * d[2]
+        if -H - 0.1 <= z_hit <= _WALL_HEIGHT:
+            if s_wall is None or s < s_wall:
+                s_wall = s
+    cands = [s for s in (s_ground, s_wall) if s is not None]
+    if cands:
+        P_term = C + min(cands) * d
+    else:
+        P_term = P_table
+    return P_table, P_term
+
+
 def cone_corners(cam: dict, fx: float, fy: float) -> Tuple[np.ndarray, np.ndarray]:
     """光心 C 与 4 个足迹角点 corners(4,3)（世界系）。"""
     C = cam["C"]
@@ -212,6 +258,23 @@ def draw_table(ax, table: Table3D) -> None:
     _draw_axes(ax, np.zeros(3), np.eye(3), 0.25)
 
 
+def draw_environment(ax, table: Table3D) -> None:
+    """地面平面 + 长边两侧两面墙（半透明，承接相机投影）。"""
+    H = table.height
+    # 地面（z=-H）
+    gx0, gx1 = _GROUND_X
+    gy0, gy1 = _GROUND_Y
+    ax.add_collection3d(Poly3DCollection(
+        [[[gx0, gy0, -H], [gx1, gy0, -H], [gx1, gy1, -H], [gx0, gy1, -H]]],
+        alpha=0.25, facecolor="#26262e", edgecolor="none"))
+    # 两面墙（X=xw 竖直面，Y 方向与地面同范围）
+    y0, y1 = _GROUND_Y
+    for xw in wall_xs(table):
+        ax.add_collection3d(Poly3DCollection(
+            [[[xw, y0, -H], [xw, y1, -H], [xw, y1, _WALL_HEIGHT], [xw, y0, _WALL_HEIGHT]]],
+            alpha=0.25, facecolor="#3a3a48", edgecolor="none"))
+
+
 def draw_camera_body(ax, cam: dict):
     """相机位置点 + 朝向短坐标架。返回 ``(marker, [axis_line...])`` 供显隐。"""
     C, Rw, color = cam["C"], cam["Rw"], cam["color"]
@@ -221,26 +284,48 @@ def draw_camera_body(ax, cam: dict):
     return marker, axes
 
 
-def draw_cone(ax, cam: dict, fx: float, fy: float) -> List:
-    """单相机覆盖锥：4 条角射线 + 4 条足迹边（线）+ 锥体/足迹半透明填充。"""
-    C, corners = cone_corners(cam, fx, fy)
+def draw_cone(ax, cam: dict, fx: float, fy: float, table: Table3D) -> List:
+    """单相机覆盖锥：实线角射线到桌面足迹 + 半透明锥体 + 虚线延长线到地面/墙 + 落点边界。"""
+    C = cam["C"]
+    dirs = corner_dirs(cam, fx, fy)
     color = cam["color"]
     arts: List = []
+    # 每条角射线：桌面交点 P_table + 最终落点 P_term（地面/墙）
+    P_tables = np.empty((4, 3), np.float64)
+    P_terms = np.empty((4, 3), np.float64)
+    for i, d in enumerate(dirs):
+        P_tables[i], P_terms[i] = ray_hit(cam, d, table)
+    # 1) 实线角射线：C -> P_table
     for i in range(4):
-        ln, = ax.plot([C[0], corners[i, 0]], [C[1], corners[i, 1]],
-                      [C[2], corners[i, 2]], color=color, linewidth=1.1)
+        ln, = ax.plot([C[0], P_tables[i, 0]], [C[1], P_tables[i, 1]],
+                      [C[2], P_tables[i, 2]], color=color, linewidth=1.1)
         arts.append(ln)
+    # 2) 桌面足迹边（实线）
     for i in range(4):
         j = (i + 1) % 4
-        ln, = ax.plot([corners[i, 0], corners[j, 0]], [corners[i, 1], corners[j, 1]],
-                      [corners[i, 2], corners[j, 2]], color=color, linewidth=1.1)
+        ln, = ax.plot([P_tables[i, 0], P_tables[j, 0]], [P_tables[i, 1], P_tables[j, 1]],
+                      [P_tables[i, 2], P_tables[j, 2]], color=color, linewidth=1.1)
         arts.append(ln)
+    # 3) 虚线延长线：P_table -> P_term（投到地面/墙）
+    for i in range(4):
+        ln, = ax.plot([P_tables[i, 0], P_terms[i, 0]], [P_tables[i, 1], P_terms[i, 1]],
+                      [P_tables[i, 2], P_terms[i, 2]], color=color, linewidth=0.9,
+                      linestyle="--")
+        arts.append(ln)
+    # 4) 落点边界（地面/墙上的覆盖范围，点线）
+    for i in range(4):
+        j = (i + 1) % 4
+        ln, = ax.plot([P_terms[i, 0], P_terms[j, 0]], [P_terms[i, 1], P_terms[j, 1]],
+                      [P_terms[i, 2], P_terms[j, 2]], color=color, linewidth=0.9,
+                      linestyle=":")
+        arts.append(ln)
+    # 5) 半透明锥体（桌面足迹 + 侧面）
     faces = [
-        [C.tolist(), corners[0].tolist(), corners[1].tolist()],
-        [C.tolist(), corners[1].tolist(), corners[2].tolist()],
-        [C.tolist(), corners[2].tolist(), corners[3].tolist()],
-        [C.tolist(), corners[3].tolist(), corners[0].tolist()],
-        [corners[0].tolist(), corners[1].tolist(), corners[2].tolist(), corners[3].tolist()],
+        [C.tolist(), P_tables[0].tolist(), P_tables[1].tolist()],
+        [C.tolist(), P_tables[1].tolist(), P_tables[2].tolist()],
+        [C.tolist(), P_tables[2].tolist(), P_tables[3].tolist()],
+        [C.tolist(), P_tables[3].tolist(), P_tables[0].tolist()],
+        [P_tables[0].tolist(), P_tables[1].tolist(), P_tables[2].tolist(), P_tables[3].tolist()],
     ]
     poly = Poly3DCollection(faces, alpha=_FILL_ALPHA, facecolor=color, edgecolor="none")
     ax.add_collection3d(poly)
@@ -293,6 +378,13 @@ def fit_view(ax, cams, table: Table3D, enabled: List[bool], fx: float, fy: float
         pts.append([c[0], c[1], c[2]])
     pts.append([0.0, 0.0, -table.height])
     pts.append([table.width, table.length, -table.height])
+    # 环境：地面范围 + 两面墙四角（保证墙/地面始终在视图内）
+    for xw in wall_xs(table):
+        for y in _GROUND_Y:
+            pts.append([xw, y, -table.height])
+            pts.append([xw, y, _WALL_HEIGHT])
+    pts.append([_GROUND_X[0], _GROUND_Y[0], -table.height])
+    pts.append([_GROUND_X[1], _GROUND_Y[1], -table.height])
     a = np.asarray(pts, np.float64)
     lo, hi = a.min(axis=0), a.max(axis=0)
     span = max(hi[0] - lo[0], hi[1] - lo[1], 1.0)
@@ -326,10 +418,14 @@ class FovViewer:
         self._syncing = False                    # 焦距/FOV 滑动条重入保护
         self._syncing_pose = False               # 位姿滑动条重入保护
         self._dyn_arts: List[List] = []          # 动态图层（相机本体 + 覆盖锥）
+        self._zoom = 1.0                          # 手动缩放因子
+        self._base_lims = None                    # fit_view 得到的基准限值（缩放前）
+        self._pan = None                          # 中键平移状态 (x0,y0,(xlim,ylim,zlim))
 
         self.fig = plt.figure(figsize=(13.5, 10))
         self.ax = self.fig.add_subplot(111, projection="3d")
         draw_table(self.ax, table)
+        draw_environment(self.ax, table)
         setup_view(self.ax, table)
 
         fov_h, fov_v, f_mm = fov_from_fx_fy(base_fx, base_fy, W, H)
@@ -343,10 +439,13 @@ class FovViewer:
                                 "FOV horiz [deg]", 5.0, 150.0, valinit=fov_h)
         self._sl_fov_v = Slider(self.plt.axes([0.02, 0.20, 0.20, 0.025]),
                                 "FOV vert [deg]", 5.0, 150.0, valinit=fov_v)
-        self._btn_reset = Button(self.plt.axes([0.02, 0.12, 0.20, 0.035]), "Reset")
+        self._sl_zoom = Slider(self.plt.axes([0.02, 0.13, 0.20, 0.025]),
+                               "zoom", 0.3, 5.0, valinit=1.0)
+        self._btn_reset = Button(self.plt.axes([0.02, 0.06, 0.20, 0.035]), "Reset")
         self._sl_focal.on_changed(self._on_focal)
         self._sl_fov_h.on_changed(self._on_fov_h)
         self._sl_fov_v.on_changed(self._on_fov_v)
+        self._sl_zoom.on_changed(self._on_zoom)
         self._btn_reset.on_clicked(self._on_reset)
 
         # 列 2：选中相机的位置（世界系，米）
@@ -383,13 +482,15 @@ class FovViewer:
         self._check.on_clicked(self._on_check)
 
         # 分节标题
-        self.fig.text(0.02, 0.385, "LENS", fontsize=9, color="#888")
-        self.fig.text(0.25, 0.385, "MOVE (selected cam) [m]", fontsize=9, color="#888")
-        self.fig.text(0.48, 0.385, "ROTATE (selected cam) [deg]", fontsize=9, color="#888")
-        self.fig.text(0.72, 0.385, "EDIT / SHOW", fontsize=9, color="#888")
+        self.fig.text(0.02, 0.385, "LENS", fontsize=12, color="#888")
+        self.fig.text(0.25, 0.385, "MOVE (selected cam) [m]", fontsize=12, color="#888")
+        self.fig.text(0.48, 0.385, "ROTATE (selected cam) [deg]", fontsize=12, color="#888")
+        self.fig.text(0.72, 0.385, "EDIT / SHOW", fontsize=12, color="#888")
 
-        self._title = self.fig.suptitle("", fontsize=11)
+        self._title = self.fig.suptitle("", fontsize=14)
         self._sync_title()
+        self._style_widgets()
+        self._setup_mouse()
         self._update()          # 初始绘制相机本体 + 覆盖锥 + 适配视图
 
     # ---- 焦距 / FOV 回调 --------------------------------------------
@@ -523,14 +624,86 @@ class FovViewer:
             if not self.enabled[cam["cid"]]:
                 continue
             marker, axes = draw_camera_body(self.ax, cam)
-            cone = draw_cone(self.ax, cam, self.fx, self.fy)
+            cone = draw_cone(self.ax, cam, self.fx, self.fy, self.table)
             self._dyn_arts.append([marker] + axes + cone)
-        fit_view(self.ax, self.cams, self.table, self.enabled, self.fx, self.fy)
+        self._fit_view()
         self.fig.canvas.draw_idle()
 
+    # ---- 视图缩放 / 平移 ---------------------------------------------
+    def _fit_view(self) -> None:
+        """自动适配视图，记录基准限值，并按当前缩放因子套用。"""
+        fit_view(self.ax, self.cams, self.table, self.enabled, self.fx, self.fy)
+        self._base_lims = (self.ax.get_xlim(), self.ax.get_ylim(), self.ax.get_zlim())
+        if self._zoom != 1.0:
+            self._apply_zoom()
+
+    def _on_zoom(self, v: float) -> None:
+        self._zoom = v
+        self._apply_zoom()
+
+    def _apply_zoom(self) -> None:
+        if self._base_lims is None:
+            return
+        xl, yl, zl = self._base_lims
+        f = self._zoom
+
+        def scale(lim):
+            c = 0.5 * (lim[0] + lim[1])
+            h = 0.5 * (lim[1] - lim[0]) / f
+            return (c - h, c + h)
+
+        self.ax.set_xlim(*scale(xl))
+        self.ax.set_ylim(*scale(yl))
+        self.ax.set_zlim(*scale(zl))
+        self.fig.canvas.draw_idle()
+
+    def _setup_mouse(self) -> None:
+        self.fig.canvas.mpl_connect("button_press_event", self._on_press)
+        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
+
+    def _on_press(self, event) -> None:
+        if event.button == 2 and event.inaxes is self.ax:
+            self._pan = (event.x, event.y,
+                         (self.ax.get_xlim(), self.ax.get_ylim(), self.ax.get_zlim()))
+
+    def _on_release(self, event) -> None:
+        if event.button == 2:
+            self._pan = None
+
+    def _on_motion(self, event) -> None:
+        if self._pan is None or event.inaxes is not self.ax:
+            return
+        x0, y0, lims = self._pan
+        dx = event.x - x0
+        dy = event.y - y0
+        xl, yl, zl = lims
+        figw, figh = self.fig.get_size_inches() * self.fig.dpi
+        sx = (xl[1] - xl[0]) / figw
+        sy = (yl[1] - yl[0]) / figh
+        sz = (zl[1] - zl[0]) / figh
+        self.ax.set_xlim(xl[0] - dx * sx, xl[1] - dx * sx)
+        self.ax.set_ylim(yl[0] - dy * sy, yl[1] - dy * sy)
+        self.ax.set_zlim(zl[0] - dy * sz, zl[1] - dy * sz)
+        self.fig.canvas.draw_idle()
+
+    def _style_widgets(self) -> None:
+        """统一放大 UI 文字。"""
+        sliders = (self._sl_focal, self._sl_fov_h, self._sl_fov_v, self._sl_zoom,
+                   self._sl_cx, self._sl_cy, self._sl_cz,
+                   self._sl_yaw, self._sl_pitch, self._sl_roll)
+        for sl in sliders:
+            sl.label.set_size(12)
+            sl.valtext.set_size(11)
+        for lb in self._check.labels:
+            lb.set_size(12)
+        for lb in self._radio.labels:
+            lb.set_size(12)
+        self._btn_reset.label.set_size(12)
+
     def run(self) -> None:
-        print("[视场角] 鼠标：左拖=旋转 / 右拖=缩放 / 中拖=平移。")
-        print("        左列滑动条改焦距/FOV；右侧单选「EDIT」选要移动/转动的相机，")
+        print("[视场角] 鼠标：左拖=旋转 / 滚轮=缩放 / 中拖=平移（或左列 zoom 滑动条缩放）。")
+        print("        左列改焦距/FOV/zoom；右侧单选「EDIT」选要移动/转动的相机，")
         print("        中间两列 X/Y/Z + yaw/pitch/roll 移动/转动它；SHOW 勾选渲染。")
         self.plt.show()
 
@@ -546,9 +719,10 @@ def render_offscreen(cams, table, base_fx, base_fy, W, H, out_path: str,
     fig = plt.figure(figsize=(width / 100.0, height / 100.0), dpi=100)
     ax = fig.add_subplot(111, projection="3d")
     draw_table(ax, table)
+    draw_environment(ax, table)
     for cam in cams:
         draw_camera_body(ax, cam)
-        draw_cone(ax, cam, base_fx, base_fy)
+        draw_cone(ax, cam, base_fx, base_fy, table)
     setup_view(ax, table)
     fit_view(ax, cams, table, [True] * len(cams), base_fx, base_fy)
     fig.savefig(out_path, dpi=100)
