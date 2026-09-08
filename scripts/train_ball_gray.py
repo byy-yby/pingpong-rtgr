@@ -42,6 +42,46 @@ def _write_gray_yaml(root: str) -> str:
     return yaml_path
 
 
+def _build_split(root: str, val_ratio: float = 0.1, seed: int = 0) -> None:
+    """生成 train.txt / val.txt（9:1 切分，与 train_ball.py::build_dataset 一致）。
+
+    augment_ball.py 只产出 images/ + labels/，不写切分文件；训练前必须先生成，
+    否则 ultralytics check_det_dataset 报 "images not found, missing path .../val.txt"。
+    """
+    import numpy as np
+
+    img_dir = os.path.join(root, "images")
+    lbl_dir = os.path.join(root, "labels")
+    os.makedirs(lbl_dir, exist_ok=True)
+
+    names = sorted(f for f in os.listdir(img_dir) if f.lower().endswith((".png", ".jpg", ".bmp")))
+    if not names:
+        raise SystemExit(f"[错误] {img_dir} 里没有图片，先跑 augment_ball.py 生成增强集。")
+
+    # 缺标签的图片补空标签（当背景负样本）
+    for name in names:
+        lbl = os.path.join(lbl_dir, os.path.splitext(name)[0] + ".txt")
+        if not os.path.exists(lbl):
+            open(lbl, "w").close()
+
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(names))
+    n_val = max(1, int(len(names) * val_ratio))
+    val_idx = set(order[:n_val].tolist())
+
+    with open(os.path.join(root, "train.txt"), "w") as f:
+        f.write("\n".join(os.path.join(img_dir, n) for i, n in enumerate(names) if i not in val_idx) + "\n")
+    with open(os.path.join(root, "val.txt"), "w") as f:
+        f.write("\n".join(os.path.join(img_dir, n) for i, n in enumerate(names) if i in val_idx) + "\n")
+
+    n_pos = sum(
+        1 for name in names
+        if os.path.getsize(os.path.join(lbl_dir, os.path.splitext(name)[0] + ".txt")) > 0
+    )
+    print(f"数据集：{len(names)} 张（{n_pos} 有球 / {len(names) - n_pos} 背景负样本），"
+          f"train {len(names) - n_val} / val {n_val}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="微调 yolo11n-grayscale 单类 ball")
     ap.add_argument("--out", default=None, help="数据集根目录（默认 data/ball_dataset_aug）")
@@ -65,6 +105,7 @@ def main() -> None:
         raise SystemExit("[错误] 未安装 ultralytics/torch。")
 
     root = args.out or os.path.join(project_root(), "data", "ball_dataset_aug")
+    _build_split(root)
     yaml_path = _write_gray_yaml(root)
 
     model = YOLO(args.model)
