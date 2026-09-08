@@ -22,9 +22,11 @@
   warm     = EmFit 热启动 ftol 5e-4 / maxiters 40（约 x1.8，误差≈官方）
   stream   = EmFit 热启动 ftol 1.5e-3 / maxiters 25（约 x2.3，误差略优于官方）
 
-多人识别：``--person-groups "[[0,2],[1,3]]"`` 每个组=一个人（组内相机拍同一个人，
-组下标=身份，仿 live_control 按 P 的 match_people_fixed）。单人用 ``--person-groups
-"[[1,3]]"``（只放拍人的那组相机）。``--det-conf`` 人检测阈值（默认 0.2）、
+多人识别：换广角镜头后每相机可能同时框到近/远两人，身份不再由相机分组下标决定，
+改为全局几何匹配（match_people）后按 3D 质心在球桌长边(Y)的位置分侧定身份（调
+``--partition-y`` / ``--anchor-max-reproj``）。``--person-groups`` 仍须给出「每个人的
+home 相机」（组数=人数，组内相机作该人的拟合投影视角 view_ids）。单人用
+``--person-groups "[[1,3]]"``（只放拍人的那组相机）。``--det-conf`` 人检测阈值（默认 0.2）、
 ``--fit-conf`` 拟合关键点阈值（默认 0.15）——黑衣服/低亮度人关键点置信度偏低，
 阈值太高会把 2D 已检出的关节在 3D 拟合里丢掉，致其退化成均值模型。
 
@@ -155,7 +157,11 @@ def build_args():
     ap.add_argument("--vposer-ckpt", default=None,
                     help="VPoser checkpoint 路径（默认 VPOSER_CKPT 环境变量或 easymocap.DEFAULT_VPOSER_CKPT）")
     ap.add_argument("--person-groups", default="[[0,2],[1,3]]",
-                    help="相机分组 JSON：每个组=一个人，组内相机拍同一个人（仿 live_control P）")
+                    help="相机分组 JSON：组数=人数，每个组的相机作该人的拟合投影视角（身份改由世界系长边分侧决定）")
+    ap.add_argument("--partition-y", type=float, default=1.37,
+                    help="分侧定身份的球桌长边(Y)阈值（米）：质心 Y<阈值→身份0，否则身份1")
+    ap.add_argument("--anchor-max-reproj", type=float, default=30.0,
+                    help="match_people 锚点匹配重投影门限（px）")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
     ap.add_argument("--root", default=None,
                     help="项目根（读 data/calibration 与 data/extrinsics，默认自动探测）")
@@ -185,7 +191,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     ``smpl_from_keypoints3d2d``（nFrames=T），激活 smooth_body/smooth_poses/smooth_Rh
     时间平滑；单视角关节由相邻帧约束 + 模型先验补全。
     """
-    from tabletennis.reconstruction.associate import match_people_fixed
+    from tabletennis.reconstruction.associate import AssociationConfig, match_people_by_side
     from tabletennis.reconstruction.obs2d import pose_to_dict, save_pose2d
     from tabletennis.reconstruction.triangulate import MultiViewTriangulator
 
@@ -225,11 +231,18 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             pose2d_by_frame[str(k)] = {
                 str(cid): [pose_to_dict(p) for p in pl] for cid, pl in poses_per_cam.items()
             }
-        for g, group in enumerate(person_groups):
-            matched = match_people_fixed(poses_per_cam, triangulator, groups=[group])
-            obs = matched[0] if matched else {}
-            frames_obs_by_pid[g].append(obs)
-            if obs:
+        matched = match_people_by_side(
+            poses_per_cam, triangulator,
+            cfg=AssociationConfig(anchor_max_reproj_px=args.anchor_max_reproj),
+            partition_threshold=args.partition_y,
+        )
+        obs_by_pid = {g: {} for g in range(n_people)}
+        for side, obs in matched:
+            if side < n_people:
+                obs_by_pid[side] = obs
+        for g in range(n_people):
+            frames_obs_by_pid[g].append(obs_by_pid[g])
+            if obs_by_pid[g]:
                 n_seen_by_pid[g] += 1
     det_wall = time.time() - t0
     stats = []

@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..core.types import Pose2D
+from .pose_track import centroid
 from .triangulate import (
     DEFAULT_MAX_REPROJ_PX,
     DEFAULT_MIN_CONF,
@@ -307,3 +308,52 @@ def _pick_in_group(
         if r is not None and r[2] < best_e:
             best, best_e = d, r[2]
     return best
+
+
+# 世界系长轴分侧定身份的默认参数（与 pose_track.PoseTracker 分区约定一致：
+# 球桌长边 Y=2.74m，中点 1.37；身份 0=Y<阈值 一侧，身份 1=Y≥阈值 一侧）。
+PARTITION_AXIS = 1
+PARTITION_THRESHOLD = 1.37
+
+
+def match_people_by_side(
+    poses_per_cam: Dict[int, List[Pose2D]],
+    triangulator: MultiViewTriangulator,
+    cfg: Optional[AssociationConfig] = None,
+    partition_axis: int = PARTITION_AXIS,
+    partition_threshold: float = PARTITION_THRESHOLD,
+    min_conf: float = DEFAULT_MIN_CONF,
+) -> List[Tuple[int, Dict[int, Pose2D]]]:
+    """跨视角几何匹配 + 世界系长轴分侧定身份。
+
+    与 :func:`match_people_fixed` 的关键区别：身份不绑定相机分组，而是由每个匹配到的
+    人的 3D 质心在球桌世界系某轴（默认长边 Y）上的位置决定——两人分居球桌两端，该轴
+    天然分离，身份绝对稳定、不随时间漂移。换广角镜头后一相机同时框到近/远两人时，
+    两人仍各自成一组、各自拿到稳定身份（这是 fixed 固定分组做不到的）。
+
+    流程：:func:`match_people` 用极线/重投影一致 + 并查集把跨相机检测聚成若干「人」
+    （近/远的人自然分成两个连通分量，每人可被 2~4 台相机看到）→ 三角化该人姿态取
+    3D 质心 → 按质心在 ``partition_axis`` 轴上的坐标与 ``partition_threshold`` 比较
+    分侧（``side=0`` / ``side=1``）→ 按 side 升序返回（顺序即身份）。
+
+    Args:
+        poses_per_cam: ``{cam_id: [Pose2D, ...]}`` 各相机本帧检测到的人。
+        triangulator: 用于锚点匹配与质心三角化。
+        cfg: 匹配参数（``AssociationConfig``），None 用默认。
+        partition_axis: 分侧用的世界系坐标轴（0=X 短边, 1=Y 长边, 2=Z）。
+        partition_threshold: 分侧阈值（米），质心该轴坐标 < 阈值 → side=0，否则 side=1。
+        min_conf: 质心三角化时的关键点置信度下限。
+
+    Returns:
+        ``[(side, obs), ...]``，按 ``side`` 升序；``obs`` 为该身份跨相机观测
+        ``{cam_id: Pose2D}``（≥ ``min_views`` 视角）。无匹配返回空列表。
+    """
+    people = match_people(poses_per_cam, triangulator, cfg)
+    out: List[Tuple[int, Dict[int, Pose2D]]] = []
+    for obs in people:
+        skel = triangulator.triangulate_pose(obs, min_conf=min_conf)
+        c = centroid(skel)
+        side = 0 if (c is not None and float(c[partition_axis]) < partition_threshold) else 1
+        out.append((side, obs))
+    out.sort(key=lambda t: t[0])   # 身份 0 在前，顺序即 ID
+    return out
