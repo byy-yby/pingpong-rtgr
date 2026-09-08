@@ -18,10 +18,10 @@ import numpy as np
 
 from ..core.types import Skeleton3D
 
-__all__ = ["PoseTracker", "centroid"]
+__all__ = ["PoseTracker"]
 
 
-def centroid(skel: Skeleton3D) -> Optional[np.ndarray]:
+def _centroid(skel: Skeleton3D) -> Optional[np.ndarray]:
     """骨架 3D 质心：有效关节的均值（世界系，米）。无有效关节返回 None。"""
     kp = np.asarray(skel.keypoints, dtype=np.float64)
     valid = np.isfinite(kp).all(axis=1)
@@ -69,7 +69,7 @@ class PoseTracker:
         thr = self.partition_threshold
         key = []
         for s in skeletons:
-            c = centroid(s)
+            c = _centroid(s)
             if c is None:
                 key.append((1, 1))  # 无质心排最后
             else:
@@ -81,7 +81,7 @@ class PoseTracker:
     def _track_update(self, skeletons: List[Skeleton3D]) -> List[Skeleton3D]:
         """时序最近邻：贪心关联到最近的 track，保持 ID 跨帧稳定。"""
         n = len(skeletons)
-        centroids = [centroid(s) for s in skeletons]
+        centroids = [_centroid(s) for s in skeletons]
         used = [False] * n
         assign = [-1] * n
 

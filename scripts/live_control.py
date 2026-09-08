@@ -160,11 +160,11 @@ def camera_kwargs_from_config(config: dict) -> dict:
 class LiveControl:
     """交互式控制：单窗口，视频在上、自绘滑块在中、提示在下。"""
 
-    # 身份定界：换广角镜头后每相机可能同时框到近/远两人，不再用固定相机分组
-    # （cam0/cam2 看一边、cam1/cam3 看另一边）。改为全局几何匹配后按 3D 质心在
-    # 球桌世界系长边 Y 的位置分侧定身份：Y < _PARTITION_Y → 身份0，否则身份1。
-    _PARTITION_Y = 1.37          # 球桌长边 2.74m 的中点
-    _ANCHOR_MAX_REPROJ = 30.0    # match_people 锚点匹配重投影门限（px）
+    # 固定相机分组（姿态重建）：cam0/cam2 看球桌一边的人、cam1/cam3 看另一边的人。
+    # 组顺序即身份 ID（0/1）；换机位/换边时改这里。换广角镜头后每相机可能同时框到
+    # 近/远两人，匹配前用 keep_nearest_person 每相机只留最近（bbox 最大）的那一个，
+    # 把远处/对面的人排除，恢复「每组相机各看一人」的前提。
+    PERSON_GROUPS = [[0, 2], [1, 3]]
     def __init__(self, mgr: CameraManager, *, exposure_us, gain_db, gamma, trigger_mode,
                  max_width, imu_name=None, imu_mac=None, imu_rate=100.0):
         self.mgr = mgr
@@ -907,8 +907,8 @@ class LiveControl:
         print("[检测] 姿态: OFF")
 
     def _reconstruct_frame(self) -> None:
-        """批处理检测所有相机 + 全局几何匹配 + 世界系长边分侧定身份 + 三角化，更新 Open3D 骨架与 2D 姿态。"""
-        from tabletennis.reconstruction import AssociationConfig, match_people_by_side
+        """批处理检测所有相机 + 排除远处人 + 固定分组匹配 + 三角化，更新 Open3D 骨架与 2D 姿态。"""
+        from tabletennis.reconstruction import keep_nearest_person, match_people_fixed
 
         t0 = time.perf_counter()
         detector = self.detectors["pose"]
@@ -926,19 +926,17 @@ class LiveControl:
             poses_list = [detector.detect(f) for f in frames]
         t_detect = time.perf_counter() - t_det0
         poses_per_cam = dict(zip(cids, poses_list))
+        # 排除远处/对面的人：每相机只留 bbox 最大（最近）的那一个，让固定分组匹配稳定
+        poses_per_cam = keep_nearest_person(poses_per_cam)
         self._last_poses = poses_per_cam
 
         t_recon = 0.0
         if self._triangulator is not None:
             t_r0 = time.perf_counter()
-            # 宽视野：每相机可能同时框到近/远两人，不做固定相机分组；全局几何匹配
-            # （match_people）+ 世界系长边 Y 分侧定身份（side=身份），身份不随帧漂移。
-            people = match_people_by_side(
-                poses_per_cam, self._triangulator,
-                cfg=AssociationConfig(anchor_max_reproj_px=self._ANCHOR_MAX_REPROJ),
-                partition_threshold=self._PARTITION_Y,
-            )
-            skeletons = [self._triangulator.triangulate_pose(obs) for _side, obs in people]
+            # 固定分组：cam0/cam2 看一边、cam1/cam3 看另一边，组顺序即身份，无需跨组匹配
+            people = match_people_fixed(poses_per_cam, self._triangulator,
+                                        groups=self.PERSON_GROUPS)
+            skeletons = [self._triangulator.triangulate_pose(obs) for obs in people]
             if self.viewer3d is not None:
                 self.viewer3d.set_skeletons(skeletons)
                 # IMU 球拍绑到右手腕（=IMU 位置）：选离桌面原点最近的右手腕，逐帧跟手

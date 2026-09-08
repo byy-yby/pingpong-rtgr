@@ -5,12 +5,10 @@
 """
 from .associate import (
     DEFAULT_PERSON_GROUPS,
-    PARTITION_AXIS,
-    PARTITION_THRESHOLD,
     AssociationConfig,
     anchor_2d,
+    keep_nearest_person,
     match_people,
-    match_people_by_side,
     match_people_fixed,
 )
 from .ball import triangulate_ball, undistort_ball_center
@@ -29,12 +27,10 @@ __all__ = [
     "undistort_keypoints",
     "AssociationConfig",
     "anchor_2d",
+    "keep_nearest_person",
     "match_people",
-    "match_people_by_side",
     "match_people_fixed",
     "DEFAULT_PERSON_GROUPS",
-    "PARTITION_AXIS",
-    "PARTITION_THRESHOLD",
     "triangulate_ball",
     "undistort_ball_center",
     "BallTracker",

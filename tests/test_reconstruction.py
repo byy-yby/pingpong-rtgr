@@ -9,8 +9,8 @@ from tabletennis.core.types import (
 from tabletennis.reconstruction import (
     AssociationConfig,
     MultiViewTriangulator,
+    keep_nearest_person,
     match_people,
-    match_people_by_side,
     match_people_fixed,
     undistort_keypoints,
 )
@@ -272,42 +272,22 @@ def test_association_config_from_dict():
     assert cfg.min_views == 3
 
 
-def test_match_people_by_side_wide_fov():
-    """宽视野：4 台相机都同时看到近/远两人，应按世界系长边(Y)分侧定身份。"""
-    intrinsics, extrinsics = make_parallel_rig(
-        cam_centers=[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0],
-                     [1.0, 0.0, 0.0], [1.5, 0.0, 0.0]]
-    )
-    tri = MultiViewTriangulator(intrinsics, extrinsics)
-    # 两人 Y 分居阈值 1.37 两侧（0.5 vs 2.0），每台相机都看到两人（近 + 远）
-    A = np.array([0.3, 0.5, 2.0])
-    B = np.array([0.3, 2.0, 2.0])
-    poses_per_cam = {
-        cid: [make_pose3(cid, A, intrinsics, extrinsics),
-              make_pose3(cid, B, intrinsics, extrinsics)]
-        for cid in (0, 1, 2, 3)
-    }
-    people = match_people_by_side(poses_per_cam, tri, partition_threshold=1.37)
-    assert len(people) == 2
-    sides = [side for side, _ in people]
-    assert sides == [0, 1]
-    for side, obs in people:
-        assert set(obs.keys()) == {0, 1, 2, 3}   # 每人都被 4 台相机看到
-        skel = tri.triangulate_pose(obs)
-        valid = np.isfinite(skel.keypoints).all(axis=1)
-        cy = skel.keypoints[valid].mean(axis=0)[1]
-        assert (cy < 1.37) == (side == 0)
+def test_keep_nearest_person_drops_far():
+    """每相机同时框到近/远两人时，只保留 bbox 最大（最近）的那个，排除远处人。"""
+    big = Pose2D(camera_id=0, keypoints=np.zeros((3, 3), np.float32),
+                 bbox=np.array([100.0, 100.0, 500.0, 800.0], np.float32))
+    small = Pose2D(camera_id=0, keypoints=np.zeros((3, 3), np.float32),
+                   bbox=np.array([300.0, 300.0, 380.0, 420.0], np.float32))
+    poses_per_cam = {0: [small, big], 1: [big], 2: []}
+    out = keep_nearest_person(poses_per_cam)
+    assert out == {0: [big], 1: [big]}
 
 
-def test_match_people_by_side_single_person():
-    """只有一侧有人（Y 大）时，身份应保留为 side=1 而非回落到 0。"""
-    intrinsics, extrinsics = make_parallel_rig(
-        cam_centers=[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]]
-    )
-    tri = MultiViewTriangulator(intrinsics, extrinsics)
-    B = np.array([0.3, 2.0, 2.0])   # Y=2.0 ≥ 阈值 → 应为身份 1
-    poses_per_cam = {cid: [make_pose3(cid, B, intrinsics, extrinsics)] for cid in (0, 1)}
-    people = match_people_by_side(poses_per_cam, tri, partition_threshold=1.37)
-    assert len(people) == 1
-    assert people[0][0] == 1
-    assert set(people[0][1].keys()) == {0, 1}
+def test_keep_nearest_person_keypoint_fallback():
+    """bbox 缺失时回退到关键点包络面积，仍能区分近/远。"""
+    near = Pose2D(camera_id=0, keypoints=np.array(
+        [[0, 0, 1], [200, 400, 1], [0, 400, 1]], np.float32))
+    far = Pose2D(camera_id=0, keypoints=np.array(
+        [[0, 0, 1], [40, 80, 1], [0, 80, 1]], np.float32))
+    out = keep_nearest_person({0: [far, near]})
+    assert out == {0: [near]}
