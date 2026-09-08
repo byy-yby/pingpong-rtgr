@@ -10,6 +10,7 @@ from tabletennis.reconstruction import (
     AssociationConfig,
     MultiViewTriangulator,
     match_people,
+    match_people_by_side,
     match_people_fixed,
     undistort_keypoints,
 )
@@ -269,3 +270,44 @@ def test_association_config_from_dict():
     cfg = AssociationConfig.from_dict({"anchor_max_reproj_px": 20.0, "min_views": 3})
     assert cfg.anchor_max_reproj_px == 20.0
     assert cfg.min_views == 3
+
+
+def test_match_people_by_side_wide_fov():
+    """宽视野：4 台相机都同时看到近/远两人，应按世界系长边(Y)分侧定身份。"""
+    intrinsics, extrinsics = make_parallel_rig(
+        cam_centers=[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0],
+                     [1.0, 0.0, 0.0], [1.5, 0.0, 0.0]]
+    )
+    tri = MultiViewTriangulator(intrinsics, extrinsics)
+    # 两人 Y 分居阈值 1.37 两侧（0.5 vs 2.0），每台相机都看到两人（近 + 远）
+    A = np.array([0.3, 0.5, 2.0])
+    B = np.array([0.3, 2.0, 2.0])
+    poses_per_cam = {
+        cid: [make_pose3(cid, A, intrinsics, extrinsics),
+              make_pose3(cid, B, intrinsics, extrinsics)]
+        for cid in (0, 1, 2, 3)
+    }
+    people = match_people_by_side(poses_per_cam, tri, partition_threshold=1.37)
+    assert len(people) == 2
+    sides = [side for side, _ in people]
+    assert sides == [0, 1]
+    for side, obs in people:
+        assert set(obs.keys()) == {0, 1, 2, 3}   # 每人都被 4 台相机看到
+        skel = tri.triangulate_pose(obs)
+        valid = np.isfinite(skel.keypoints).all(axis=1)
+        cy = skel.keypoints[valid].mean(axis=0)[1]
+        assert (cy < 1.37) == (side == 0)
+
+
+def test_match_people_by_side_single_person():
+    """只有一侧有人（Y 大）时，身份应保留为 side=1 而非回落到 0。"""
+    intrinsics, extrinsics = make_parallel_rig(
+        cam_centers=[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]]
+    )
+    tri = MultiViewTriangulator(intrinsics, extrinsics)
+    B = np.array([0.3, 2.0, 2.0])   # Y=2.0 ≥ 阈值 → 应为身份 1
+    poses_per_cam = {cid: [make_pose3(cid, B, intrinsics, extrinsics)] for cid in (0, 1)}
+    people = match_people_by_side(poses_per_cam, tri, partition_threshold=1.37)
+    assert len(people) == 1
+    assert people[0][0] == 1
+    assert set(people[0][1].keys()) == {0, 1}
