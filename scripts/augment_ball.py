@@ -66,15 +66,15 @@ def geometric(img: np.ndarray, box: Optional[Tuple[float, float, float, float]],
     elif op == 1:  # 垂直翻转
         img = cv2.flip(img, 0)
         if b: b = (b[0], 1 - b[1], b[2], b[3])
-    elif op == 2:  # 平移 ±8%
-        tx = float(rng.uniform(-0.08, 0.08) * W)
-        ty = float(rng.uniform(-0.08, 0.08) * H)
+    elif op == 2:  # 平移 ±20%
+        tx = float(rng.uniform(-0.20, 0.20) * W)
+        ty = float(rng.uniform(-0.20, 0.20) * H)
         M = np.float32([[1, 0, tx], [0, 1, ty]])
         img = cv2.warpAffine(img, M, (W, H), borderMode=cv2.BORDER_REPLICATE)
         if b:
             b = (b[0] + tx / W, b[1] + ty / H, b[2], b[3])
-    elif op == 3:  # 缩放 0.85~1.2（绕图像中心）
-        s = float(rng.uniform(0.85, 1.2))
+    elif op == 3:  # 缩放 0.7~1.4（绕图像中心）
+        s = float(rng.uniform(0.7, 1.4))
         M = cv2.getRotationMatrix2D((W / 2, H / 2), 0, s)
         img = cv2.warpAffine(img, M, (W, H), borderMode=cv2.BORDER_REPLICATE)
         if b:
@@ -82,8 +82,8 @@ def geometric(img: np.ndarray, box: Optional[Tuple[float, float, float, float]],
             cx = (cx - 0.5) * s + 0.5
             cy = (cy - 0.5) * s + 0.5
             b = (cx, cy, w * s, h * s)
-    else:  # 旋转 ±12°
-        ang = float(rng.uniform(-12, 12))
+    else:  # 旋转 ±30°
+        ang = float(rng.uniform(-30, 30))
         M = cv2.getRotationMatrix2D((W / 2, H / 2), ang, 1.0)
         img = cv2.warpAffine(img, M, (W, H), borderMode=cv2.BORDER_REPLICATE)
         if b:
@@ -107,22 +107,23 @@ def geometric(img: np.ndarray, box: Optional[Tuple[float, float, float, float]],
 
 
 def photometric(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """随机光度变换（不改 bbox）。球只有 12~24px，增强必须保守：
-    过强的模糊/伽马/噪声会把小球抹掉，产生「框在但球消失」的坏样本。"""
+    """随机光度变换（不改 bbox）。幅度已加大（亮度±45 / 对比度0.6~1.45 /
+    伽马0.6~1.5 / 噪声σ6~14 / 模糊σ0.5~1.2）以加强域适应；球只有 12~24px，
+    极端模糊/伽马/噪声仍可能把小球抹掉产生坏样本，训练后若 mAP 掉需回退模糊/伽马上限。"""
     op = int(rng.integers(0, 5))
     img = img.astype(np.float32)
 
-    if op == 0:  # 亮度 ±20（整体平移，球保持对比）
-        img += float(rng.uniform(-20, 20))
-    elif op == 1:  # 对比度 0.85~1.15（温和）
-        img = (img - 128.0) * float(rng.uniform(0.85, 1.15)) + 128.0
-    elif op == 2:  # 伽马 0.9~1.1（温和，避免暗帧抹掉球）
-        g = float(rng.uniform(0.9, 1.1))
+    if op == 0:  # 亮度 ±45（整体平移，球保持对比）
+        img += float(rng.uniform(-45, 45))
+    elif op == 1:  # 对比度 0.6~1.45（剧烈）
+        img = (img - 128.0) * float(rng.uniform(0.6, 1.45)) + 128.0
+    elif op == 2:  # 伽马 0.6~1.5（剧烈，暗帧更强）
+        g = float(rng.uniform(0.6, 1.5))
         img = np.clip(img / 255.0, 0, 1) ** g * 255.0
-    elif op == 3:  # 高斯噪声 σ=3~6
-        img += rng.normal(0, float(rng.uniform(3, 6)), img.shape)
-    else:  # 高斯模糊 σ=0.4~0.8（球径 12px 以上才扛得住，σ≤0.8）
-        img = cv2.GaussianBlur(img, (0, 0), float(rng.uniform(0.4, 0.8)))
+    elif op == 3:  # 高斯噪声 σ=6~14
+        img += rng.normal(0, float(rng.uniform(6, 14)), img.shape)
+    else:  # 高斯模糊 σ=0.5~1.2（球径 12px 以上才扛得住，σ≤1.2）
+        img = cv2.GaussianBlur(img, (0, 0), float(rng.uniform(0.5, 1.2)))
 
     return np.clip(img, 0, 255).astype(np.uint8)
 
