@@ -128,6 +128,49 @@ def create_board(cfg: CharucoConfig):
     return board
 
 
+_DETECTOR_CORNER_REFINE = {
+    "none": cv2.aruco.CORNER_REFINE_NONE,
+    "subpix": cv2.aruco.CORNER_REFINE_SUBPIX,
+    "contour": cv2.aruco.CORNER_REFINE_CONTOUR,
+}
+
+
+def make_detector_parameters(detector_cfg: Optional[dict] = None):
+    """构建 ArUco 检测参数，默认按短焦/广角镜头放宽。
+
+    OpenCV 默认 ``minMarkerPerimeterRate=0.03``（标记周长须 >= 图像最短边的 3%），
+    换短焦镜头后同一块板在画面里变小、标记常被该阈值**静默丢弃**，表现为「这台
+    相机识别不到板」而非报错。这里默认放宽到 0.01 并开启亚像素角点精化，使小标记
+    也能被检出（外参标定是离线操作，检测只在按 Enter 时跑一次，放宽不会拖慢预览）。
+
+    Args:
+        detector_cfg: ``config/extrinsics.yaml`` 里 ``detector`` 段的 dict，可选。
+
+    Returns:
+        ``cv2.aruco.DetectorParameters``。
+    """
+    d = detector_cfg or {}
+    p = cv2.aruco.DetectorParameters()
+    p.minMarkerPerimeterRate = float(d.get("min_marker_perimeter_rate", 0.01))
+    p.maxMarkerPerimeterRate = float(d.get("max_marker_perimeter_rate", 4.0))
+    p.adaptiveThreshWinSizeMin = int(d.get("adaptive_thresh_win_min", 3))
+    p.adaptiveThreshWinSizeMax = int(d.get("adaptive_thresh_win_max", 23))
+    p.minCornerDistanceRate = float(d.get("min_corner_distance_rate", 0.05))
+    refine = str(d.get("corner_refinement", "subpix")).lower()
+    p.cornerRefinementMethod = _DETECTOR_CORNER_REFINE.get(
+        refine, cv2.aruco.CORNER_REFINE_SUBPIX
+    )
+    p.cornerRefinementWinSize = int(d.get("corner_refinement_win_size", 5))
+    return p
+
+
+def create_charuco_detector(board, detector_cfg: Optional[dict] = None):
+    """创建 CharucoDetector 并套用放宽的检测参数（见 :func:`make_detector_parameters`）。"""
+    detector = cv2.aruco.CharucoDetector(board)
+    detector.setDetectorParameters(make_detector_parameters(detector_cfg))
+    return detector
+
+
 def detect_charuco(
     gray: np.ndarray, detector, min_corners: int = 0
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:

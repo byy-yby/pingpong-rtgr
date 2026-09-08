@@ -50,10 +50,11 @@ import cv2
 import numpy as np
 
 from tabletennis.calibration.extrinsics import (
-    CharucoConfig, compute_relative_extrinsics, create_board, detect_charuco,
-    draw_charuco_overlay, estimate_board_pose, generate_board_image,
-    generate_marker_image, load_extrinsics, localize_table_bundle,
-    reprojection_error, resolve_dictionary, save_extrinsics,
+    CharucoConfig, compute_relative_extrinsics, create_board,
+    create_charuco_detector, detect_charuco, draw_charuco_overlay,
+    estimate_board_pose, generate_board_image, generate_marker_image,
+    load_extrinsics, localize_table_bundle, reprojection_error,
+    resolve_dictionary, save_extrinsics,
 )
 from tabletennis.calibration.intrinsics import load_intrinsics
 from tabletennis.camera import CameraManager
@@ -602,7 +603,7 @@ def main() -> None:
         sys.exit(0)
 
     board = create_board(cfg)
-    detector = cv2.aruco.CharucoDetector(board)
+    detector = create_charuco_detector(board, cal_cfg.get("detector") or {})
 
     out_dir = os.path.join(root, cal_cfg.get("output_dir", "data/extrinsics"))
     intr_dir = os.path.join(root, cal_cfg.get("intrinsics_dir", "data/calibration"))

@@ -9,7 +9,7 @@ refine 失败（conf<0.3）时回退为「原框中心 + 正方形（边长=原 
 
 用法：
   python scripts/normalize_ball_boxes.py                 # 处理 data/ball_dataset 前 N 张
-  python scripts/normalize_ball_boxes.py --root data/ball_dataset --limit 3000
+  python scripts/normalize_ball_boxes.py --root data/ball_dataset --limit 6000
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def write_yolo(path: str, box: Optional[tuple], W: int, H: int) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="统一手绘标注框（精修球心+正方形）")
     ap.add_argument("--root", default=None, help="数据集根目录（默认 data/ball_dataset）")
-    ap.add_argument("--limit", type=int, default=3000, help="只处理排序前 N 张（默认 3000）")
+    ap.add_argument("--limit", type=int, default=6000, help="只处理排序前 N 张（默认 6000）")
     ap.add_argument("--dry-run", action="store_true", help="只统计不改写")
     args = ap.parse_args()
 

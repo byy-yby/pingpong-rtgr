@@ -11,6 +11,20 @@ charuco:
   legacy_pattern: false     # 打印板若由 OpenCV <4.6 生成，偶数行布局有差异，改 true
   min_corners: 10           # 判定「检测成功」的最少 ChArUco 角点数
 
+# ---- ChArUco 检测参数（短焦/广角镜头下标记变小，默认已放宽）----
+# min_marker_perimeter_rate：标记最小周长率（相对图像最短边）。OpenCV 默认 0.03，
+#   短焦镜头下标记小会被静默丢弃（表现为「这台相机识别不到板」）；这里放宽到 0.01。
+#   若仍检测不到：先确认单个标记边长像素 >= ~10px（5x5 标记本身需要足够像素才能解码），
+#   再考虑继续调小本值，或改用更大的板 / 把板拿近多角度采集。
+detector:
+  min_marker_perimeter_rate: 0.001
+  max_marker_perimeter_rate: 4.0
+  adaptive_thresh_win_min: 3
+  adaptive_thresh_win_max: 23
+  min_corner_distance_rate: 0.05
+  corner_refinement: subpix      # none | subpix | contour（角点精化方式）
+  corner_refinement_win_size: 5
+
 # ---- 内参结果目录（读取 cam_N.yaml，须先跑 scripts/calibrate_intrinsics.py）----
 intrinsics_dir: data/calibration
 
