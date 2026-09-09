@@ -60,14 +60,23 @@ def _make_person(recon, pos=(1.0, 1.0)):
 def _observe(recon, rig, j25, sigma=0.5):
     from tabletennis.reconstruction.easymocap import HALPE26_TO_BODY25
     from tabletennis.core.types import Pose2D
+    import cv2
+
     intr, ext = rig
     cids = sorted(ext)
     best = {}
     for cid in cids:
         K = intr[cid].K
-        P = K @ np.hstack([ext[cid].R, ext[cid].t.reshape(3, 1)])
-        c = np.hstack([j25, np.ones((25, 1))]) @ P.T
-        p2d = c[:, :2] / c[:, 2:3]
+        # 必须按**真实畸变**投影：管线会对像素做去畸变（_pose_to_body25_view ->
+        # undistort_keypoints），若这里按针孔模型生成像素，去畸变就会把它们整体
+        # 挪开，重建相对 GT 出现系统性偏移（广角镜头 dist k1=-0.15/k2=+0.15 时约 80mm）。
+        rvec, _ = cv2.Rodrigues(np.asarray(ext[cid].R, dtype=np.float64))
+        p2d, _ = cv2.projectPoints(
+            np.asarray(j25, dtype=np.float64).reshape(-1, 1, 3),
+            rvec, np.asarray(ext[cid].t, dtype=np.float64).reshape(3, 1),
+            np.asarray(K, dtype=np.float64), np.asarray(intr[cid].dist, dtype=np.float64),
+        )
+        p2d = p2d.reshape(-1, 2)
         halpe = np.zeros((26, 3), np.float32)
         for hi, b25 in HALPE26_TO_BODY25:
             x, y = p2d[b25]
