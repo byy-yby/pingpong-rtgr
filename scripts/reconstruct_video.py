@@ -194,9 +194,14 @@ def build_args():
                     help="下半身门：下半身中位置信 < 该比例 × 同视角上半身中位（默认 0.5）")
     ap.add_argument("--lower-body-conf-abs", type=float, default=0.5,
                     help="下半身门：且下半身中位置信 < 该绝对值（默认 0.5）")
+    ap.add_argument("--mask-hips-when-unreliable", action="store_true",
+                    help="tracker：被判「下半身不可信」的视角**连髋（halpe26 11/12/19）也丢**，"
+                         "即该视角只用上半身。默认关闭——实测远端视角的髋残差 3.5cm（近端 "
+                         "5.5cm）、置信 0.84，比近端还准，丢掉它会削弱骨盆（拟合根）的约束；"
+                         "真正烂的是膝以下（踝 27cm、脚 42~49cm），已由下半身门覆盖")
     ap.add_argument("--upper-body-only", type=int, nargs="+", default=None,
                     metavar="PID",
-                    help="指定身份只用上半身重建（膝/踝/脚尖/脚跟的 2D 与 3D 数据全部丢弃，"
+                    help="指定身份只用上半身重建（下半身 + 髋的 2D 与 3D 数据全部丢弃，"
                          "腿部交给 SMPL 先验），如 --upper-body-only 0")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
     ap.add_argument("--root", default=None,
@@ -301,6 +306,7 @@ def _pass1_tracker(args, src, detector, triangulator, indices, cids_ok, n_people
         lower_body_gate=not args.no_lower_body_gate,
         lower_body_conf_ratio=args.lower_body_conf_ratio,
         lower_body_conf_abs=args.lower_body_conf_abs,
+        mask_hips_when_unreliable=args.mask_hips_when_unreliable,
     )
     # 卡尔曼 dt 用录制真实帧率（100fps 外部触发 → 0.01s；编码丢帧由 pulse 对齐吸收）
     try:
@@ -503,10 +509,10 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
                 print(f"  ⚠ --upper-body-only {g} 超出身份范围 0..{n_people - 1}，忽略")
                 continue
             frames_obs_by_pid[g] = [
-                {cid: mask_lower_body(p) for cid, p in obs.items()}
+                {cid: mask_lower_body(p, include_hips=True) for cid, p in obs.items()}
                 for obs in frames_obs_by_pid[g]
             ]
-            print(f"  p{g}：--upper-body-only → 全部视角的膝/踝/脚尖/脚跟都不参与重建")
+            print(f"  p{g}：--upper-body-only → 全部视角的下半身 + 髋都不参与重建")
     for g, group in enumerate(person_groups):
         if len(group) < 2:
             print(f"  ⚠ p{g} 组内相机数 {len(group)} < 2，跳过（无法三角化）")
@@ -535,9 +541,11 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
                     print(f"  p{g}：3D 关键点用阶段 D 鲁棒三角化覆盖"
                           f"（{n_ok_kp}/{len(kp3d_ov)} 帧有有效关节）")
                 if kp3d_ov is not None and g in upper_only:
-                    from tabletennis.reconstruction.easymocap import LOWER_BODY_BODY25
-                    kp3d_ov[:, list(LOWER_BODY_BODY25), :] = 0.0
-                    print(f"  p{g}：3D 下半身关节已按 --upper-body-only 清零")
+                    from tabletennis.reconstruction.easymocap import (
+                        HIP_BODY25, LOWER_BODY_BODY25,
+                    )
+                    kp3d_ov[:, list(LOWER_BODY_BODY25 + HIP_BODY25), :] = 0.0
+                    print(f"  p{g}：3D 下半身 + 髋关节已按 --upper-body-only 清零")
             results_by_pid[g] = recon.reconstruct_batch(
                 frames_obs_by_pid[g], intrinsics, extrinsics,
                 min_conf=args.fit_conf, view_ids=sorted(group),

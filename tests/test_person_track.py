@@ -29,6 +29,7 @@ from tabletennis.reconstruction.person_track import (  # noqa: E402
     TrackConfig,
     lower_body_unreliable,
     mask_lower_body,
+    HIP_HALPE26,
 )
 from tabletennis.reconstruction.triangulate import MultiViewTriangulator  # noqa: E402
 
@@ -463,6 +464,48 @@ def test_tracker_masks_lower_body_of_polluted_view():
             if cid != bad_cid:
                 assert not r.lower_body_masked.get(cid)
                 assert r.obs[cid].keypoints[13, 2] > 0.0, "好视角不该被掩码"
+
+
+def test_mask_lower_body_include_hips():
+    """include_hips=True → 连髋（11/12/19）一起丢，坐标仍不动。"""
+    p = _pose_with_conf(0.9, 0.3)
+    m = mask_lower_body(p, include_hips=True)
+    assert np.allclose(m.keypoints[:, :2], p.keypoints[:, :2])
+    for i in LOWER_BODY_HALPE26 + HIP_HALPE26:
+        assert m.keypoints[i, 2] == 0.0
+    assert m.keypoints[0, 2] == p.keypoints[0, 2] > 0, "上半身不该被动"
+    assert p.keypoints[11, 2] > 0, "原对象不该被就地修改"
+
+
+def test_tracker_masks_hips_when_unreliable():
+    """mask_hips_when_unreliable=True → 被判不可信的视角连髋也不参与重建。"""
+    world = World(n_frames=8, cams=(0, 1, 2, 3))
+    bad_cid = 1
+    orig = world.poses_for
+
+    def poses_for(cid, t, boxes):
+        out = orig(cid, t, boxes)
+        if cid != bad_cid:
+            return out
+        for p in out:
+            kp = np.array(p.keypoints, dtype=np.float64, copy=True)
+            for i in LOWER_BODY_HALPE26:
+                kp[i, 1] += 45.0
+                kp[i, 2] = 0.25
+            p.keypoints = kp.astype(np.float32)
+        return out
+
+    world.poses_for = poses_for
+    cfg = TrackConfig(full_detect_interval=1, dt=0.01, mask_hips_when_unreliable=True)
+    results, _ = run_tracker(world, cfg=cfg, n_frames=8)
+    for r in results[-1]:
+        assert r.lower_body_masked.get(bad_cid) is True
+        for i in HIP_HALPE26:
+            assert r.obs[bad_cid].keypoints[i, 2] == 0.0, "髋应被掩码"
+            assert r.raw_obs[bad_cid].keypoints[i, 2] > 0.0, "原始观测应保留"
+        for cid in r.obs:
+            if cid != bad_cid:
+                assert r.obs[cid].keypoints[11, 2] > 0.0, "好视角的髋不该被掩码"
 
 
 def test_tracker_lower_body_gate_can_be_disabled():

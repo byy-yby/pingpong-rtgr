@@ -112,8 +112,14 @@ bbox 高 128~168px），把关节投回该视角差 95~290px。该函数按「bb
 `LOWER_BODY_HALPE26` 的置信置 0 再进阶段 D；**髋 11/12/19 不掩码**（根关节靠它）。
 `TrackFrameResult.raw_obs` 保留原姿态供 2D 叠加、`lower_body_masked` 记命中视角。
 CLI `--no-lower-body-gate` / `--lower-body-conf-ratio` / `--lower-body-conf-abs`，
-`--upper-body-only PID...` 整段只用上身。实测 20260908_161147：**下身·好视角**重投影
-中位 p1 20.4→14.8px、p0 10.8→10.4px，上身不变（9.5→9.7 / 12.1→12.2）。
+`--upper-body-only PID...` 整段只用上身（含髋）。实测 20260908_161147：**下身·好视角**
+重投影中位 p1 20.4→14.8px、p0 10.8→10.4px，上身不变（9.5→9.7 / 12.1→12.2）。
+
+**「远端连髋也丢」`mask_hips_when_unreliable`（默认关）**：`mask_lower_body(pose,
+include_hips=True)` 连 `HIP_HALPE26=(11,12,19)` 一起置 0，即被判不可信的视角只留上半身。
+默认关是因为**远端髋实测比近端还准**（髋·远端 3.5cm/置信 0.84 vs 髋·近端 5.5cm/0.86），
+而髋是阶段 B/C 的根关节：A/B 实测追踪退化（`root_index==19` 232→192 帧、骨盆内点
+2.07→1.61、根跳变 max 12.07→28.32cm）。CLI `--mask-hips-when-unreliable`。
 
 ## EasyMocap（按 S）
 
