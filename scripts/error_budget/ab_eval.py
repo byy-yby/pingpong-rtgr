@@ -55,8 +55,9 @@ def main():
         m = json.load(open(meta_p, encoding='utf-8'))
         for i, g in enumerate(m.get('person_groups') or []):
             fit_views[i] = sorted(g)
-    intr, _ = load_camera_rig(None)
-    P = {c: intr[c].K @ np.hstack([intr[c].R, intr[c].t.reshape(3, 1)]) for c in intr}
+    intr, ext = load_camera_rig(None)
+    P = {c: intr[c].K @ np.hstack([ext[c].R, ext[c].t.reshape(3, 1)])
+         for c in ext if c in intr}
 
     def proj(cid, X):
         h = np.hstack([X, np.ones((len(X), 1))]) @ P[cid].T

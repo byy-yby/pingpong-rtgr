@@ -13,6 +13,8 @@
   离线 EasyMocap 重建（`reconstruction/video_source.py` 对齐 + `em_fit.py` 热启动流式拟合）。
 - **姿态 2D** `vision/pose/rtmpose_pose.py` —— RTMPose-l-halpe26（26 点），top-down。
   **人检测默认换 `yolo11n-gray`**（1ch 灰度原生），见「人检测」节。
+  离线 `reconstruct_video.py` 走 **ViTPose**（`vision/pose/vitpose_pose.py`，coco_25 25 点含脚
+  → 重排成 halpe26），默认 **`vitpose-h-coco_25`**；见「离线 2D 模型」节。
 - **球检测** `vision/ball/` —— 三条路线都实现：经典 CV、YOLO（yolov8n）、灰度 yolo11n（1ch）。
 - **球 3D 重建** `reconstruction/ball.py` + `scripts/reconstruct_ball.py` + live_control 按 b —— 三角化 + 红球渲染。
 - **姿态 2D→3D 重建** `reconstruction/triangulate.py`（置信度加权多视角 DLT，已向量化）+ `associate.py`（跨视角匹配）+ `person_track.py`（**阶段 A–D 多人跟踪/身份**，宽视野一相机多人，见「多人跟踪」节）。`pose_track.py::PoseTracker` 是旧的单相机时序身份跟踪，已被 person_track 取代。
@@ -66,6 +68,35 @@
 - 三处提速：① `conf_thresh` 0.35→**0.5**（对齐旧 YOLOX，0.35 太松致 RTMPose 裁剪数翻倍）；② RTMPose 预处理归一化 float64→**float32 就地算**（省 ~1ms）；③ 人检测 imgsz **640→416**（人够大，检测段 5.1→2.5ms）。
 - ONNX 在 `~/.cache/tabletennis/yolo11n_grayscale_person_416.onnx`（`scripts/export_yolo11_person.py` 从 `data/weights/gray/yolo11n-grayscale.pt` 导出，`fix_onnx_dynamic.py --ch 1` 修 h/w；gitignored 需重导）。`det="yolox-tiny"` 分支保留作回退。
 - 真实含人帧 `detect_batch`(4 相机) 优化后 ~10.0ms + 重建 1ms ≈ **~90fps**。
+
+### 离线 2D 模型 + 拟合置信度阈值（P0 落地，2026-09-10）
+
+**离线不追推理速度 → 默认换最强 2D 模型**。`scripts/reconstruct_video.py --pose-model`
+默认 **`vitpose-h-coco_25`**（`vision/pose/vitpose_pose.py`，coco_25 25 点含脚 → halpe26）。
+- 模型放 **`/mnt/newdisk1/vitpose/`**（新硬盘），项目内软链 `data/weights/vitpose`。
+  档位 b/s 单文件；**l = 1.23GB 单文件；h = 226KB 图 + 394 个外挂分片同目录（~2.55GB）**
+  ——分片靠相对路径解析，**别单独拷 .onnx**。`vitpose_pose.py::_download_h` 从
+  `JunkyByte/easy_ViTPose` 拉（走 HTTP 代理 `http://127.0.0.1:7897`；SOCKS 会让 hf_hub 崩）。
+- **跨模型公平 A/B**（`scripts/error_budget/ab_pose_model.py`，同一批 2D 点、除模型外参数全同，
+  两段视频）：h/l 比原默认 vitpose-b 重投影中位 **−0.77/−0.92px** 与 **−1.09px**，
+  收益集中在下身/脚（−1.4~−2.0px）；**h vs l 头对头**：一段打平（−0.03px）、
+  一段 h 好 0.79px。检测段耗时 161014：l 254.9s / h 323.5s（2015 帧）。
+- **根关节抖动（2D-free 指标，2 段合并）**：b→c50→l→h 的 p1 max = **14.79→7.68→3.69→3.86cm**，
+  p1 中位 0.32→0.28→0.25→0.22 —— **换模型对追踪稳定性的贡献比调 fit-conf 更大**。
+- 要速度用 `--pose-model vitpose-l-coco_25`（精度基本持平、快 ~2.8×）。
+
+**`--fit-conf` 默认 0.15 → 0.5**：低置信度（遮挡外推）关节不参与 SMPL 拟合。
+**必须用固定观测集评**——提高阈值会把低置信度关节从重投影误差的分母里剔除，裸看中位数
+是**假提升**（`ab_eval.py` 用同一批 (帧,人,视角,关节) 同时算 `--fit-conf 0.5` 与 `0` 两组）。
+8 配置 × 3 段视频（5462 帧）：c50 在 fit/outfit/conf>0 四个口径上**全部不劣**，
+根关节 p1 最坏跳变 **14.79→7.68cm（−48%）**。ViTPose conf 中位 0.87~0.90，0.5 不误杀。
+
+**多视角 3D 共识降权（`reconstruction/obs_filter.py`，默认关）**：Cauchy
+`w=1/(1+(r/σ)²)`，r = 2D 观测与阶段 D 鲁棒 3D 的重投影距离，> `--consensus-max` 直接丢。
+留出视角 −7% 但**有循环成分**（参考相机就是留出视角），拟合视角 +2%、p0 抖动 +0.04cm
+→ 净账不划算，默认 `--consensus-sigma 0`；要压最坏跳变用 `--consensus-sigma 10`
+（p1 max 7.7→4.0cm）。`--save-pass1/--load-pass1` 可缓存 Pass 1 观测秒级重跑拟合。
+权威数字见 `docs/error_budget_report.md` §6/§7。
 
 ### 三角化：已向量化
 
@@ -448,6 +479,8 @@ MvCamera.MV_CC_Finalize()
 - [x] 卡尔曼 dt 写死 0.01 假设 100FPS 致快速球误判冻结 → 用实际帧间隔，最终整体移除卡尔曼走逐帧纯 DLT。
 
 ### 视觉 / 姿态
+- [x] 离线 2D 模型默认换 **vitpose-h**（比 vitpose-b 重投影 −0.8~−0.9px、根关节最坏跳变 14.8→3.9cm）+ `--fit-conf` 0.5；共识降权实现但默认关——见「离线 2D 模型」节。
+- [ ] 在线 `live_control.py` 的姿态仍走 RTMPose-l + TRT（追实时，没跟离线一起换 ViTPose-h）；若要在线也升级需另测吞吐。
 - [x] 人检测 yolo11n 灰度（`det="yolo11n-gray"` 默认）+ 三处提速 + conf 0.5 + float32 归一化——见「人检测」节。
 - [x] RTMPose 预处理瓶颈是**归一化**（uint8→float64 占 3.35ms 的 60%），不是 warp（0.09ms）；float32 就地算省 ~1ms。
 - [ ] RTMPose `_trt_session` 加动态 batch profile(1/4/8) + 预热 batch 8（避免人数变化触发引擎重建）。

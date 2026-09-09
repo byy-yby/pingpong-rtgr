@@ -90,8 +90,9 @@ def main():
 
     A, B = a.a.rstrip('/'), a.b.rstrip('/')
     pa, pb = _load_poses(a.poses_a, A), _load_poses(a.poses_b, B)
-    intr, _ = load_camera_rig(None)
-    P = {c: intr[c].K @ np.hstack([intr[c].R, intr[c].t.reshape(3, 1)]) for c in intr}
+    intr, ext = load_camera_rig(None)
+    P = {c: intr[c].K @ np.hstack([ext[c].R, ext[c].t.reshape(3, 1)])
+         for c in ext if c in intr}
 
     # (部位, 模型) -> [逐观测像素误差]
     err = defaultdict(list)

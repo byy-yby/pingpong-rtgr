@@ -57,7 +57,9 @@ VITPOSE_URLS: Dict[str, str] = {
     "vitpose-l-coco_25": ("https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/"
                           "onnx/coco_25/vitpose-l-coco_25.onnx"),
 }
-DEFAULT_VITPOSE_MODEL = "vitpose-b-coco_25"
+# 离线重建默认取 ViTPose 最大档（不追推理速度；固定观测集 A/B 比 b 重投影 −0.8~−0.9px，
+# 根关节最坏跳变 14.8→3.9cm）。要速度用 vitpose-l-coco_25（精度基本持平、快 ~2.8×）。
+DEFAULT_VITPOSE_MODEL = "vitpose-h-coco_25"
 
 # 已知模型的权威文件大小（HF x-linked-size）。本地缓存文件若大小不匹配即视为
 # 下载被截断，删除重下——否则 onnxruntime 会拿坏文件报很绕的解析错。
@@ -82,8 +84,20 @@ _VP_STD = np.asarray((58.395, 57.12, 57.375), dtype=np.float32)
 
 
 def _default_vitpose_dir() -> str:
-    """权重目录（新盘 /mnt/newdisk1；VITPOSE_DIR 覆盖）。"""
-    return os.environ.get("VITPOSE_DIR") or "/mnt/newdisk1/vitpose"
+    """权重目录：``VITPOSE_DIR`` > 项目内软链 ``data/weights/vitpose`` > ``/mnt/newdisk1/vitpose``。
+
+    大权重放在 400G 新盘，项目里只留一个软链指过去（``ln -s /mnt/newdisk1/vitpose
+    data/weights/vitpose``），这样路径自解释、换机器也只需重建软链。
+    """
+    env = os.environ.get("VITPOSE_DIR")
+    if env:
+        return env
+    linked = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
+                          "data", "weights", "vitpose")
+    linked = os.path.abspath(linked)
+    if os.path.isdir(linked):
+        return linked
+    return "/mnt/newdisk1/vitpose"
 
 
 def resolve_vitpose_onnx(model: str) -> str:

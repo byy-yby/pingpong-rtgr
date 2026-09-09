@@ -35,9 +35,16 @@
             前提是每相机只拍到一个人。单人用 ``--person-groups "[[1,3]]"``。
 
 SMPL β 只用置信度最高的 ``--shape-top-k`` 帧估计（默认 5，0=官方原版用全部帧）。
+
+``--pose-model`` 默认 **vitpose-h-coco_25**（ViTPose 最大档，离线不追推理速度）。固定观测集
+A/B（2 段视频）：h 比原默认 vitpose-b 重投影中位 −0.77/−0.92px、根关节最坏跳变
+14.8→3.9cm；vitpose-l 与 h 基本持平（−0.03/−0.79px）但快 ~2.8×，要速度切 ``--pose-model
+vitpose-l-coco_25``。h 的 onnx 是「226KB 图 + 394 个外挂分片」同目录结构，缺任一分片都加载不了。
+
 ``--det-conf`` 人检测阈值（默认 0.2）、
-``--fit-conf`` 拟合关键点阈值（默认 0.15）——黑衣服/低亮度人关键点置信度偏低，
-阈值太高会把 2D 已检出的关节在 3D 拟合里丢掉，致其退化成均值模型。
+``--fit-conf`` 拟合关键点阈值（**默认 0.5**）——低置信度关节不参与拟合。早期用 0.15
+是想给黑衣服/低亮度人多留约束，但固定观测集 A/B 证明 0.5 在同批点上更准（见
+``--fit-conf`` 的 help）。真要放宽用 ``--fit-conf 0.15`` 回退。
 
 调试选项
   --fake-poses  不跑检测，注入一个合成站姿人观测 → 专用于验证 录制→对齐→重建→存档
@@ -153,24 +160,36 @@ def build_args():
     ap.add_argument("--min-cams", type=int, default=2)
     ap.add_argument("--det-conf", type=float, default=0.2,
                     help="人检测置信度阈值（yolo11n bbox；黑衣服/低亮度人易被漏检，离线降到 0.2 少丢人）")
-    ap.add_argument("--fit-conf", type=float, default=0.15,
-                    help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此被丢弃；黑衣服人关键点偏低，降到 0.15 保留更多约束）")
-    ap.add_argument("--consensus-sigma", type=float, default=10.0,
-                    help="多视角 3D 共识降权：2D 观测与鲁棒三角化 3D 的偏差达到该像素值时"
-                         "权重降到 0.5（Cauchy）。0=关闭。实测 2D 系统性偏差占误差 39~48%%，"
-                         "该项专治「单视角偏/外推」的关节")
+    ap.add_argument("--fit-conf", type=float, default=0.5,
+                    help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此不参与拟合）。"
+                         "默认 0.5：固定观测集 A/B（3 段视频）比 0.15 在同批点上重投影更小、"
+                         "根关节抖动的最大值从 14.8cm 降到 7.7cm，无任何指标变差；"
+                         "ViTPose 的 conf 中位 0.87~0.90，0.5 不会误杀真实关节。")
+    ap.add_argument("--consensus-sigma", type=float, default=0.0,
+                    help="多视角 3D 共识降权（默认 0=关闭）：2D 观测与鲁棒三角化 3D 的偏差达到"
+                         "该像素值时权重降到 0.5（Cauchy）。0=关闭。实测 2D 系统性偏差占误差 "
+                         "39~48%%，该项专治「单视角偏/外推」的关节。**固定观测集 A/B（3 段视频）"
+                         "结论：开启后留出视角重投影 −7%%（14.71→13.69px，但留出视角恰是共识参考"
+                         "用到的相机，有循环成分），代价是拟合视角重投影 +2%%（11.83→12.18px）与 "
+                         "p0 根关节抖动中位 +0.04cm（0.20→0.24）。净账不划算故默认关；"
+                         "想让最坏跳变从 7.7cm 再降到 4.0cm 时用 --consensus-sigma 10")
     ap.add_argument("--consensus-max", type=float, default=30.0,
-                    help="多视角 3D 共识降权：偏差超过该像素值直接丢弃该视角该关节")
+                    help="多视角 3D 共识降权：偏差超过该像素值直接丢弃该视角该关节（仅 sigma>0 时生效）")
     ap.add_argument("--no-consensus-filter", action="store_true",
                     help="关闭多视角 3D 共识降权（用于 A/B 对照）")
     ap.add_argument("--save-pass1", default=None, metavar="PATH",
                     help="把 Pass 1（检测+身份关联）的观测存成 npz，供后续 --load-pass1 秒级重跑拟合")
     ap.add_argument("--load-pass1", default=None, metavar="PATH",
                     help="跳过检测，直接读 --save-pass1 存的观测（保证 A/B 的 2D 输入逐位一致）")
-    ap.add_argument("--pose-model", default="vitpose-b-coco_25",
-                    help="姿态模型（默认 vitpose-b-coco_25，ViTPose：coco_25 25 点含脚，"
-                         "输出重排成 halpe26；vitpose-s 最快 / b 甜点 / l 更强 / "
-                         "h 最强（图+外挂分片，~2.55GB，首次自动下载））/ "
+    ap.add_argument("--pose-model", default="vitpose-h-coco_25",
+                    help="姿态模型（默认 vitpose-h-coco_25 = ViTPose 最大档，离线不追速度就取最强；"
+                         "coco_25 25 点含脚，输出重排成 halpe26）。"
+                         "固定观测集 A/B（2 段视频，同批 2D 点）：h 比 vitpose-b 重投影中位 "
+                         "−0.77/−0.92px、根关节最坏跳变 14.8→3.9cm；"
+                         "vitpose-l 与 h 基本持平（一段 −0.03px、一段 −0.79px）但推理快 ~2.8×，"
+                         "要速度用 vitpose-l-coco_25。"
+                         "h 是「226KB 图 + 394 个外挂分片」目录（~2.55GB，首次自动下载，"
+                         "分片必须与图同目录，别单独拷 .onnx）/ "
                          "rtmpose-x-halpe26（384×288，RTMPose）/ rtmpose-l-halpe26（256×192）")
     ap.add_argument("--pose-input-size", type=int, nargs=2, default=(288, 384),
                     metavar=("H", "W"), help="姿态模型输入尺寸 (H, W)（RTMPose 用，默认 288 384；"
