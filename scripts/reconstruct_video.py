@@ -37,8 +37,9 @@
   --max-frames  最多处理前 N 个主时钟帧（调试/计时用，0 = 全部）。
 
 球重建选项（默认开启）
+  --ball-only        只重建球轨迹（跳过姿态/SMPL 重建），写 ball_trajectory.npz 后退出。
   --no-ball          跳过球轨迹重建。
-  --ball-detector    球检测路线：classical（默认）/ yolo。
+  --ball-detector    球检测路线：yolo（默认，自动用 ball_gray/weights/best.onnx）/ classical。
   --ball-model       显式指定 YOLO 球 ONNX 路径（覆盖 yolo 的自动查找）。
   --ball-min-conf    球三角化最低置信度（默认 0.3）。
 """
@@ -168,6 +169,8 @@ def build_args():
     ap.add_argument("--em-verbose", action="store_true")
     ap.add_argument("--easymocap-root", default="/home/yby/projects/EasyMocap")
     ap.add_argument("--no-ball", action="store_true", help="跳过球轨迹重建（默认开启）")
+    ap.add_argument("--ball-only", action="store_true",
+                    help="只重建球轨迹（跳过姿态/SMPL 重建），写 ball_trajectory.npz 后退出")
     ap.add_argument("--ball-detector", choices=["classical", "yolo"], default="yolo",
                     help="球检测路线：yolo（默认，onnx，与 live_control 一致）/ classical（背景减除+帧差，先验弱易误检）")
     ap.add_argument("--ball-model", default=None,
@@ -497,6 +500,13 @@ def main() -> None:
     missing = [c for c in src.cids if c not in cids_ok]
     if missing:
         print(f"  ⚠ 以下相机无标定，重建时跳过：{missing}")
+
+    # ---- 只重建球：跳过姿态/SMPL 模型加载与重建，跑完球轨迹即退出 ----
+    if args.ball_only:
+        print("=== 只重建球（--ball-only，跳过姿态/SMPL）===")
+        src_ball = VideoSource(session_dir, ref_cam=args.ref_cam)
+        run_ball_recon(args, src_ball, intrinsics, extrinsics, cids_ok, out_dir)
+        return
 
     # ---- 模型 / 检测 / 拟合器 ----
     recon = EasymocapReconstructor(verbose=False)
