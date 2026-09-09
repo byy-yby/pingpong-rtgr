@@ -1202,16 +1202,22 @@ class ReconScene:
         self._cl_set(scene, "ball", 1, self._cl_mat(_CLOUD_PT_BALL),
                      np.asarray(X, np.float64).reshape(1, 3),
                      np.asarray(_BALL_COLOR, np.float64).reshape(1, 3), True)
-        if self.ball_trail:
-            pts = self.tl.ball_trail_upto(t)
-            if pts:
-                allp = np.concatenate([np.asarray(s, np.float64) for s in pts], axis=0)
-                if len(allp) > _TRAIL_CAP:
-                    allp = allp[-_TRAIL_CAP:]
-                m = len(allp)
-                cols = np.tile(np.asarray(_BALL_TRAIL_COLOR, np.float64), (m, 1))
-                self._cl_set(scene, "trail", _TRAIL_CAP, self._cl_mat(_CLOUD_PT_TRAIL),
-                             allp, cols, True)
+        # 轨迹是「到 t 为止」的累积层：逐帧 O(t) 重算 + 点数增长，播放中每帧都多一块
+        # 工作。播放中（full=False）冻结轨迹、只让红球逐帧走；暂停/步进/拖条（full=True）
+        # 才刷新轨迹（与 mesh 路径「次层降频」同一思路，点云路径把它变成 full 门控）。
+        if full:
+            if self.ball_trail:
+                pts = self.tl.ball_trail_upto(t)
+                if pts:
+                    allp = np.concatenate([np.asarray(s, np.float64) for s in pts], axis=0)
+                    if len(allp) > _TRAIL_CAP:
+                        allp = allp[-_TRAIL_CAP:]
+                    m = len(allp)
+                    cols = np.tile(np.asarray(_BALL_TRAIL_COLOR, np.float64), (m, 1))
+                    self._cl_set(scene, "trail", _TRAIL_CAP, self._cl_mat(_CLOUD_PT_TRAIL),
+                                 allp, cols, True)
+                else:
+                    self._cl_show(scene, "trail", False)
             else:
                 self._cl_show(scene, "trail", False)
         return True
@@ -1430,6 +1436,10 @@ class _PlayerApp:
         self._2d_win = None
         self._2d_img_widget = None
         self._last_title = 0.0              # 标题栏更新节流（见 _show）
+        self._last_slider_sync = 0.0        # 进度条回显节流（见 _show）
+        self._last_2d_wall = 0.0            # 2D 叠加解码节流（见 _refresh_2d）
+        self._perf_t0 = 0.0                 # 播放帧率诊断（见 run）
+        self._perf_n = 0
 
         self.app = gui.Application.instance
         self.app.initialize()
@@ -1481,6 +1491,16 @@ class _PlayerApp:
                         # 被跳过的帧本来也不会在 60Hz 屏上分得一个刷新。
                         self.t = min(float(n), self.t + dt * self.fps * self.speed)
                 self._show()
+                if self.playing:
+                    # 帧率诊断：每 ~2s 打印一次实测渲染帧率（排查播放卡顿/跳帧）
+                    self._perf_n += 1
+                    if self._perf_n == 1:
+                        self._perf_t0 = time.perf_counter()
+                    elif time.perf_counter() - self._perf_t0 >= 2.0:
+                        dt = time.perf_counter() - self._perf_t0
+                        print(f"[回放] 实测 ≈{self._perf_n / dt:.0f} 帧/秒"
+                              f"（{dt * 1000 / self._perf_n:.0f}ms/帧）· t={int(self.t)}")
+                        self._perf_n = 0
                 if not self.playing and was_playing:
                     gc.collect()      # 刚暂停/到尾时收一次积压
                 was_playing = self.playing
@@ -1579,14 +1599,18 @@ class _PlayerApp:
         person = self.scene_b.apply_people(self.widget.scene, t0, full=paused)
         has_ball = self.scene_b.apply_ball(self.widget.scene, t0, full=paused)
         self.widget.force_redraw()     # 场景变了立即重绘，别等事件流捎带（否则卡/跳帧）
-        # 进度条回显（只在换帧时同步；程序设值用 _slider_sync 挡住 _on_slider 的 seek）
-        self._slider_sync = True
-        try:
-            self.slider.int_value = t0
-        finally:
-            self._slider_sync = False
-        # 标题栏节流：每帧改 X11 标题会带来卡顿/闪烁，降到 ~4Hz
         now = time.perf_counter()
+        # 进度条回显：播放中降到 ~10Hz——每帧设 Slider 值会反复触发重排/重绘，是进度条
+        # 跟着卡顿的来源之一；暂停/步进/拖条（paused）则每帧同步。程序设值用 _slider_sync
+        # 挡住 _on_slider 的 seek 回调。
+        if paused or now - self._last_slider_sync >= 0.1:
+            self._last_slider_sync = now
+            self._slider_sync = True
+            try:
+                self.slider.int_value = t0
+            finally:
+                self._slider_sync = False
+        # 标题栏节流：每帧改 X11 标题会带来卡顿/闪烁，降到 ~4Hz
         if now - self._last_title >= 0.25:
             self._last_title = now
             rate = self.speed * self.fps
@@ -1640,6 +1664,12 @@ class _PlayerApp:
             return
         if not force:
             return
+        # 拖进度条 / 连点会密集触发 force，每次都要解 4 路 h264（~15-40ms）→ 拖条卡。
+        # 统一降到 ~8Hz 解码：暂停/步进/拖条够看，又不拖垮主循环。
+        now = time.perf_counter()
+        if now - self._last_2d_wall < 1.0 / 8.0:
+            return
+        self._last_2d_wall = now
         try:
             tile = self.overlay.tile(int(self.t))
         except Exception as exc:  # noqa: BLE001 —— 视频解不出来不该拖垮主窗口
