@@ -31,7 +31,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -48,13 +48,62 @@ from .triangulate import (
 __all__ = [
     "TrackConfig", "BoxTrack", "LocalCameraTracker", "PersonKalman",
     "PersonTrack", "TrackFrameResult", "MultiPersonTracker",
-    "iou_xyxy", "select_fit_views",
+    "iou_xyxy", "select_fit_views", "lower_body_unreliable", "mask_lower_body",
+    "LOWER_BODY_HALPE26",
 ]
 
 _EMPTY_BOXES = np.zeros((0, 4), dtype=np.float32)
 
 # bbox 贴到图像边界的判定余量（像素）。
 _CLIP_MARGIN_PX = 3.0
+
+# 下半身关键点在 halpe26 里的下标：膝 13/14、踝 15/16、脚尖 20-23、脚跟 24/25。
+# **髋部（11/12/19）不在内**——阶段 B/C 的根关节靠它，且髋几乎不被球桌挡住。
+LOWER_BODY_HALPE26: Tuple[int, ...] = (13, 14, 15, 16, 20, 21, 22, 23, 24, 25)
+
+
+def lower_body_unreliable(pose: Pose2D, *, ratio: float = 0.5, abs_min: float = 0.5,
+                          min_joints: int = 2) -> bool:
+    """该视角的姿态是否「下半身不可信」（远端相机隔着球桌看人时的典型症状）。
+
+    判据：下半身关节（膝/踝/脚尖/脚跟）的**中位置信度**既明显低于**同一姿态上半身**
+    的中位（``< ratio`` 倍），又低于绝对门限 ``abs_min``。两个条件都满足才判不可信——
+    只看相对值会误伤「整具骨架置信度都低的远处小目标」，只看绝对值会误伤挥拍时
+    手腕短暂低置信的帧。下半身有效关节少于 ``min_joints`` 时不判（没数据 = 没污染）。
+
+    实测（session 20260908_161147，2 人 4 相机）：远端相机的下半身中位置信
+    0.24~0.40 / 同视角上半身 0.76~0.91（比值 0.44~0.46），投回该相机的中位残差
+    32~63px；而正常视角下半身 0.81~0.89（比值 0.89~0.94）、残差 10~17px。
+    两组比值被 0.5 门限干净分开。
+    """
+    kp = np.asarray(pose.keypoints, dtype=np.float64)
+    if kp.ndim != 2 or kp.shape[1] < 3 or len(kp) <= max(LOWER_BODY_HALPE26):
+        return False
+    conf = kp[:, 2]
+    low_idx = list(LOWER_BODY_HALPE26)
+    up_mask = np.ones(len(kp), dtype=bool)
+    up_mask[low_idx] = False
+    up = conf[up_mask]
+    up = up[up > 0]
+    low = conf[low_idx]
+    low = low[low > 0]
+    if len(low) < min_joints or len(up) == 0:
+        return False
+    m_up, m_low = float(np.median(up)), float(np.median(low))
+    return bool(m_low < ratio * m_up and m_low < abs_min)
+
+
+def mask_lower_body(pose: Pose2D) -> Pose2D:
+    """返回副本：下半身关节（膝/踝/脚尖/脚跟）置信度置 0，坐标保留。
+
+    置 0 后该视角的这些关节在下游（阶段 D 鲁棒三角化 / SMPL 拟合）自动被丢弃，
+    3D 下半身只由**看得见腿的相机**决定；上半身与髋部完全不受影响。
+    """
+    kp = np.array(pose.keypoints, dtype=np.float64, copy=True)
+    for i in LOWER_BODY_HALPE26:
+        if i < len(kp):
+            kp[i, 2] = 0.0
+    return replace(pose, keypoints=kp)
 
 
 def iou_xyxy(a, b) -> float:
@@ -156,6 +205,11 @@ class TrackConfig:
     min_pose_joints: int = 5           # 观测姿态至少要有这么多关节 conf ≥ anchor_min_conf
     # -- 阶段 D：鲁棒三角化 --
     robust: RobustTriangulationConfig = field(default_factory=lambda: DEFAULT_ROBUST)
+    # 下半身可信度门（见 lower_body_unreliable）：远端相机隔球桌看人时膝/踝是姿态
+    # 模型外推的假点，置信度明显低于同视角上半身 → 该视角下半身置 0 不参与重建。
+    lower_body_gate: bool = True
+    lower_body_conf_ratio: float = 0.5     # 下半身中位置信 < 该比例 × 上半身中位
+    lower_body_conf_abs: float = 0.5       # 且下半身中位置信 < 该绝对值
     # -- 通用 --
     max_people: int = 4
     anchor_min_conf: float = 0.3       # anchor_2d 的关节置信度门限
@@ -481,7 +535,7 @@ class PersonTrack:
 class TrackFrameResult:
     """一帧里某个人的跟踪结果（喂给下游拟合 / 可视化）。"""
     person_id: int
-    obs: Dict[int, Pose2D]                    # 参与三角化的 2D 观测
+    obs: Dict[int, Pose2D]                    # 参与三角化的 2D 观测（下半身门已生效）
     source: Dict[int, str]                    # detect / predicted / roi_redetect / predicted_only
     boxes: Dict[int, np.ndarray]
     cam_weights: Dict[int, float]
@@ -489,6 +543,10 @@ class TrackFrameResult:
     root: Optional[np.ndarray]                # 卡尔曼更新后的 3D 根
     root_cov: np.ndarray
     track: PersonTrack
+    raw_obs: Dict[int, Pose2D] = field(default_factory=dict)
+    """未做下半身掩码的原始观测（**仅供 2D 叠加显示/诊断**，勿拿去三角化/拟合）。"""
+    lower_body_masked: Dict[int, bool] = field(default_factory=dict)
+    """每个相机本帧是否被下半身门判为不可信（下半身关节已在 :attr:`obs` 里置 0）。"""
 
 
 # ----------------------------------------------------------------------
@@ -1120,16 +1178,29 @@ class MultiPersonTracker:
             kpt_conf = float(np.mean(kp[:, 2])) if kp.ndim == 2 and kp.shape[1] > 2 else 0.0
             cam_w[cid] = float(max(pose.score, 1e-3) * max(kpt_conf, 1e-3))
 
+        # 下半身可信度门：远端相机隔球桌看人时膝/踝是姿态模型外推的假点（置信度远低于
+        # 同视角上半身，实测残差 32~63px），把它们置 0，只让看得见腿的相机决定下半身。
+        masked: Dict[int, bool] = {}
+        tri_obs = obs
+        if self.cfg.lower_body_gate and obs:
+            tri_obs = {}
+            for cid, pose in obs.items():
+                bad = lower_body_unreliable(
+                    pose, ratio=self.cfg.lower_body_conf_ratio,
+                    abs_min=self.cfg.lower_body_conf_abs)
+                masked[cid] = bool(bad)
+                tri_obs[cid] = mask_lower_body(pose) if bad else pose
+
         robust = None
-        if len(obs) >= 2:
+        if len(tri_obs) >= 2:
             robust = self.tri.triangulate_pose_robust(
-                obs, cam_weights=cam_w,
-                decay={cid: tr.decay(cid) for cid in obs},
+                tri_obs, cam_weights=cam_w,
+                decay={cid: tr.decay(cid) for cid in tri_obs},
                 cfg=self.cfg.robust)
             # 每相机误差 EMA（重投影到该相机与观测根关节的距离）
             ri = robust.root_index
             if ri >= 0 and np.isfinite(robust.skeleton.keypoints[ri]).all():
-                for cid, pose in obs.items():
+                for cid, pose in obs.items():          # 用原始观测测根关节误差
                     a = anchor_2d(pose, self.cfg.anchor_min_conf)
                     if a is None:
                         continue
@@ -1170,8 +1241,8 @@ class MultiPersonTracker:
             tr.confirmed = True
         tr.last_robust = robust
         return TrackFrameResult(
-            person_id=tr.person_id, obs=obs, source=sources, boxes=boxes,
+            person_id=tr.person_id, obs=tri_obs, source=sources, boxes=boxes,
             cam_weights=cam_w, robust=robust, root=tr.kalman.position.copy(),
             root_cov=(R if R is not None else np.eye(3) * self.cfg.obs_base_std ** 2),
-            track=tr,
+            track=tr, raw_obs=obs, lower_body_masked=masked,
         )

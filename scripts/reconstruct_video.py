@@ -186,6 +186,18 @@ def build_args():
     ap.add_argument("--no-robust-kp3d", action="store_true",
                     help="tracker：SMPL 拟合仍用官方 batch_triangulate 的 3D 关键点"
                          "（默认用阶段 D 鲁棒三角化的结果覆盖）")
+    ap.add_argument("--no-lower-body-gate", action="store_true",
+                    help="tracker：关闭下半身可信度门（默认开启）。默认会丢掉「下半身"
+                         "置信度明显低于同视角上半身」的视角的膝/踝/脚尖/脚跟——远端相机"
+                         "隔着球桌看人时这些点是姿态模型外推的假点，会拖坏腿部重建")
+    ap.add_argument("--lower-body-conf-ratio", type=float, default=0.5,
+                    help="下半身门：下半身中位置信 < 该比例 × 同视角上半身中位（默认 0.5）")
+    ap.add_argument("--lower-body-conf-abs", type=float, default=0.5,
+                    help="下半身门：且下半身中位置信 < 该绝对值（默认 0.5）")
+    ap.add_argument("--upper-body-only", type=int, nargs="+", default=None,
+                    metavar="PID",
+                    help="指定身份只用上半身重建（膝/踝/脚尖/脚跟的 2D 与 3D 数据全部丢弃，"
+                         "腿部交给 SMPL 先验），如 --upper-body-only 0")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
     ap.add_argument("--root", default=None,
                     help="项目根（读 data/calibration 与 data/extrinsics，默认自动探测）")
@@ -247,13 +259,36 @@ def _pass1_fixed(args, src, intrinsics, extrinsics, detector, triangulator, indi
     return _obs_stats(frames_obs_by_pid)
 
 
+def _predicted_box_distorted(triangulator, track, cid):
+    """卡尔曼预测位置在该相机的**原始像素**框（灰色虚线显示用，**不参与重建**）。
+
+    ``Track.predicted_box`` 给的是无畸变口径；回放叠加画在原始图像上，所以这里用
+    ``project_distorted`` 重算中心，尺寸沿用该相机最近一次实测 bbox（也是原始像素）。
+    """
+    uv = triangulator.project_distorted(cid, track.kalman.position)
+    if uv is None:
+        return None
+    box = track.last_bbox.get(cid)
+    if box is not None:
+        b = np.asarray(box, dtype=np.float64)[:4]
+        half = np.maximum((b[2:] - b[:2]) * 0.5, 8.0)
+    else:
+        half = np.full(2, float(track.cfg.roi_fallback_px) * 0.5, dtype=np.float64)
+    return np.asarray([uv[0] - half[0], uv[1] - half[1],
+                       uv[0] + half[0], uv[1] + half[1]], dtype=np.float32)
+
+
 def _pass1_tracker(args, src, detector, triangulator, indices, cids_ok, n_people,
                    frames_obs_by_pid, frames_robust_by_pid, n_seen_by_pid,
-                   pose2d_by_frame):
+                   pose2d_by_frame, lower_gate, pred_by_frame=None):
     """阶段 A–D 多人跟踪：逐帧检测 → 局部跟踪 → 跨相机关联 → 鲁棒三角化。
 
     输出与 ``_pass1_fixed`` 相同的「按身份收集的逐帧观测」，外加每帧每人的
     :class:`RobustPose3D`（阶段 D 结果，供 Pass 2 覆盖官方三角化的 3D 关键点）。
+    ``lower_gate[pid][cid]`` 累计该视角被判「下半身不可信」的帧数（见
+    :func:`tabletennis.reconstruction.person_track.lower_body_unreliable`）。
+    ``pred_by_frame``（可选）收集「该相机该帧没检出人」时的卡尔曼预测框，**只给回放
+    叠加画灰色虚线**——预测只用来开 ROI 搜索窗，绝不参与重建（见 person_track 红线①）。
     """
     from tabletennis.reconstruction.obs2d import pose_to_dict
     from tabletennis.reconstruction.person_track import MultiPersonTracker, TrackConfig
@@ -263,6 +298,9 @@ def _pass1_tracker(args, src, detector, triangulator, indices, cids_ok, n_people
         full_detect_interval=max(1, args.full_detect_interval),
         switch_margin=args.switch_margin,
         max_people=max(n_people, args.max_people or n_people),
+        lower_body_gate=not args.no_lower_body_gate,
+        lower_body_conf_ratio=args.lower_body_conf_ratio,
+        lower_body_conf_abs=args.lower_body_conf_abs,
     )
     # 卡尔曼 dt 用录制真实帧率（100fps 外部触发 → 0.01s；编码丢帧由 pulse 对齐吸收）
     try:
@@ -290,14 +328,28 @@ def _pass1_tracker(args, src, detector, triangulator, indices, cids_ok, n_people
         obs_by_slot = {g: {} for g in range(n_people)}
         robust_by_slot = {g: None for g in range(n_people)}
         per_cam_poses: Dict[int, list] = {}
+        pred_by_cam: Dict[int, list] = {}
         for r in results:
             g = slot_of.get(r.person_id)
             if g is None:                # 超出 --max-people 的人，忽略
                 continue
             obs_by_slot[g] = dict(r.obs)
             robust_by_slot[g] = r.robust
-            for cid, p in r.obs.items():
+            for cid, bad in (r.lower_body_masked or {}).items():
+                if bad:
+                    lower_gate[g][cid] = lower_gate[g].get(cid, 0) + 1
+            # 2D 叠加显示用**原始**姿态（下半身门只影响重建输入，不改检测结果本身）
+            for cid, p in (r.raw_obs or r.obs).items():
                 per_cam_poses.setdefault(cid, []).append(p)
+            # 该相机这一帧没检出人（轨迹还在，只是没框）→ 记预测框供叠加画虚线
+            if pred_by_frame is not None:
+                for cid in frames_k:
+                    if r.track.last_sources.get(cid) != "predicted_only":
+                        continue
+                    pb = _predicted_box_distorted(triangulator, r.track, cid)
+                    if pb is not None:
+                        pred_by_cam.setdefault(cid, []).append(
+                            [float(v) for v in pb] + [int(g)])
         for g in range(n_people):
             frames_obs_by_pid[g].append(obs_by_slot[g])
             frames_robust_by_pid[g].append(robust_by_slot[g])
@@ -308,6 +360,8 @@ def _pass1_tracker(args, src, detector, triangulator, indices, cids_ok, n_people
                 str(cid): [pose_to_dict(p) for p in pl]
                 for cid, pl in per_cam_poses.items()
             }
+        if pred_by_frame is not None and pred_by_cam:
+            pred_by_frame[str(k)] = {str(cid): v for cid, v in pred_by_cam.items()}
     return _obs_stats(frames_obs_by_pid)
 
 
@@ -368,7 +422,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     模型先验补全。β 只用置信度最高的 ``--shape-top-k`` 帧估计（见
     :func:`tabletennis.reconstruction.easymocap.select_shape_frames`）。
     """
-    from tabletennis.reconstruction.obs2d import pose_to_dict, save_pose2d
+    from tabletennis.reconstruction.obs2d import pose_to_dict, save_pred_boxes, save_pose2d
     from tabletennis.reconstruction.triangulate import MultiViewTriangulator
 
     # 过滤掉未标定的相机，组内相机数 <2 则该身份无法三角化（后面跳过）
@@ -390,12 +444,15 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     frames_robust_by_pid = {g: [] for g in range(n_people)}  # pid -> [ RobustPose3D | None ]
     n_seen_by_pid = {g: 0 for g in range(n_people)}
     pose2d_by_frame = {}                                    # 全部检出 2D 姿态（存盘供回放叠加）
+    pred_by_frame = {}                                      # 纯显示的预测框（不参与重建）
+    lower_gate = {g: {} for g in range(n_people)}           # pid -> {cid: 被判不可信的帧数}
     t_global0 = time.time()
     t0 = time.time()
     if use_tracker and not args.fake_poses:
         stats = _pass1_tracker(args, src, detector, triangulator, indices, cids_ok,
                                n_people, frames_obs_by_pid, frames_robust_by_pid,
-                               n_seen_by_pid, pose2d_by_frame)
+                               n_seen_by_pid, pose2d_by_frame, lower_gate,
+                               pred_by_frame)
     else:
         stats = _pass1_fixed(args, src, intrinsics, extrinsics, detector, triangulator,
                              indices, cids_ok, person_groups, recon,
@@ -406,6 +463,15 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     if pose2d_by_frame:
         save_pose2d(out_dir, pose2d_by_frame)
         print(f"  2D 姿态检测已存 pose2d.json（{len(pose2d_by_frame)} 帧）")
+    if pred_by_frame:
+        save_pred_boxes(out_dir, pred_by_frame)
+        print(f"  预测框已存 pred_boxes.json（{len(pred_by_frame)} 帧，**仅回放显示**、"
+              "不参与重建——预测只用来开 ROI 搜索窗，伪造成检测会引发自激回路）")
+    # 下半身可信度门报告：哪些 (人, 相机) 被判「隔球桌看人」→ 该视角膝/踝不参与重建
+    for g in range(n_people):
+        if lower_gate.get(g):
+            parts = [f"c{cid}×{n}帧" for cid, n in sorted(lower_gate[g].items())]
+            print(f"  p{g}：下半身不可信视角（膝/踝/脚尖/脚跟已丢弃）{', '.join(parts)}")
 
     # 每个身份实际参与拟合的视角：tracker 用「看到过该人、且不是在画面边缘只露半截
     # 的相机」（``select_fit_views``：裁边视角的姿态是模型外推的，会把 SMPL 拉偏），
@@ -429,6 +495,18 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     # ---- Pass 2：逐人批量拟合 ----
     t0 = time.time()
     results_by_pid = {}
+    upper_only = set(args.upper_body_only or [])
+    if upper_only:
+        from tabletennis.reconstruction.person_track import mask_lower_body
+        for g in sorted(upper_only):
+            if not (0 <= g < n_people):
+                print(f"  ⚠ --upper-body-only {g} 超出身份范围 0..{n_people - 1}，忽略")
+                continue
+            frames_obs_by_pid[g] = [
+                {cid: mask_lower_body(p) for cid, p in obs.items()}
+                for obs in frames_obs_by_pid[g]
+            ]
+            print(f"  p{g}：--upper-body-only → 全部视角的膝/踝/脚尖/脚跟都不参与重建")
     for g, group in enumerate(person_groups):
         if len(group) < 2:
             print(f"  ⚠ p{g} 组内相机数 {len(group)} < 2，跳过（无法三角化）")
@@ -456,6 +534,10 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
                 else:
                     print(f"  p{g}：3D 关键点用阶段 D 鲁棒三角化覆盖"
                           f"（{n_ok_kp}/{len(kp3d_ov)} 帧有有效关节）")
+                if kp3d_ov is not None and g in upper_only:
+                    from tabletennis.reconstruction.easymocap import LOWER_BODY_BODY25
+                    kp3d_ov[:, list(LOWER_BODY_BODY25), :] = 0.0
+                    print(f"  p{g}：3D 下半身关节已按 --upper-body-only 清零")
             results_by_pid[g] = recon.reconstruct_batch(
                 frames_obs_by_pid[g], intrinsics, extrinsics,
                 min_conf=args.fit_conf, view_ids=sorted(group),

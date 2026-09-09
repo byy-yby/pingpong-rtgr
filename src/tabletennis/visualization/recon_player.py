@@ -1347,16 +1347,17 @@ class Recon2DOverlay:
 
     def __init__(self, out_dir: str, session_dir: str,
                  per_cam_size: tuple = (480, 360)):
-        from ..reconstruction.obs2d import load_ball2d, load_pose2d
+        from ..reconstruction.obs2d import load_ball2d, load_pose2d, load_pred_boxes
         self.pose2d = load_pose2d(out_dir)
         self.ball2d = load_ball2d(out_dir)
+        self.pred_boxes = load_pred_boxes(out_dir)   # 纯显示：预测框（灰色虚线）
         self.session_dir = session_dir
         self.per_cam_size = tuple(per_cam_size)
         self._src = None
 
     @property
     def available(self) -> bool:
-        return bool(self.pose2d or self.ball2d)
+        return bool(self.pose2d or self.ball2d or self.pred_boxes)
 
     def _source(self):
         if self._src is None:
@@ -1368,11 +1369,16 @@ class Recon2DOverlay:
         return self._src
 
     def tile(self, t: int) -> "Optional[np.ndarray]":
-        """主时钟 t 帧的四路画面 2×2 平铺（RGB uint8）；无画面返回 None。"""
+        """主时钟 t 帧的四路画面 2×2 平铺（RGB uint8）；无画面返回 None。
+
+        **每台相机固定占一格**（按 ``src.cids`` 排序），该脉冲号没有帧的相机画
+        「camN 无帧」占位块——否则缺一路就会让后面几格整体前移，看起来像「相机接错了」。
+        """
         import cv2
 
         from ..reconstruction.obs2d import dict_to_ball, dict_to_pose
-        from .overlay2d import draw_ball, draw_pose, gray_to_bgr, tile_images
+        from .overlay2d import (draw_ball, draw_pose, draw_pred_box, gray_to_bgr,
+                                tile_images)
 
         src = self._source()
         if src is None:
@@ -1382,14 +1388,30 @@ class Recon2DOverlay:
             return None
         tw, th = self.per_cam_size
         images = []
-        for cid in sorted(frames):
-            bgr = gray_to_bgr(frames[cid].image)
+        for cid in src.cids:
+            frame = frames.get(cid)
+            if frame is None:
+                # 该相机的这一拍被丢帧/没对齐上（见 video_source 脉冲号对齐）
+                ph = np.full((th, tw, 3), 24, dtype=np.uint8)
+                cv2.putText(ph, f"cam{cid}", (8, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (120, 120, 120), 2, cv2.LINE_AA)
+                cv2.putText(ph, "no frame (drop/misalign)", (8, th // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (70, 70, 200), 2, cv2.LINE_AA)
+                images.append(ph)
+                continue
+            bgr = gray_to_bgr(frame.image)
+            # 预测框先画（灰色虚线，压在实测框下面）：该相机这一帧没检出人时，
+            # 卡尔曼预测位置的框——**只是显示**，重建里这一帧该相机不贡献观测。
+            for pb in self.pred_boxes.get(str(int(t)), {}).get(str(cid), []):
+                draw_pred_box(bgr, pb[:4], label=f"pred p{int(pb[4])}" if len(pb) > 4 else "pred")
             for pd in self.pose2d.get(str(int(t)), {}).get(str(cid), []):
                 draw_pose(bgr, dict_to_pose(pd, camera_id=cid), draw_bbox=True)
             for bd in self.ball2d.get(str(int(t)), {}).get(str(cid), []):
                 draw_ball(bgr, dict_to_ball(bd, camera_id=cid))
             if (bgr.shape[1], bgr.shape[0]) != (tw, th):
                 bgr = cv2.resize(bgr, (tw, th), interpolation=cv2.INTER_AREA)
+            cv2.putText(bgr, f"cam{cid}", (8, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (255, 255, 255), 2, cv2.LINE_AA)
             images.append(bgr)
         tile = tile_images(images, cols=2)
         return cv2.cvtColor(tile, cv2.COLOR_BGR2RGB)

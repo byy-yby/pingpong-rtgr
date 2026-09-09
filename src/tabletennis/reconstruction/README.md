@@ -25,6 +25,9 @@
 - `video_source.py` —— **离线输入**：把 `data/video/<session>/cam*.mp4` + ts
   副产物读成对齐的多视角灰度帧流（`VideoSource.frames_for_ref`）。四路各自丢帧时
   用**脉冲号对齐**把帧绑回同一触发（详见模块文档）。
+- `obs2d.py` —— 2D 观测的 JSON 存读：`pose2d.json`（每帧每相机的**原始** 2D 姿态）、
+  `ball2d.json`、`pred_boxes.json`（**纯显示**的卡尔曼预测框，回放叠加画灰色虚线用，
+  **重建不读**——预测只用来开 ROI 搜索窗，伪造成检测会引发自激回路）。
 
 ## 数据流
 
@@ -101,6 +104,16 @@ for obs in people:
 bbox 高 128~168px），把关节投回该视角差 95~290px。该函数按「bbox 贴边帧 ≥50% 出场帧」
 剔掉这类相机，不足 2 台时回退出场最多的 2 台。离线 20 帧实测重投影误差中位
 36.7px → 18.7px。
+
+**下半身可信度门 `lower_body_gate`（默认开）**：隔球桌看远端的人时，膝/踝/脚尖/脚跟
+是姿态模型**外推**的点（同视角上半身 kp 置信 ~0.9，下半身中位 0.24~0.40），旧版照样
+喂进三角化会把 SMPL 的腿拉歪。每视角逐帧判 `lower_body_unreliable`（下半身中位置信
+< 0.5 × 上半身中位 **且** < 0.5 绝对值），命中则 `mask_lower_body` 把
+`LOWER_BODY_HALPE26` 的置信置 0 再进阶段 D；**髋 11/12/19 不掩码**（根关节靠它）。
+`TrackFrameResult.raw_obs` 保留原姿态供 2D 叠加、`lower_body_masked` 记命中视角。
+CLI `--no-lower-body-gate` / `--lower-body-conf-ratio` / `--lower-body-conf-abs`，
+`--upper-body-only PID...` 整段只用上身。实测 20260908_161147：**下身·好视角**重投影
+中位 p1 20.4→14.8px、p0 10.8→10.4px，上身不变（9.5→9.7 / 12.1→12.2）。
 
 ## EasyMocap（按 S）
 

@@ -143,6 +143,45 @@ def draw_ball(
     return image
 
 
+_PRED_COLOR = (150, 150, 150)  # BGR 灰色：预测框，与实测框（彩色）区分
+
+
+def _dashed_line(image: np.ndarray, a, b, color, dash: int = 8) -> None:
+    """在 ``image`` 上画一条从 a 到 b 的虚线（``dash`` 像素实、``dash`` 像素空）。"""
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    n = int(np.hypot(bx - ax, by - ay))
+    if n <= 0:
+        return
+    for i in range(0, n, 2 * dash):
+        t0, t1 = i / n, min(1.0, (i + dash) / n)
+        p0 = (int(round(ax + (bx - ax) * t0)), int(round(ay + (by - ay) * t0)))
+        p1 = (int(round(ax + (bx - ax) * t1)), int(round(ay + (by - ay) * t1)))
+        cv2.line(image, p0, p1, color, 1, cv2.LINE_AA)
+
+
+def draw_pred_box(image: np.ndarray, box, *, label: str = "pred",
+                  color=_PRED_COLOR, scale: float = 1.0, dash: int = 8) -> np.ndarray:
+    """把「卡尔曼预测框」画成**灰色虚线**矩形 + 角标（原地返回同一张图）。
+
+    纯显示用：预测框**不参与**重建——阶段 A 的预测只用来开 ROI 搜索窗，绝不伪造成
+    检测（见 ``person_track`` 红线①，伪框会引发 3D→框→姿态→3D 自激回路）。画出来
+    是为了让「该相机这一帧没检出人」呈现为虚线框而不是整格空白，同时一眼可辨「这是
+    预测、不是实测」。
+    """
+    x0 = int(round(float(box[0]) * scale))
+    y0 = int(round(float(box[1]) * scale))
+    x1 = int(round(float(box[2]) * scale))
+    y1 = int(round(float(box[3]) * scale))
+    for a, b in (((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)),
+                 ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))):
+        _dashed_line(image, a, b, color, dash)
+    if label:
+        cv2.putText(image, label, (x0, max(12, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, color, 1, cv2.LINE_AA)
+    return image
+
+
 def draw_table(
     image: np.ndarray,
     table,

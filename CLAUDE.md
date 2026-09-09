@@ -128,6 +128,33 @@ f17/f18 骨盆：c0/c3 互差 8.3/6.9px 一致、c1 偏 65px）。现退化取�
 `roi_gate_px=120, roi_gate_ratio=0.0` 为当前默认（**注意**：早期 A/B 曾判它「更差」，
 那次对比被伪框路径污染；新架构下 PX120 的跳变统计与 c0 骨盆残差都更好）。
 
+**下半身可信度门（`lower_body_gate`，默认开，2026-09-09）**：隔球桌看远端的人时，
+ViTPose 对膝/踝/脚尖/脚跟是**外推**出来的点（同视角上半身 kp 置信 ~0.9，下半身中位
+0.24~0.40），旧版照样喂进三角化，把 SMPL 的腿整体拉歪。现在每视角逐帧判
+`lower_body_unreliable`（下半身中位置信 < `lower_body_conf_ratio=0.5` × 上半身中位
+**且** < `lower_body_conf_abs=0.5`），命中则 `mask_lower_body` 把该视角的
+`LOWER_BODY_HALPE26=(13,14,15,16,20,21,22,23,24,25)` 置信置 0 再进阶段 D；
+**髋 11/12/19 绝不在掩码内**（阶段 B/C 的根关节靠它，且髋几乎不被桌子挡住）。
+`TrackFrameResult.raw_obs` 保留原姿态供 2D 叠加显示、`lower_body_masked` 记命中视角。
+CLI：`--no-lower-body-gate` / `--lower-body-conf-ratio` / `--lower-body-conf-abs`，
+以及 `--upper-body-only PID [PID ...]`（整段只用上身，连好视角的腿也丢）。
+
+实测（session 20260908_161147，719 帧 2 人）：门命中 p0 c1×568帧/c3×261帧、
+p1 c0×398帧/c2×289帧/c1×9帧。**别拿「重投影误差 18.70→13.27px」当证据**——那个指标
+只统计有效关节，掩码后坏视角的下半身压根不进分母，是假提升。同 2D、同关节集拆开比
+才是真的：上身 9.5→9.7 / 12.1→12.2px（无损伤）、**下身·好视角 p1 20.4→14.8px**
+（p0 10.8→10.4）、下身·坏视角 49.8→51.4 / 50.7→62.1px（**故意变差**：不再追那些
+错点——它们与好视角的 3D 共识本就差 50~60px）。
+
+**「某相机某帧没框」的成因（实测 515 个「人×相机」帧无框）**：A 预测位置投影出画幅
+151（那人不在该相机视野里）· C 全图只看到**另一个人** 300（被球桌/另一人挡住或太小）·
+D 全图也没检出人 28 · **B ROI 小窗漏检 36（7%，唯一可修的）**——全图能检出、就在预测
+位置 200px 内（中位 110px），却被 ROI 门限拒掉（`roi_gate_px=120` 距离门 + 「框心必须
+落在小窗内」+ 尺寸门）。**预测绝不填框**（红线①）：预测只用来开搜索窗，凭空造框会让
+图像里没人的地方长出骨架。故 2D 叠加里没框的相机画**灰色虚线 `pred pN` 框**
+（`obs2d.save_pred_boxes` → `pred_boxes.json` → `overlay2d.draw_pred_box`，**纯显示、
+重建不读**），让「这帧这台相机没观测」一眼可见、又不会误认成实测框。
+
 **SMPL 拟合视角要去掉「画面边缘只露半截」的相机**（`person_track.select_fit_views`，
 `reconstruct_video.py` tracker 模式调用）：某人只在某相机边缘露出一条时，人检测框被
 边界裁掉一半，姿态模型对看不见的另一半**外推**出完整骨架（中位 kp 置信 0.21/0.34、
@@ -148,6 +175,18 @@ bbox 高仅 128~168px vs 正常 190~405px，投回该视角差 95~290px），喂
 
 - `scripts/reconstruct_video.py` 每帧存 `frame_NNNNNN.npz`（vertices/joints/…）时**多写一次 `recon_faces.npy`**（13776×3 SMPL 拓扑，整段一次，`ensure_faces`）。
 - `scripts/visualize_recon.py <recon目录>` 弹出 Open3D 新渲染器窗口逐帧回放（`--watch` 重建进行中追帧；`--render T out.png` EGL 出 PNG；`--root` 指定含标定的项目根）。t 是主时钟帧号：no_person/失败帧清空人体，被 `--stride` 跳过帧保持上一姿态（`ReconTimeline`）。
+- **按 `v` 的真实画面叠加（`Recon2DOverlay`）**：从重建目录读 `pose2d.json`（**原始**
+  2D 姿态，下半身门不改它）/ `ball2d.json` / `pred_boxes.json`，配 `VideoSource` 取主时钟
+  帧，2×2 平铺。三件事：① **固定 4 格 + 每格标 `camN`**（缺帧画 `no frame (drop/misalign)`
+  占位块，见「录像」节 Q3）——否则缺一路后面几格前移，看着像相机接错；② 该相机该帧
+  **没检出人**时画**灰色虚线 `pred pN` 框**（卡尔曼预测位置，`draw_pred_box`；**纯显示**，
+  重建不读，红线①）；③ 实测框/骨架仍按原样画在**原始分辨率**图上再缩放。
+- **「看不出体型」不是渲染 bug（Q1 实测，2026-09-09）**：SMPL β **每人整段只估一次**
+  （top-5 置信帧，`select_shape_frames`；`OPT_SHAPE=False`，逐帧只拟合 θ/t），实测
+  2~718 帧 β 完全恒定、用存档 β 重算顶点与 npz 差 0.000mm。β 模长只有
+  **0.63(p0)/0.24(p1)**——25 个稀疏关键点只约束**肢体长度**，对胖瘦/肩宽/胸廓几乎无
+  约束（β 前几维才管体型），所以 mesh 与 points 两条路都只能给出「标准身材的这个人」。
+  要看出体型得加约束（轮廓项 / VPoser·HuMoR 密度先验），不是渲染端能修的。
 - **播放观感（三处曾踩的坑，2026-09）**：① 播放速度按**内容帧边界 pacing**——目标 = 录像真实出帧率（meta 里 period 反推，100fps 录制=实时），标题栏实时显示 `≈N帧/秒`；渲染跟不上自动掉帧不慢放，别用固定 sleep。② **必须 `widget.force_redraw()`**（每次换帧后）——否则场景变了事件流不保证重绘，观感一卡一卡/跳帧。③ 100Hz 拟合常单帧/两三帧 no_person 抖动 → `--hold-gaps`（默认 3≈30ms）：连续 no_person ≤N 帧保持上一姿态不清空（`ReconTimeline.hold_gaps`），否则人体高频闪没。
 - **GUI 播放 = 点云模式（2026-09-04 重构；用户拍板「只要点云就行」）**：Open3D 0.19 Filament 的 `Scene.update_geometry` **只收 PointCloud**；三角网格逐帧动画只能 remove+add，每次重挂留不可回收引擎级残留、~1 万次（实测 8k~11.5k ops）即段错误——旧的限频/对象池只能推迟到崩溃点（「播一段就停 / 干脆不播」的根因，GPU 渲染一直在跑、不是 CPU 软渲染）。修法：`ReconScene(mode=...)` 两条路——`mode="mesh"`（平滑三角网格）**只**用于 `render_still`（每次新建场景加一次、不累积）；`mode="points"`（`play_gui` 用，**mesh 默认参数不用动**）把人体表面（SMPL 顶点+每面质心 ≈20666 点）、地板影（顶点沿光水平投影、不透明深色点）、骨骼（关节连线等分点）、球（单点）、轨迹（逐采样点）全做成 `t.geometry.PointCloud`，**add 一次后每帧 `update_geometry` 原地改顶点缓冲 + `show_geometry` 切可见性**，全程 0 次 remove+add。实测 8 遍×714 帧播放（5712 次换帧）实体数恒 8（+0 churn）、RSS 平稳、中位换帧 7.7ms、无段错误 → 可无限长播。**⚠️ 别给场景里的 pcd 设 `.point.normals`**（normals 只 CPU 侧算法线烘焙用；设了会把云注册进别的低层入口 → update 报 `_Map_base::at`）。
 - **人体凸凹明暗 = 顶点色烘焙 `bake_body_shading`（defaultUnlit），不走 Filament 实时光照**：逐顶点 Lambert（`ambient=_BAKE_AMBIENT`+`key=_BAKE_KEY`×`max(n·光向,0)`），光从上方略偏左前来（`_KEY_LIGHT_FROM`，与假影太阳同侧）。朝光面≈肤色顶格、颌下/腋下/腹股沟等凹处法线背光自然暗一档 → 一眼看出身体起伏；纯 numpy 可单测。原因（EGL 实测，2026-09）：Filament **cast_shadows 不产真影**、fill/IBL 低强度无效；高 lux（~1e5）方向光**能出强漫反射**——旧结论「太阳定向光不生效」实为强度 1000 太小 + fill 用了 0.19 旧版参数序（color 位塞了方向向量），非平台限制。真影不可靠故地上阴影仍用程序化假影，明暗走烘焙，双保险。**影子两层都画在地板平面 `floor_z`（不是脚平面）**：重建 SMPL 脚底常悬空几 cm（142020 实测 median -0.713 vs floor -0.76），贴脚画盘会悬在地板上方成脱开深斑。① 接触椭圆 `contact_shadow_planes`（脚底核心深影）② 整身投影软影 `project_floor_shadow`+`convex_hull2d`（**纯 numpy 2D monotone-chain**，投影点全在同平面——open3d `compute_convex_hull` 会因退化抛 QH6154/每帧打 QH7089 精度告警刷屏；质心 apex 三角扇 CCW → 法线 +Z）——垂直俯视桌顶时人影被桌面挡住看不见（取景限制，侧视/低视角可见），这是物理遮挡不是 bug。透明材质必须显式 `shader="defaultLitTransparency"`——`base_color` alpha 默认不混合。
@@ -237,6 +276,15 @@ bbox 高仅 128~168px vs 正常 190~405px，投回该视角差 95~290px），喂
   真损失是编码侧 cam0 丢 23/cam3 丢 18（~5-7%，集中在 1.3~1.9s 一次 CPU 抢占，
   cam1/cam2 为 0）——逐帧 ts 的 >1 拍间隙是**编码丢最旧造成的写入断档**，不等于
   USB 丢脉冲。**离线重建不受影响**：脉冲号对齐天然容忍缺帧。
+- **20260908_161147 的逐相机缺帧已定位（Q3，2026-09-09）**：719 主时钟帧里
+  cam0/1/2/3 各有 0/24/22/28 帧缺帧（`fed_per_cam` 719/715/715/713，`encoder_dropped`
+  全 0、入队无 >35ms 空档、GetImageBuffer 超时 0）→ **是采集侧单拍丢**（USB/触发丢
+  脉冲），不是编码侧。逐相机相邻 ts 差/周期取整直方图几乎全是 1 拍（偶有 2~3 拍），
+  脉冲号累加与绝对取整零不一致；cam1 实测直接跳过脉冲 89（间隔正好 2.0000 周期）。
+  共 **51/719 拍至少缺一台相机**（7%）。回放里这表现为「某格空白」——
+  `Recon2DOverlay.tile()` 已改成**按 `src.cids` 固定 4 格**、缺帧画 `camN / no frame
+  (drop/misalign)` 占位块、每格左上角标 `camN`，否则缺一路会让后面几格整体前移、
+  看起来像「相机接错了」。
 - 命名按**逻辑相机号** `cam{cid}.mp4`（cid=标定 `cam_{cid}.yaml` 的号），与在线 EasyMocap
   一致；live_control 按 `v` / 面板「录像」按钮启停（`fps=100` 外部触发 / `30` 自由采集）。
 
@@ -381,6 +429,7 @@ MvCamera.MV_CC_Finalize()
 - [x] 录像离线重建的多人身份：`reconstruct_video.py --assoc tracker`（默认）走 `person_track.py` 阶段 A–D；每人的 SMPL 拟合视角 = 「曾看到该人的全部相机」（tracker 模式覆盖 `--person-groups`，后者只给人数/`--assoc fixed` 用）。
 - [x] 伪预测框自激漂移、根关节落到手腕、RANSAC 视角对兜底——见「多人跟踪 / 身份」节三条红线。
 - [ ] `person_track` 仍只跟踪**人数上限内**的人（`--max-people` / `--person-groups` 组数），新人进入不自动开新身份；`LOCAL_TRACK_MAX_MISSED`/`ROI_REDETECT_CONF` 未做参数化扫描。
+- [ ] ROI 小窗漏检（Q4 实测 36/515 无框帧，占人×相机帧 ~0.6%）：全图能检出、离预测 110px 中位，被 `roi_gate_px=120` 距离门 + 「框心必须落在小窗内」+ 尺寸门拒掉。放宽前**先做干净 A/B**（早期放宽被伪框路径污染、结论作废）；影响面小，暂不改默认。
 - [ ] 离线 tracker 模式的 EmFit 仍逐人顺序拟合；多人并行/共享初值未做。
 
 ### 录像 / 重建相关已踩坑

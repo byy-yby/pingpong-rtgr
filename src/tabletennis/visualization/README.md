@@ -9,6 +9,8 @@
 - `gray_to_bgr(image)`：黑白灰度图 → 3 通道 BGR（复制通道，不污染原数据）。
 - `draw_pose(image, pose)`：把单个 `Pose2D` 的骨骼连线 + 关键点画到 BGR 图上。
 - `draw_ball` / `draw_table`：画球（圆）/ 球桌（2D 角点多边形）。
+- `draw_pred_box(image, box, label="pred")`：**灰色虚线**矩形——回放里「该相机该帧
+  没检出人」时画卡尔曼预测框，一眼区分「预测」与实测的实线彩色框（纯显示，重建不读）。
 - `draw_table_model(image, table, R, t, K, dist)`：把标准尺寸球桌的 3D 线框（桌面边框 + 4 腿 + 球网）投影到图像。
 - `annotate_frame(image, poses, title=...)`：把一帧所有姿态画到灰度图，返回带标题的 BGR 图。
 - `tile_images(images, cols=2)`：把多张 BGR 图平铺成一格（4 路 → 2×2），缺处补黑。
@@ -33,6 +35,10 @@
   姿态伸长，默认开、`--no-cast` 关）。重建的 SMPL 脚底常悬空几 cm，影子钉在地板
   才是真「地上影」（贴脚画会悬空）。
 - 交互：Space 暂停/播放、←/→ 步进、Home/End、R 复位、-/= 调速、Esc 退出。
+- **按 `v` 的真实画面叠加**（`Recon2DOverlay`）：读重建目录的 `pose2d.json`（原始 2D
+  姿态）/ `ball2d.json` / `pred_boxes.json` + `VideoSource`，2×2 平铺。**按相机号固定
+  4 格**，缺帧画 `camN / no frame (drop/misalign)` 占位（否则缺一路后面几格前移，看着
+  像相机接错）；每格左上角标 `camN`；没检出人的相机画灰色虚线 `pred pN` 框。
 - 用法：`scripts/visualize_recon.py <recon目录>`（加 `--watch` 在重建进行中追帧，
   `--render T out.png` EGL 出图验证）。
 
