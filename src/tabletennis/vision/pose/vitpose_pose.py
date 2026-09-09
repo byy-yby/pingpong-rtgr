@@ -355,6 +355,26 @@ class ViTPosePoseDetector(PoseDetector):
             return []
         return self._detect_bgr_boxes(frame, bgr, boxes)
 
+    def detect_person_boxes(self, frame: Frame, *, conf_thresh: Optional[float] = None,
+                            roi=None, return_scores: bool = True):
+        """只跑人检测（不跑 ViTPose），返回 ``(boxes (M,4), scores (M,))`` 全图坐标。
+
+        ROI 引导重检测用：小窗口 + 低阈值（如 0.15）再检测一次，命中才值得跑姿态。
+        """
+        return self._det_person.detect(frame, conf_thresh=conf_thresh, roi=roi,
+                                       return_scores=return_scores)
+
+    def detect_on_boxes(self, frame: Frame, boxes) -> List[Pose2D]:
+        """对**指定的人框**跑 ViTPose（不重复做人检测）；框为全图像素坐标。"""
+        if frame.image is None or frame.image.size == 0:
+            return []
+        boxes = np.asarray(boxes, dtype=np.float32)
+        if boxes.ndim != 2 or len(boxes) == 0:
+            return []
+        bgr = (cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR)
+               if frame.image.ndim == 2 else frame.image)
+        return self._detect_bgr_boxes(frame, bgr, boxes)
+
     def detect_batch(self, frames: List[Frame]) -> List[List[Pose2D]]:
         """批处理多帧：人检测一次 batch，ViTPose 逐人逐帧。"""
         n = len(frames)

@@ -257,6 +257,110 @@ def test_match_people_fixed_glimpse_picks_consistent():
     assert np.linalg.norm(centroid[:2] - A[:2]) < 0.3
 
 
+def test_robust_point_best_pair_fallback():
+    """3 视角里一个观测偏 60px：另两个视角的解应被接受（回归 20260908_161147 骨盆丢失）。
+
+    旧逻辑要求「至少一对视角有 ≥2 内点」——两个好视角本身互差 >8px（真实像素噪声）时
+    一对也满足不了，于是**整条关节被丢弃**，卡尔曼观测随之丢失/漂移。
+    """
+    from tabletennis.reconstruction.triangulate import (
+        RobustTriangulationConfig, DEFAULT_ROBUST)
+
+    # 平行光轴机位：极线方向取决于**基线方向**——基线沿 X 的一对，对应点必须同 v；
+    # 基线沿 Y 的一对，必须同 u。这里让每一对都真的不自洽：
+    #   c0/c1 基线沿 X → 各偏 ∓12px 的 v（互差 24px，无法用深度解释）；
+    #   c0/c2 基线沿 Y → 让 c2 偏 60px 的 u（c0/c2 的 u 对不上）；
+    #   c1/c2 斜基线 → 已被上面两处偏移带偏 >100px。
+    # 于是**任何**视角对都凑不出 ≥2 内点 → 只能走 best-pair 兜底。
+    intrinsics, extrinsics = make_parallel_rig(
+        cam_centers=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    tri = MultiViewTriangulator(intrinsics, extrinsics)
+    X_gt = np.array([0.5, 0.5, 2.0])
+    shift = {0: np.array([0.0, 12.0]), 1: np.array([0.0, -12.0]),
+             2: np.array([60.0, 80.0])}
+    pts, confs = {}, {}
+    for cid in (0, 1, 2):
+        pts[cid] = tuple(project(X_gt, intrinsics, extrinsics, cid) + shift[cid])
+        confs[cid] = 0.9
+
+    # 阈值收紧到 2×thresh(8px) < 好视角对的自身残差(12px) 时退化为「拒绝」——证明成功
+    # 来自 best-pair 兜底，而不是普通 RANSAC 恰好挑到了两个好视角
+    assert tri.triangulate_point_robust(
+        pts, confs, cfg=RobustTriangulationConfig(ransac_thresh_px=4.0)) is None
+    assert tri.triangulate_point_robust(
+        pts, confs, cfg=RobustTriangulationConfig(ransac_thresh_px=8.0)) is not None
+    r = tri.triangulate_point_robust(pts, confs, cfg=DEFAULT_ROBUST)
+    assert r is not None
+    assert r.n_inliers == 2
+    assert np.linalg.norm(r.X - X_gt) < 0.15      # 两个好视角的解，量级正确
+    assert r.reproj_err < 15.0
+
+
+def make_pose26(X_gt, intrinsics, extrinsics, cid):
+    """构造 26 关节（halpe26 布局）Pose2D：骨盆 19 在 X_gt，双髋 11/12 分列两侧。"""
+    j3 = np.tile(np.asarray(X_gt, dtype=np.float64), (26, 1))
+    j3[11] += [-0.15, 0.0, 0.0]     # 左髋
+    j3[12] += [0.15, 0.0, 0.0]      # 右髋
+    j3[18] += [0.0, 0.0, 0.50]      # 颈
+    j3[17] += [0.0, 0.0, 0.70]      # 头
+    j3[5] += [-0.20, 0.0, 0.45]     # 左肩
+    j3[6] += [0.20, 0.0, 0.45]      # 右肩
+    j3[9] += [-0.25, 0.0, 0.10]     # 左腕（旧兜底会误选它）
+    j3[10] += [0.25, 0.0, 0.10]     # 右腕
+    j3[13] += [-0.15, 0.0, -0.45]   # 左膝
+    j3[14] += [0.15, 0.0, -0.45]    # 右膝
+    j3[15] += [-0.15, 0.0, -0.90]   # 左踝
+    j3[16] += [0.15, 0.0, -0.90]    # 右踝
+    kpts = np.zeros((26, 3), dtype=np.float32)
+    for j in range(26):
+        u, v = project(j3[j], intrinsics, extrinsics, cid)
+        kpts[j, :2] = [u, v]
+        kpts[j, 2] = 0.9
+    # 让双腕成为「置信度最高的关节」——旧兜底会把它当根关节
+    kpts[9, 2] = kpts[10, 2] = 0.99
+    return Pose2D(camera_id=cid, keypoints=kpts, skeleton="halpe26")
+
+
+def test_pose_root_never_falls_back_to_limb():
+    """骨盆不可三角化时用双髋中点合成根关节，绝不落到手腕/脚（回归自激漂移 bug）。"""
+    intrinsics, extrinsics = make_rig(
+        cam_centers=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        look_at=(0.5, 0.5, 2.0),
+    )
+    tri = MultiViewTriangulator(intrinsics, extrinsics)
+    X_gt = np.array([0.5, 0.5, 2.0])
+    obs = {cid: make_pose26(X_gt, intrinsics, extrinsics, cid) for cid in (0, 1, 2)}
+    # 骨盆在所有视角都不可信（模拟下身在桌后被遮挡）→ 关节 19 无法三角化
+    for cid in (0, 1, 2):
+        obs[cid].keypoints[19, 2] = 0.0
+
+    rob = tri.triangulate_pose_robust(obs)
+    assert rob.root_index == 19, f"根关节应为骨盆(19)，实际 {rob.root_index}"
+    assert np.isfinite(rob.skeleton.keypoints[19]).all()
+    # 合成的骨盆 ≈ 双髋中点，且在真值附近
+    hips = 0.5 * (rob.skeleton.keypoints[11] + rob.skeleton.keypoints[12])
+    assert np.linalg.norm(rob.skeleton.keypoints[19] - hips) < 1e-6
+    assert np.linalg.norm(rob.skeleton.keypoints[19] - X_gt) < 0.05
+    assert rob.root_index not in (9, 10)          # 不是手腕
+
+
+def test_pose_root_minus_one_when_no_torso():
+    """骨盆与双髋都不可用时 root_index = -1（调用方纯预测），不退化成四肢。"""
+    intrinsics, extrinsics = make_rig(
+        cam_centers=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        look_at=(0.5, 0.5, 2.0),
+    )
+    tri = MultiViewTriangulator(intrinsics, extrinsics)
+    X_gt = np.array([0.5, 0.5, 2.0])
+    obs = {cid: make_pose26(X_gt, intrinsics, extrinsics, cid) for cid in (0, 1)}
+    for cid in (0, 1):                      # 骨盆 + 双髋全部置零置信度
+        obs[cid].keypoints[[11, 12, 19], 2] = 0.0
+
+    rob = tri.triangulate_pose_robust(obs)
+    assert rob.root_index == -1
+    assert np.isfinite(rob.skeleton.keypoints[10]).all()   # 手腕仍在，但不做根
+
+
 def test_undistort_keypoints_passthrough():
     """无畸变（dist=0）时去畸变应近似恒等（仅主点附近精确）。"""
     K = np.array([[1000.0, 0.0, 320.0], [0.0, 1000.0, 240.0], [0.0, 0.0, 1.0]])

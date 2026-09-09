@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import itertools
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -40,6 +41,53 @@ DEFAULT_MIN_CONF = 0.3
 DEFAULT_MAX_REPROJ_PX = 12.0
 # 交会角低于该值（度）判定几何退化（两相机近共线），深度不可靠，放弃该关键点。
 DEFAULT_MIN_ANGLE_DEG = 8.0
+
+
+# ----------------------------------------------------------------------
+# 阶段 D：置信度加权鲁棒三角化（RANSAC + 协方差）
+# ----------------------------------------------------------------------
+@dataclass
+class RobustTriangulationConfig:
+    """鲁棒三角化参数（阶段 D）。
+
+    默认值即用户方案里的常量：``kpt_conf < 0.2`` 的观测丢弃、
+    ``cam_weight < 0.1`` 的相机整体忽略、RANSAC 内点阈值 8px。
+    """
+    kpt_ignore_thresh: float = 0.2     # KPT_IGNORE_THRESH
+    cam_ignore_thresh: float = 0.1     # CAM_IGNORE_THRESH
+    ransac_thresh_px: float = 8.0      # RANSAC_THRESH_PX
+    min_angle_deg: float = DEFAULT_MIN_ANGLE_DEG
+    max_pair_trials: int = 12          # N 大时抽样多少个视角对（N≤5 时全枚举）
+    min_cam_weight: float = 0.05       # cam_weight 下限，避免除零/全零
+
+
+DEFAULT_ROBUST = RobustTriangulationConfig()
+
+# halpe26 里身体中线上的根关节：骨盆 = 19，双髋 = 11 / 12。
+# 骨盆不可用时用双髋中点合成（见 ``triangulate_pose_robust``），不换语义、不落到四肢。
+_HIP_INDEX = (11, 12)
+
+
+@dataclass
+class RobustPoint3D:
+    """单点鲁棒三角化结果。"""
+    X: np.ndarray          # (3,) 世界坐标
+    conf: float            # 综合置信度 = 内点率 × 平均权重 × 几何因子 / 误差衰减
+    reproj_err: float      # 内点平均重投影误差（像素）
+    n_inliers: int
+    n_views: int           # 参与筛选的观测数（N）
+    angle_deg: float
+    cov: np.ndarray        # (3,3) 位置协方差（世界系，米²）
+
+
+@dataclass
+class RobustPose3D:
+    """整具骨架的鲁棒三角化结果（阶段 D 输出）。"""
+    skeleton: Skeleton3D
+    cov: np.ndarray            # (J,3,3) 每关节位置协方差
+    inlier_ratio: np.ndarray   # (J,) 内点数 / 有效观测数
+    root_cov: np.ndarray       # (3,3) 根关节（骨盆）协方差，喂卡尔曼 R
+    root_index: int            # 根关节下标（halpe26 的 19=骨盆；-1=未找到）
 
 
 def undistort_keypoints(
@@ -105,9 +153,42 @@ class MultiViewTriangulator:
     # 几何工具
     # ------------------------------------------------------------------
     def project(self, cid: int, X: np.ndarray) -> np.ndarray:
-        """世界点 ``X`` (3,) -> 该相机无畸变像素坐标 (2,)。"""
+        """世界点 ``X`` (3,) -> 该相机无畸变像素坐标 (2,)。
+
+        ⚠️ 与 :meth:`reproj` / :meth:`_dlt` 同一坐标口径（**无畸变**）。要和原始
+        图像像素（画框、开 ROI 小窗）打交道时用 :meth:`project_distorted`。
+        """
         x = self.P[cid] @ np.append(np.asarray(X, dtype=np.float64), 1.0)
         return x[:2] / x[2]
+
+    def undistort_points(self, cid: int, uv) -> Optional[np.ndarray]:
+        """原始（带畸变）像素坐标 -> 无畸变像素坐标 (2,)。非法输入返回 None。"""
+        if cid not in self.K:
+            return None
+        pts = np.asarray(uv, dtype=np.float32).reshape(1, 1, 2)
+        try:
+            out = cv2.undistortPoints(pts, self.K[cid], self.dist[cid], P=self.K[cid])
+        except cv2.error:
+            return None
+        out = np.asarray(out, dtype=np.float64).reshape(2)
+        return out if np.isfinite(out).all() else None
+
+    def project_distorted(self, cid: int, X: np.ndarray) -> Optional[np.ndarray]:
+        """世界点 ``X`` (3,) -> 该相机**原始（带畸变）像素坐标** (2,)。
+
+        用于把卡尔曼预测位置落到真实图像上（开 ROI 小窗、画预测框）。
+        """
+        if cid not in self.K:
+            return None
+        uv = self.project(cid, X)
+        norm = np.linalg.inv(self.K[cid]) @ np.array([uv[0], uv[1], 1.0])
+        try:
+            out, _ = cv2.projectPoints(norm.reshape(1, 1, 3), np.zeros(3),
+                                       np.zeros(3), self.K[cid], self.dist[cid])
+        except cv2.error:
+            return None
+        out = np.asarray(out, dtype=np.float64).reshape(2)
+        return out if np.isfinite(out).all() else None
 
     def reproj(self, cid: int, X: np.ndarray, uv) -> float:
         """单视角重投影误差（像素）：世界点 X 投影到相机 cid 与观测 uv 的距离。"""
@@ -399,6 +480,264 @@ class MultiViewTriangulator:
             n_views=nviews,
             reproj_err=rerr,
         )
+
+
+    # ------------------------------------------------------------------
+    # 阶段 D：鲁棒三角化（RANSAC + 协方差）
+    # ------------------------------------------------------------------
+    def _point_covariance(self, views: List[int], X: np.ndarray,
+                          points: Dict[int, Tuple[float, float]],
+                          weights: Dict[int, float]) -> np.ndarray:
+        """位置协方差 ``(3,3)``：重投影雅可比的加权最小二乘协方差。
+
+        ``cov = σ² (Jᵀ W J)⁻¹``，``σ² = rᵀ W r / (2N − 3)``——与「观测噪声越大、
+        视角几何越差，协方差越大」一致，直接喂卡尔曼观测噪声 R。
+        """
+        rows: List[np.ndarray] = []
+        res: List[float] = []
+        wv: List[float] = []
+        Xh = np.append(np.asarray(X, dtype=np.float64), 1.0)
+        for cid in views:
+            Pi = self.P[cid]
+            p = Pi @ Xh
+            z = float(p[2])
+            if abs(z) < 1e-12:
+                continue
+            x, y = (float(v) for v in points[cid])
+            # d(u,v)/dX = (P0 − u·P2 ; P1 − v·P2)[:3] / z
+            rows.append((Pi[0, :3] - (p[0] / z) * Pi[2, :3]) / z)
+            rows.append((Pi[1, :3] - (p[1] / z) * Pi[2, :3]) / z)
+            res.append(p[0] / z - x)
+            res.append(p[1] / z - y)
+            w = float(weights.get(cid, 1.0))
+            wv.extend((w, w))
+        if len(rows) < 4:
+            return np.eye(3, dtype=np.float64) * np.nan
+        J = np.asarray(rows, dtype=np.float64)
+        r = np.asarray(res, dtype=np.float64)
+        w = np.asarray(wv, dtype=np.float64)
+        JtWJ = J.T @ (J * w[:, None])
+        dof = max(len(r) - 3, 1)
+        sigma2 = float((w * r * r).sum() / dof)
+        try:
+            cov = np.linalg.inv(JtWJ) * sigma2
+        except np.linalg.LinAlgError:
+            cov = np.linalg.pinv(JtWJ) * sigma2
+        if not np.isfinite(cov).all():
+            return np.eye(3, dtype=np.float64) * np.nan
+        return cov
+
+    def triangulate_point_robust(
+        self,
+        points: Dict[int, Tuple[float, float]],
+        confs: Dict[int, float],
+        cam_weights: Optional[Dict[int, float]] = None,
+        decay: Optional[Dict[int, float]] = None,
+        cfg: Optional[RobustTriangulationConfig] = None,
+    ) -> Optional[RobustPoint3D]:
+        """阶段 D：单个关键点的置信度加权鲁棒三角化（输入为**无畸变**像素坐标）。
+
+        流程（与用户方案一致）：
+          1. 丢弃 ``conf < cfg.kpt_ignore_thresh`` 的观测与 ``cam_weight <
+             cfg.cam_ignore_thresh`` 的相机，剩余 N 个观测；
+          2. N<2 → 返回 None（该关节不可用，由调用方用卡尔曼预测/上帧插值补）；
+          3. N==2 → 加权 DLT（``w_i = kpt_conf_i · cam_weight_i · decay_i``）；
+          4. N≥3 → RANSAC：枚举（或抽样）视角对三角化 → 其余视角重投影，
+             误差 < ``cfg.ransac_thresh_px`` 记内点；取内点最多、均误差最小的解，
+             再用全部内点做加权 DLT 精修（含一次内点重选）。
+
+        Returns:
+            :class:`RobustPoint3D` 或 None。
+        """
+        cfg = cfg or DEFAULT_ROBUST
+        cw = cam_weights or {}
+        dc = decay or {}
+        views: List[int] = []
+        w: Dict[int, float] = {}
+        for cid, uv in points.items():
+            if cid not in self.P:
+                continue
+            c = float(confs.get(cid, 0.0))
+            uv_arr = np.asarray(uv, dtype=np.float64)
+            if c < cfg.kpt_ignore_thresh or not np.isfinite(uv_arr).all():
+                continue
+            w_cam = float(cw.get(cid, 1.0))
+            if w_cam < cfg.cam_ignore_thresh:
+                continue
+            views.append(cid)
+            w[cid] = c * max(w_cam, cfg.min_cam_weight) * float(dc.get(cid, 1.0))
+        n_views = len(views)
+        if n_views < 2:
+            return None
+
+        if n_views == 2:
+            inliers = list(views)
+            X = self._dlt(inliers, points, w)
+            if X is None:
+                return None
+        else:
+            pairs = list(itertools.combinations(views, 2))
+            if len(pairs) > cfg.max_pair_trials:
+                rng = np.random.default_rng(0)
+                sel = rng.choice(len(pairs), size=cfg.max_pair_trials, replace=False)
+                pairs = [pairs[i] for i in sel]
+            best_score = None
+            best_inliers: List[int] = []
+            for pair in pairs:
+                Xt = self._dlt(list(pair), points, w)
+                if Xt is None:
+                    continue
+                errs = {c: self.reproj(c, Xt, points[c]) for c in views}
+                inl = [c for c in views if errs[c] <= cfg.ransac_thresh_px]
+                if len(inl) < 2:
+                    continue
+                score = (len(inl), -float(np.mean([errs[c] for c in inl])))
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_inliers = inl
+            if best_score is None:
+                # 没有任何视角对满足「≥2 内点」：N=3 时只要**一个**视角偏差 >8px 就会这样，
+                # 但剩下两个一致视角的解往往就是正确答案。退化为「最优视角对」——取两视角
+                # 残差最大值最小的一对，且该最大值 ≤ 2×阈值 才接受（保留防线）。
+                # 实测 20260908_161147 f17/f18 骨盆：c0/c3 互相一致（残差 8.3/6.9px）、
+                # c1 偏 65px → 旧逻辑返回 None → 根关节丢失 → 卡尔曼观测漂移。
+                best_pair = None
+                best_key = None
+                for pair in pairs:
+                    Xt = self._dlt(list(pair), points, w)
+                    if Xt is None:
+                        continue
+                    e = [self.reproj(c, Xt, points[c]) for c in pair]
+                    if not all(np.isfinite(v) for v in e):
+                        continue
+                    key = (max(e), float(np.mean(e)))
+                    if key[0] <= 2.0 * cfg.ransac_thresh_px and (best_key is None or key < best_key):
+                        best_key = key
+                        best_pair = (list(pair), Xt)
+                if best_pair is None:
+                    return None
+                best_inliers, X = best_pair
+            else:
+                X = self._dlt(best_inliers, points, w)
+            if X is None:
+                return None
+            # 一次内点重选 + 精修（对精修解再筛一轮，去掉被拉偏的观测）
+            errs = {c: self.reproj(c, X, points[c]) for c in views}
+            inliers = [c for c in views if errs[c] <= cfg.ransac_thresh_px]
+            if len(inliers) >= 2 and set(inliers) != set(best_inliers):
+                X2 = self._dlt(inliers, points, w)
+                if X2 is not None:
+                    X = X2
+            if len(inliers) < 2:
+                inliers = best_inliers
+
+        errs = {c: self.reproj(c, X, points[c]) for c in inliers}
+        err = float(np.mean(list(errs.values())))
+        angle = self._max_angle_deg(X, inliers)
+        if angle < cfg.min_angle_deg:
+            return None
+
+        w_used = np.asarray([w[c] for c in inliers], dtype=np.float64)
+        w_norm = float(w_used.mean() / max(w_used.max(), 1e-12))
+        geo = 0.5 + 0.5 * float(np.clip(angle / 90.0, 0.0, 1.0))
+        conf = float(np.clip((len(inliers) / n_views) * w_norm * geo
+                             / (1.0 + err / 8.0), 0.0, 1.0))
+        return RobustPoint3D(
+            X=np.asarray(X, dtype=np.float64),
+            conf=conf,
+            reproj_err=err,
+            n_inliers=len(inliers),
+            n_views=n_views,
+            angle_deg=angle,
+            cov=self._point_covariance(inliers, X, points, w),
+        )
+
+    def triangulate_pose_robust(
+        self,
+        observations: Dict[int, Pose2D],
+        cam_weights: Optional[Dict[int, float]] = None,
+        decay: Optional[Dict[int, float]] = None,
+        cfg: Optional[RobustTriangulationConfig] = None,
+        root_index: int = 19,
+    ) -> RobustPose3D:
+        """阶段 D：整具骨架的鲁棒三角化（逐关键点 :meth:`triangulate_point_robust`）。
+
+        Args:
+            observations: ``{cam_id: Pose2D}``，同一人在各相机的 2D 观测（halpe26）。
+            cam_weights: ``{cam_id: 相机权重}``（阶段 C 的 ``w_cam`` 或在线固定权重）。
+            decay: ``{cam_id: 误差衰减因子}``（per-camera ``per_cam_error_ema``）。
+            root_index: 根关节下标（halpe26 骨盆=19），其协方差作为 ``root_cov``。
+
+        Returns:
+            :class:`RobustPose3D`；无有效观测时骨架为空。
+        """
+        if not observations:
+            empty = Skeleton3D(keypoints=np.zeros((0, 3)), confidence=np.zeros(0),
+                               skeleton="coco17")
+            return RobustPose3D(skeleton=empty, cov=np.zeros((0, 3, 3)),
+                                inlier_ratio=np.zeros(0),
+                                root_cov=np.eye(3), root_index=-1)
+
+        skeleton = next(iter(observations.values())).skeleton
+        n_joints = max(len(obs.keypoints) for obs in observations.values())
+
+        undist: Dict[int, np.ndarray] = {}
+        for cid, obs in observations.items():
+            if cid not in self.P:
+                continue
+            undist[cid] = undistort_keypoints(obs.keypoints, self.K[cid], self.dist[cid])
+
+        kp3 = np.full((n_joints, 3), np.nan, dtype=np.float64)
+        conf3 = np.zeros(n_joints, dtype=np.float64)
+        nviews = np.zeros(n_joints, dtype=np.int32)
+        rerr = np.full(n_joints, np.nan, dtype=np.float64)
+        cov = np.full((n_joints, 3, 3), np.nan, dtype=np.float64)
+        ratio = np.zeros(n_joints, dtype=np.float64)
+        for j in range(n_joints):
+            pts: Dict[int, Tuple[float, float]] = {}
+            cs: Dict[int, float] = {}
+            for cid, kps in undist.items():
+                if j >= len(kps) or not np.isfinite(kps[j, :2]).all():
+                    continue
+                pts[cid] = (float(kps[j, 0]), float(kps[j, 1]))
+                cs[cid] = float(kps[j, 2])
+            r = self.triangulate_point_robust(pts, cs, cam_weights=cam_weights,
+                                              decay=decay, cfg=cfg)
+            if r is None:
+                continue
+            kp3[j] = r.X
+            conf3[j] = r.conf
+            nviews[j] = r.n_inliers
+            rerr[j] = r.reproj_err
+            cov[j] = r.cov
+            ratio[j] = r.n_inliers / max(r.n_views, 1)
+
+        # 根关节：优先 root_index（骨盆 19）。骨盆三角化失败时用**双髋中点合成**骨盆
+        # （同一语义点，避免卡尔曼状态跳变）；连双髋都没有则 ``root_index=-1``
+        # → 调用方走纯预测（不更新观测），并由 misses 计数触发下一次全图检测。
+        #
+        # ⚠️ 绝不用「置信度最高的关节」兜底：那会把卡尔曼的观测从骨盆换成手腕/脚。
+        # 实测 20260908_161147 f18：c1 骨盆观测与 c0/c3 差 65px → 骨盆三角化被 RANSAC
+        # 丢弃 → 旧兜底选到右腕(10) → 卡尔曼观测瞬移 0.5m、根速度反向 → 下一帧预测框
+        # 跟着漂 → ViTPose 按漂移框出姿态 → 自激回路，10 帧内 z 漂到 −0.58m（地下）。
+        ri = root_index if 0 <= root_index < n_joints else -1
+        if ri >= 0 and not np.isfinite(kp3[ri]).all():
+            h1, h2 = _HIP_INDEX
+            if h2 < n_joints and np.isfinite(kp3[h1]).all() and np.isfinite(kp3[h2]).all():
+                kp3[ri] = 0.5 * (kp3[h1] + kp3[h2])
+                conf3[ri] = float(min(conf3[h1], conf3[h2]))
+                nviews[ri] = int(min(nviews[h1], nviews[h2]))
+                rerr[ri] = float(np.nanmean([rerr[h1], rerr[h2]]))
+                ratio[ri] = float(min(ratio[h1], ratio[h2]))
+                if np.isfinite(cov[h1]).all() and np.isfinite(cov[h2]).all():
+                    cov[ri] = 0.5 * (cov[h1] + cov[h2])
+            else:
+                ri = -1
+        skel = Skeleton3D(keypoints=kp3, confidence=conf3, skeleton=skeleton,
+                          n_views=nviews, reproj_err=rerr)
+        root_cov = cov[ri] if ri >= 0 and np.isfinite(cov[ri]).all() else np.eye(3)
+        return RobustPose3D(skeleton=skel, cov=cov, inlier_ratio=ratio,
+                            root_cov=root_cov, root_index=ri)
 
 
 def load_camera_rig(root: Optional[str] = None):

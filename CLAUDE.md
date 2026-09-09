@@ -15,7 +15,7 @@
   **人检测默认换 `yolo11n-gray`**（1ch 灰度原生），见「人检测」节。
 - **球检测** `vision/ball/` —— 三条路线都实现：经典 CV、YOLO（yolov8n）、灰度 yolo11n（1ch）。
 - **球 3D 重建** `reconstruction/ball.py` + `scripts/reconstruct_ball.py` + live_control 按 b —— 三角化 + 红球渲染。
-- **姿态 2D→3D 重建** `reconstruction/triangulate.py`（置信度加权多视角 DLT，已向量化）+ `associate.py`（跨视角匹配）+ `pose_track.py`（PoseTracker 身份跟踪）。
+- **姿态 2D→3D 重建** `reconstruction/triangulate.py`（置信度加权多视角 DLT，已向量化）+ `associate.py`（跨视角匹配）+ `person_track.py`（**阶段 A–D 多人跟踪/身份**，宽视野一相机多人，见「多人跟踪」节）。`pose_track.py::PoseTracker` 是旧的单相机时序身份跟踪，已被 person_track 取代。
 - **相机标定** 内参（棋盘格张正友）+ 外参（ChArUco 板 `compute_relative_extrinsics`）+ 桌面定原点（4 大 ArUco 标记）。
 - **球桌识别 + 场景可视化** `vision/table/` + `viewer3d.py`（相机视锥 + 球桌 + 骨架 + 球图层）。
 - **TensorRT 全链路部署** 姿态 YOLOX + RTMPose 已上 TRT FP16，球 YOLO 也上 TRT。
@@ -74,6 +74,68 @@
 - 最差视角重投影 >12px 时逐点回退到 `triangulate_point`（保证与旧输出一致，坐标差 1e-12mm 级）。
 - `mean_conf` 曾用 `conf.sum()` 把遮挡相机置信度也算进去 → 改只对有效视角取均值（差分测试抓到的真 bug）。
 - 单球无需跨视角匹配（每相机最多 0/1 检测，直接 `{cam_id: Ball2D}` 喂三角化）；`associate.py::match_people` 只用于多人姿态。
+
+### 多人跟踪 / 身份：`person_track.py`（阶段 A–D，2026-09-08 起默认）
+
+换广角镜头后**一台相机能同时拍到近/远两人**，「每相机只拍一个人」的旧前提失效，
+`match_people_fixed`（固定分组 `[[0,2],[1,3]]`）逐帧挑错致 3D 骨架身份闪跳。
+现走 `MultiPersonTracker.step(frame_idx, frames, time_s)` 四阶段（离线
+`reconstruct_video.py --assoc tracker` 默认、在线 live_control 同一实现；
+`--assoc fixed` 保留旧路线回退）：
+
+- **阶段 A（单相机局部跟踪）**：每相机独立，IoU + 质心最近邻接本帧检测到该相机
+  已有 `local_track_id`（命中重置 `missed_frames`）；新检测开新 id，漏检轨迹
+  `missed_frames += 1`，超 `LOCAL_TRACK_MAX_MISSED=10` 删除。**ROI 引导重检测**
+  只对「漏检的活跃轨迹」触发：用其卡尔曼预测 3D 位置投到该相机
+  （**`project_distorted`**，原始像素）开小窗，边长 = 该人最近 bbox 对角线 ×2
+  （缺失时 300px），窗内以 `ROI_REDETECT_CONF=0.15` 重跑人检测；命中→全图坐标 +
+  `source="roi_redetect"`，未命中→`source="predicted_only"`（**不参与三角化**）。
+  每 `FULL_DETECT_INTERVAL=30` 帧强制全图检测。同一相机本帧的多个小窗结果**合并成
+  一次** `LocalCameraTracker.update`（逐轨迹分别调会把别人的局部轨迹当漏检反复计数）。
+- **阶段 B（世界系 3D 卡尔曼）**：`x=[p,v]∈R⁶` 匀速模型，观测 = 本帧鲁棒三角化的
+  **根关节**，`R` = 三角化协方差 + 基础观测噪声（上限 `obs_max_std`）。
+- **阶段 C（跨相机身份关联）**：人少时**枚举**分配方案，代价
+  `E = Σ_轨迹 Σ_分配到该轨迹的相机 w_cam·‖重投影根 − 检测中心‖²`，
+  `w_cam = bbox_conf × mean(kpt_conf)`；只有 `E(best) < E(上一帧)·(1−SWITCH_MARGIN)`
+  才切换（`SWITCH_MARGIN=0.2`），抑身份抖动。
+- **阶段 D（逐关键点鲁棒三角化）**：`triangulate_point_robust`（RANSAC + 加权 DLT）。
+
+**三条实测踩过的红线**（有回归测试锁定，改前先看）：
+
+1. **绝不用「卡尔曼预测框」当伪检测**。非全图帧曾把预测框喂人检测器 → 图像里未必
+   有那个人，姿态凭空生成 → 三角化又「确认」预测 → **3D→框→姿态→3D 自激回路**，
+   实测根关节 10 帧漂到 1.5m 外、z 到 −0.58m（地下）。现在帧间观测**只**来自 ROI
+   小窗里真实图像上的 YOLO 检测（`dets[cid]=[]`，见 `step()`）。
+2. **根关节绝不回退到四肢**。骨盆（halpe26 #19）三角化失败 → 用**双髋中点**合成
+   骨盆（同语义点，不跳变）；双髋也没有 → `root_index=-1`（本帧不更新观测、纯预测、
+   `misses+=1` 触发全图检测）。曾用「置信度最高的关节」兜底 → 选到**右手腕(10)** →
+   卡尔曼观测瞬移 0.5m、速度反向（`triangulate.py::triangulate_pose_robust` 里的
+   `_HIP_INDEX=(11,12)`）。
+3. **畸变口径别混**：`MultiViewTriangulator._dlt/reproj/project` 吃**无畸变**像素；
+   ROI 开窗、`anchor_2d`/`box_offset`/`last_bbox` 是**原始畸变**像素
+   （`project_distorted`）。用错会致 ROI 偏出真实人（本机 1440×1080 畸变 ~20px 量级）。
+
+**RANSAC 兜底（阶段 D 补丁）**：N≥3 时旧逻辑要求「某视角对 ≥2 内点」，但真实像素噪声下
+两个好视角本身可互差 ~8px → **一对都满足不了 → 整条关节被丢弃**（实测 20260908_161147
+f17/f18 骨盆：c0/c3 互差 8.3/6.9px 一致、c1 偏 65px）。现退化取「最优视角对」——
+两视角残差最大值最小、且 ≤2×阈值（`2*ransac_thresh_px`=16px）才接受，随后正常精修。
+
+**实测（session 20260908_161147，200 帧 2 人，4 相机）**：`root_index==19` 196/199 帧
+（其余 `-1`）、相邻帧根跳变中位 **0.40/1.96cm**、max 5.0/12.1cm、**>30cm 的帧数 0**
+（伪框时代是 29.8~33.7cm）；观测来源 **100% `roi_redetect`/`detect`**（无 `predicted`）。
+残留的大骨盆残差集中在 c1/c2 的 24~58px——是**姿态质量**问题（人在桌边、下半身被桌子
+挡住），不是追踪/标定：同一人在空旷处走（f150）四相机骨盆一致到 3.3~5.8px。
+`roi_gate_px=120, roi_gate_ratio=0.0` 为当前默认（**注意**：早期 A/B 曾判它「更差」，
+那次对比被伪框路径污染；新架构下 PX120 的跳变统计与 c0 骨盆残差都更好）。
+
+**SMPL 拟合视角要去掉「画面边缘只露半截」的相机**（`person_track.select_fit_views`，
+`reconstruct_video.py` tracker 模式调用）：某人只在某相机边缘露出一条时，人检测框被
+边界裁掉一半，姿态模型对看不见的另一半**外推**出完整骨架（中位 kp 置信 0.21/0.34、
+bbox 高仅 128~168px vs 正常 190~405px，投回该视角差 95~290px），喂进多视角拟合会明显
+拉偏。判据：该相机上此人 bbox 贴边（任一边距边界 ≤3px）的帧数 ≥50% 出场帧即丢弃；
+筛完不足 2 台则回退出场最多的 2 台。实测（20 帧 batch）：p0 丢 c3、p1 丢 c2 后
+重投影误差中位 **36.7px → 18.7px**，且每人仍有 3 视角（`--assoc fixed` 只用 2 视角
+得 10.5px，但那是欠约束的 2 视角拟合，不是更准）。
 
 ### 可视化 `viewer3d.py`（Open3D）
 
@@ -192,6 +254,11 @@
   （2026-09-09 实测该源 master 带 mv1p / `smooth_Rh` 补丁，不是纯官方 upstream）。
 - 默认档位 `--config stream`（EmFit 热启动 ~2.1s/帧）；`--fake-poses` 注入合成站姿人跑
   整条 录制→对齐→检测→拟合→存档 管道，无硬件/无真人视频也能验证与计时。
+- **多人身份默认走阶段 A–D 跟踪**（`--assoc tracker`，见「多人跟踪 / 身份」节）；
+  `--person-groups` 退化为「人数 + 每人的 home 视角（拟合投影用）」，不再当身份依据。
+  tracker 模式把人**曾出现过的全部相机**都作为该人的拟合视角。
+- **SMPL β 只用置信度最高的 `--shape-top-k` 帧**（默认 5，`select_shape_frames`）——
+  整段一次估计，之后逐帧只拟合姿态/平移；`0` = 官方原版用全部帧。
 - 实测单帧真机开销：检测不在此列；EmFit stream ~2.1s、official cold ~6.2s（GPU 5080）——
   即**放弃实时（100fps 视频离线跑）是必然选择**。
 - 四元数默认不上报（0x51 寄存器读响应同 0x71 帧；当前用角度 + 磁力计寄存器读即可）。
@@ -311,7 +378,10 @@ MvCamera.MV_CC_Finalize()
 - [ ] YOLOX decode+NMS 上 GPU（`_yolox_decode_batch` numpy CPU 3.7ms → <0.5ms，零精度损失）。
 - [ ] 姿态最大机会：Fixed ROI（半固定机位砍掉整个 YOLOX 段 ~12ms + 删 match_people）未做；RTMO one-stage 候选。
 - [x] YOLOX 动态 batch 重导出（`export_yolox_dynamic_batch.py` 纯 PyTorch 重建，输出 `(B,3549,85)` 不烤 NMS）；三个坑：不烤 /255（humanart 训练吃 0-255）、decode 用 cell 左上角（center=(delta+grid)×stride 不加 0.5）、TRT profile min1/opt4/max8。
-- [ ] 录像离线重建目前每相机取最高置信度一人（`reconstruct_video.py`，与 live_control 在线一致）；多人离线（match_people 或逐人 EmFit）未串。
+- [x] 录像离线重建的多人身份：`reconstruct_video.py --assoc tracker`（默认）走 `person_track.py` 阶段 A–D；每人的 SMPL 拟合视角 = 「曾看到该人的全部相机」（tracker 模式覆盖 `--person-groups`，后者只给人数/`--assoc fixed` 用）。
+- [x] 伪预测框自激漂移、根关节落到手腕、RANSAC 视角对兜底——见「多人跟踪 / 身份」节三条红线。
+- [ ] `person_track` 仍只跟踪**人数上限内**的人（`--max-people` / `--person-groups` 组数），新人进入不自动开新身份；`LOCAL_TRACK_MAX_MISSED`/`ROI_REDETECT_CONF` 未做参数化扫描。
+- [ ] 离线 tracker 模式的 EmFit 仍逐人顺序拟合；多人并行/共享初值未做。
 
 ### 录像 / 重建相关已踩坑
 - [x] `np.savez_compressed` 返回 None（无 `.close()`）；编码 mp4v 跟不上 100fps（噪声 ~44fps/路）→ 换 ffmpeg h264_nvenc（yuv420p 直喂免 swscale，4 路 ~168fps/路、满压丢 0）——见「录像 + 离线重建」节。

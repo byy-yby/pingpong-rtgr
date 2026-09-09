@@ -22,10 +22,19 @@
   warm     = EmFit 热启动 ftol 5e-4 / maxiters 40（约 x1.8，误差≈官方）
   stream   = EmFit 热启动 ftol 1.5e-3 / maxiters 25（约 x2.3，误差略优于官方）
 
-多人识别：``--person-groups "[[0,2],[1,3]]"`` 每个组=一个人（组内相机拍同一个人，
-组下标=身份，仿 live_control 按 P 的 match_people_fixed）。换广角镜头后每相机可能
-同时框到近/远两人，匹配前用 keep_nearest_person 每相机只留最近（bbox 最大）的那一个，
-把远处/对面的人排除。单人用 ``--person-groups "[[1,3]]"``（只放拍人的那组相机）。
+多人识别 ``--assoc``（默认 tracker）
+  tracker = 阶段 A–D 多人跟踪（``reconstruction/person_track.py``）：每相机独立局部跟踪
+            （IoU + 质心最近邻）→ 世界系 3D 卡尔曼 → 逐帧「枚举分配 + 重投影误差最小」
+            跨相机关联（带切换余量）→ 置信度加权鲁棒三角化（RANSAC）。宽视野下每台
+            相机可同时拍到近/远两人；某人某相机漏检时用预测位置开 ROI 小窗、按
+            ``--roi-conf`` 低阈值重检测找回。人数上限 = ``--person-groups`` 的组数
+            （或 ``--max-people``）。3D 关键点默认用阶段 D 鲁棒结果覆盖官方
+            ``batch_triangulate``（``--no-robust-kp3d`` 关掉）。
+  fixed   = 旧路线：``match_people_fixed`` 固定相机分组（``--person-groups "[[0,2],[1,3]]"``，
+            组内相机拍同一个人、组下标=身份），每相机只留最近（bbox 最大）的那一个——
+            前提是每相机只拍到一个人。单人用 ``--person-groups "[[1,3]]"``。
+
+SMPL β 只用置信度最高的 ``--shape-top-k`` 帧估计（默认 5，0=官方原版用全部帧）。
 ``--det-conf`` 人检测阈值（默认 0.2）、
 ``--fit-conf`` 拟合关键点阈值（默认 0.15）——黑衣服/低亮度人关键点置信度偏低，
 阈值太高会把 2D 已检出的关节在 3D 拟合里丢掉，致其退化成均值模型。
@@ -41,7 +50,7 @@
   --no-ball          跳过球轨迹重建。
   --ball-detector    球检测路线：yolo（默认，自动用 ball_gray/weights/best.onnx）/ classical。
   --ball-model       显式指定 YOLO 球 ONNX 路径（覆盖 yolo 的自动查找）。
-  --ball-min-conf    球三角化最低置信度（默认 0.3）。
+  --ball-min-conf    球三角化最低置信度（默认 0.15）。
 """
 from __future__ import annotations
 
@@ -158,7 +167,25 @@ def build_args():
     ap.add_argument("--vposer-ckpt", default=None,
                     help="VPoser checkpoint 路径（默认 VPOSER_CKPT 环境变量或 easymocap.DEFAULT_VPOSER_CKPT）")
     ap.add_argument("--person-groups", default="[[0,2],[1,3]]",
-                    help="相机分组 JSON：每个组=一个人，组内相机拍同一个人（组下标=身份）")
+                    help="相机分组 JSON：每个组=一个人（--assoc fixed 时组内相机拍同一个人、组下标=身份；"
+                         "--assoc tracker 时只用于确定人数与每人的 home 视角）")
+    ap.add_argument("--assoc", choices=["tracker", "fixed"], default="tracker",
+                    help="跨相机身份关联：tracker=阶段 A–D 多人跟踪（默认，宽视野一相机多人可用）/ "
+                         "fixed=旧的 match_people_fixed 固定相机分组（需每相机只拍到一个人）")
+    ap.add_argument("--max-people", type=int, default=0,
+                    help="tracker 模式最多同时跟踪几个人（0=按 --person-groups 的人数）")
+    ap.add_argument("--full-detect-interval", type=int, default=30,
+                    help="tracker：每 N 帧强制一次全图检测（其余帧只在「漏检的活跃轨迹」上"
+                         "开 ROI 小窗重检测；**不用**预测框当伪检测，否则会自激漂移）")
+    ap.add_argument("--roi-conf", type=float, default=0.15,
+                    help="tracker：漏检时 ROI 小窗重检测的置信度阈值（低于全图 --det-conf）")
+    ap.add_argument("--switch-margin", type=float, default=0.2,
+                    help="tracker：身份切换需比沿用上一帧的分配代价再低 20%% 才生效")
+    ap.add_argument("--shape-top-k", type=int, default=5,
+                    help="SMPL β 只用置信度最高的 K 帧估计（0=官方原版用全部帧）")
+    ap.add_argument("--no-robust-kp3d", action="store_true",
+                    help="tracker：SMPL 拟合仍用官方 batch_triangulate 的 3D 关键点"
+                         "（默认用阶段 D 鲁棒三角化的结果覆盖）")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
     ap.add_argument("--root", default=None,
                     help="项目根（读 data/calibration 与 data/extrinsics，默认自动探测）")
@@ -182,34 +209,13 @@ def build_args():
     return ap.parse_args()
 
 
-def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, out_dir):
-    """官方多帧批量拟合（多人）：按相机分组识别身份 → 逐人批量拟合。
-
-    跨相机身份关联仿 live_control 按 P 的实时重建：``match_people_fixed`` 固定相机
-    分组（每组相机拍同一个人，组下标=身份）。对每个身份把整段帧一次性喂给官方
-    ``smpl_from_keypoints3d2d``（nFrames=T），激活 smooth_body/smooth_poses/smooth_Rh
-    时间平滑；单视角关节由相邻帧约束 + 模型先验补全。
-    """
+def _pass1_fixed(args, src, intrinsics, extrinsics, detector, triangulator, indices,
+                 cids_ok, person_groups, recon, frames_obs_by_pid, n_seen_by_pid,
+                 pose2d_by_frame):
+    """旧身份路线：每相机只留最近（bbox 最大）一人 + ``match_people_fixed`` 分组。"""
     from tabletennis.reconstruction.associate import keep_nearest_person, match_people_fixed
-    from tabletennis.reconstruction.obs2d import pose_to_dict, save_pose2d
-    from tabletennis.reconstruction.triangulate import MultiViewTriangulator
+    from tabletennis.reconstruction.obs2d import pose_to_dict
 
-    # 过滤掉未标定的相机，组内相机数 <2 则该身份无法三角化（后面跳过）
-    person_groups = [[c for c in g if c in cids_ok] for g in args.person_groups]
-    n_people = len(person_groups)
-    triangulator = MultiViewTriangulator(intrinsics, extrinsics)
-    print(f"  相机分组（{n_people} 人）：{person_groups}")
-
-    indices = list(range(0, src.n_ref, max(1, args.stride)))
-    if args.max_frames > 0:
-        indices = indices[: args.max_frames]
-
-    # ---- Pass 1：检测 + 分组匹配，按身份（组下标）收集每帧观测 ----
-    frames_obs_by_pid = {g: [] for g in range(n_people)}   # pid -> [ {cid:Pose2D} per frame ]
-    n_seen_by_pid = {g: 0 for g in range(n_people)}
-    pose2d_by_frame = {}                                    # 全部检出 2D 姿态（存盘供回放叠加）
-    t_global0 = time.time()
-    t0 = time.time()
     for k in indices:
         if args.fake_poses:
             # 合成：每组各造一个固定站姿人（同一个人投到该组相机，测管道用）
@@ -238,18 +244,187 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             frames_obs_by_pid[g].append(obs)
             if obs:
                 n_seen_by_pid[g] += 1
-    det_wall = time.time() - t0
+    return _obs_stats(frames_obs_by_pid)
+
+
+def _pass1_tracker(args, src, detector, triangulator, indices, cids_ok, n_people,
+                   frames_obs_by_pid, frames_robust_by_pid, n_seen_by_pid,
+                   pose2d_by_frame):
+    """阶段 A–D 多人跟踪：逐帧检测 → 局部跟踪 → 跨相机关联 → 鲁棒三角化。
+
+    输出与 ``_pass1_fixed`` 相同的「按身份收集的逐帧观测」，外加每帧每人的
+    :class:`RobustPose3D`（阶段 D 结果，供 Pass 2 覆盖官方三角化的 3D 关键点）。
+    """
+    from tabletennis.reconstruction.obs2d import pose_to_dict
+    from tabletennis.reconstruction.person_track import MultiPersonTracker, TrackConfig
+
+    cfg = TrackConfig(
+        roi_redetect_conf=args.roi_conf,
+        full_detect_interval=max(1, args.full_detect_interval),
+        switch_margin=args.switch_margin,
+        max_people=max(n_people, args.max_people or n_people),
+    )
+    # 卡尔曼 dt 用录制真实帧率（100fps 外部触发 → 0.01s；编码丢帧由 pulse 对齐吸收）
+    try:
+        period = float(src.period_sec())
+    except Exception:  # noqa: BLE001 —— 无 ts 副产物时退回默认
+        period = 0.0
+    cfg.dt = period if np.isfinite(period) and period > 0 else cfg.dt
+
+    def detect_fn(cid, frame, conf_thresh=None, roi=None):
+        return detector.detect_person_boxes(frame, conf_thresh=conf_thresh, roi=roi)
+
+    def pose_fn(cid, frame, boxes):
+        return detector.detect_on_boxes(frame, boxes)
+
+    tracker = MultiPersonTracker(triangulator, cfg, detect_fn=detect_fn, pose_fn=pose_fn)
+    slot_of: Dict[int, int] = {}          # tracker 内部 person_id → 输出身份下标
+    for k in indices:
+        frames_k = src.frames_for_ref(k)
+        frames_k = {cid: f for cid, f in frames_k.items() if cid in cids_ok}
+        results = tracker.step(k, frames_k, time_s=k * cfg.dt) if frames_k else []
+        # 新身份按首次出现顺序占输出槽位（身份号本身任意，只要全程稳定）
+        for r in results:
+            if r.person_id not in slot_of and len(slot_of) < n_people:
+                slot_of[r.person_id] = len(slot_of)
+        obs_by_slot = {g: {} for g in range(n_people)}
+        robust_by_slot = {g: None for g in range(n_people)}
+        per_cam_poses: Dict[int, list] = {}
+        for r in results:
+            g = slot_of.get(r.person_id)
+            if g is None:                # 超出 --max-people 的人，忽略
+                continue
+            obs_by_slot[g] = dict(r.obs)
+            robust_by_slot[g] = r.robust
+            for cid, p in r.obs.items():
+                per_cam_poses.setdefault(cid, []).append(p)
+        for g in range(n_people):
+            frames_obs_by_pid[g].append(obs_by_slot[g])
+            frames_robust_by_pid[g].append(robust_by_slot[g])
+            if obs_by_slot[g]:
+                n_seen_by_pid[g] += 1
+        if per_cam_poses:
+            pose2d_by_frame[str(k)] = {
+                str(cid): [pose_to_dict(p) for p in pl]
+                for cid, pl in per_cam_poses.items()
+            }
+    return _obs_stats(frames_obs_by_pid)
+
+
+def _obs_stats(frames_obs_by_pid) -> List[str]:
     stats = []
-    for g in range(n_people):
-        seen = frames_obs_by_pid[g]
+    for g, seen in frames_obs_by_pid.items():
         n_seen = sum(1 for obs in seen if obs)
         avg_views = float(np.mean([len(obs) for obs in seen if obs])) if n_seen else 0.0
         stats.append(f"p{g}={n_seen}帧/均{avg_views:.1f}视角")
+    return stats
+
+
+def _robust_kp3ds_override(frames_robust, frames_obs, kpt_ignore=0.2) -> np.ndarray:
+    """阶段 D 鲁棒三角化结果 → 官方拟合要的 ``(T, 25, 4)`` 3D 关键点（halpe26→body25）。
+
+    置信度列用「有效视角的 2D 置信度均值」（与官方 ``batch_triangulate`` 的 conf3d
+    同口径），几何位置用 RANSAC 后的鲁棒解——鲁棒置信度含内点率/交会角惩罚、量纲偏小，
+    直接当 conf 会被下游 ``check_keypoints(min_conf)`` 二次丢掉关节。
+    """
+    from tabletennis.reconstruction.easymocap import HALPE26_TO_BODY25
+
+    T = len(frames_obs)
+    out = np.zeros((T, 25, 4), dtype=np.float64)
+    for t in range(T):
+        res = frames_robust[t] if t < len(frames_robust) else None
+        if res is None:
+            continue
+        kp3 = np.asarray(res.skeleton.keypoints, dtype=np.float64)
+        conf3 = np.asarray(res.skeleton.confidence, dtype=np.float64)
+        obs = frames_obs[t] if t < len(frames_obs) else {}
+        for hi, b25 in HALPE26_TO_BODY25:
+            if hi >= len(kp3) or not np.isfinite(kp3[hi]).all() or conf3[hi] <= 0:
+                continue
+            cs = []
+            for pose in obs.values():
+                kp = np.asarray(pose.keypoints, dtype=np.float64)
+                if kp.ndim == 2 and hi < len(kp) and kp[hi, 2] >= kpt_ignore:
+                    cs.append(float(kp[hi, 2]))
+            out[t, b25, :3] = kp3[hi]
+            out[t, b25, 3] = float(np.mean(cs)) if cs else float(conf3[hi])
+    return out
+
+
+def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, out_dir):
+    """官方多帧批量拟合（多人）：跨相机识别身份 → 逐人批量拟合。
+
+    身份识别两种模式（``--assoc``）：
+
+    - ``tracker``（默认）：阶段 A–D 多人跟踪（:mod:`tabletennis.reconstruction.person_track`）——
+      每相机独立局部跟踪（IoU + 质心最近邻）→ 世界系 3D 卡尔曼 → 逐帧「枚举分配 +
+      重投影误差最小」跨相机关联（带时序切换余量）→ 置信度加权鲁棒三角化（RANSAC）。
+      宽视野下每台相机可同时拍到近/远两人，漏检时用预测位置开 ROI 小窗低阈值重检测。
+    - ``fixed``：旧的 ``match_people_fixed`` 固定相机分组（每组相机拍同一个人，
+      组下标=身份），且每相机只留最近（bbox 最大）的那个人——前提是每相机只拍到一个人。
+
+    对每个身份把整段帧一次性喂给官方 ``smpl_from_keypoints3d2d``（nFrames=T），
+    激活 smooth_body/smooth_poses/smooth_Rh 时间平滑；单视角关节由相邻帧约束 +
+    模型先验补全。β 只用置信度最高的 ``--shape-top-k`` 帧估计（见
+    :func:`tabletennis.reconstruction.easymocap.select_shape_frames`）。
+    """
+    from tabletennis.reconstruction.obs2d import pose_to_dict, save_pose2d
+    from tabletennis.reconstruction.triangulate import MultiViewTriangulator
+
+    # 过滤掉未标定的相机，组内相机数 <2 则该身份无法三角化（后面跳过）
+    person_groups = [[c for c in g if c in cids_ok] for g in args.person_groups]
+    n_people = len(person_groups)
+    triangulator = MultiViewTriangulator(intrinsics, extrinsics)
+    use_tracker = getattr(args, "assoc", "tracker") == "tracker"
+    if use_tracker:
+        print(f"  身份关联：tracker（阶段 A–D 多人跟踪，最多 {n_people} 人）")
+    else:
+        print(f"  身份关联：fixed 相机分组（{n_people} 人）：{person_groups}")
+
+    indices = list(range(0, src.n_ref, max(1, args.stride)))
+    if args.max_frames > 0:
+        indices = indices[: args.max_frames]
+
+    # ---- Pass 1：检测 + 身份关联，按身份收集每帧观测 ----
+    frames_obs_by_pid = {g: [] for g in range(n_people)}   # pid -> [ {cid:Pose2D} per frame ]
+    frames_robust_by_pid = {g: [] for g in range(n_people)}  # pid -> [ RobustPose3D | None ]
+    n_seen_by_pid = {g: 0 for g in range(n_people)}
+    pose2d_by_frame = {}                                    # 全部检出 2D 姿态（存盘供回放叠加）
+    t_global0 = time.time()
+    t0 = time.time()
+    if use_tracker and not args.fake_poses:
+        stats = _pass1_tracker(args, src, detector, triangulator, indices, cids_ok,
+                               n_people, frames_obs_by_pid, frames_robust_by_pid,
+                               n_seen_by_pid, pose2d_by_frame)
+    else:
+        stats = _pass1_fixed(args, src, intrinsics, extrinsics, detector, triangulator,
+                             indices, cids_ok, person_groups, recon,
+                             frames_obs_by_pid, n_seen_by_pid, pose2d_by_frame)
+    det_wall = time.time() - t0
     print(f"  检测 {len(indices)} 帧耗时 {det_wall:.1f}s | 各身份被看到：{', '.join(stats)}"
           + "（均<2 视角=常单视角，重建会退化成均值模型）")
     if pose2d_by_frame:
         save_pose2d(out_dir, pose2d_by_frame)
         print(f"  2D 姿态检测已存 pose2d.json（{len(pose2d_by_frame)} 帧）")
+
+    # 每个身份实际参与拟合的视角：tracker 用「看到过该人、且不是在画面边缘只露半截
+    # 的相机」（``select_fit_views``：裁边视角的姿态是模型外推的，会把 SMPL 拉偏），
+    # fixed 用它的相机分组（两者都可能 <2 → 该身份跳过）。
+    if use_tracker:
+        from tabletennis.reconstruction.person_track import select_fit_views
+        fit_views = []
+        for g in range(n_people):
+            v = select_fit_views(frames_obs_by_pid[g], intrinsics)
+            seen: set = set()
+            for obs in frames_obs_by_pid[g]:
+                seen.update(obs)
+            dropped = sorted(seen - set(v))
+            if dropped:
+                print(f"  p{g}：丢弃裁边视角 {dropped}（画面边缘只露半截，姿态外推不可靠）")
+            fit_views.append(v)
+        person_groups = fit_views
+        for g, v in enumerate(fit_views):
+            print(f"  p{g} 拟合视角：{v if v else '（无）'}")
 
     # ---- Pass 2：逐人批量拟合 ----
     t0 = time.time()
@@ -271,9 +446,20 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             if results_by_pid[g] is None:
                 print(f"  ⚠ p{g} VPoser 拟合失败")
         else:
+            kp3d_ov = None
+            if use_tracker and not args.no_robust_kp3d:
+                kp3d_ov = _robust_kp3ds_override(
+                    frames_robust_by_pid[g], frames_obs_by_pid[g])
+                n_ok_kp = int((kp3d_ov[..., 3] > 0).any(axis=1).sum())
+                if n_ok_kp == 0:       # 阶段 D 无结果（如 --fake-poses）→ 用官方三角化
+                    kp3d_ov = None
+                else:
+                    print(f"  p{g}：3D 关键点用阶段 D 鲁棒三角化覆盖"
+                          f"（{n_ok_kp}/{len(kp3d_ov)} 帧有有效关节）")
             results_by_pid[g] = recon.reconstruct_batch(
                 frames_obs_by_pid[g], intrinsics, extrinsics,
-                min_conf=args.fit_conf, view_ids=sorted(group))
+                min_conf=args.fit_conf, view_ids=sorted(group),
+                shape_top_k=args.shape_top_k, kp3ds_override=kp3d_ov)
             if results_by_pid[g] is None:
                 print(f"  ⚠ p{g} 批量拟合失败")
     fit_wall = time.time() - t0
@@ -343,6 +529,9 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
         "detect_wall_s": round(det_wall, 3),
         "fit_wall_s": round(fit_wall, 3),
         "person_groups": person_groups, "n_people": n_people,
+        "assoc": "tracker" if use_tracker else "fixed",
+        "shape_top_k": args.shape_top_k,
+        "robust_kp3d": bool(use_tracker and not args.no_robust_kp3d),
         "reproj_err_mean_px_median": _median(err_mean_arr),
         "source": src.summary(),
     }
