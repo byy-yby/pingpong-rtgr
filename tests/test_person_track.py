@@ -24,8 +24,11 @@ from tabletennis.core.types import (  # noqa: E402
     Pose2D,
 )
 from tabletennis.reconstruction.person_track import (  # noqa: E402
+    LOWER_BODY_HALPE26,
     MultiPersonTracker,
     TrackConfig,
+    lower_body_unreliable,
+    mask_lower_body,
 )
 from tabletennis.reconstruction.triangulate import MultiViewTriangulator  # noqa: E402
 
@@ -386,3 +389,88 @@ def test_select_fit_views_drops_clipped_camera():
 
     # 空输入不崩
     assert select_fit_views([], intr) == []
+
+
+def _pose_with_conf(upper=0.9, lower=0.9):
+    kpts = np.zeros((26, 3), dtype=np.float32)
+    kpts[:, :2] = 100.0
+    kpts[:, 2] = upper
+    for i in LOWER_BODY_HALPE26:
+        kpts[i, 2] = lower
+    return Pose2D(camera_id=0, keypoints=kpts, score=0.9, skeleton="halpe26")
+
+
+def test_lower_body_gate_predicate():
+    """下半身不可信的判据：相对 + 绝对两个条件都要满足。"""
+    # 远端相机典型值：上半身 0.9、下半身 0.3（实测 0.76~0.91 / 0.24~0.40）
+    assert lower_body_unreliable(_pose_with_conf(0.9, 0.3))
+    # 正常视角：下半身 0.85（实测 0.81~0.89）→ 保留
+    assert not lower_body_unreliable(_pose_with_conf(0.9, 0.85))
+    # 整具骨架都低（远处小目标）→ 相对比值接近 1，不该被判成「下半身污染」
+    assert not lower_body_unreliable(_pose_with_conf(0.3, 0.28))
+    # 绝对够高但相对偏低（0.9 vs 0.5）→ 不算不可信
+    assert not lower_body_unreliable(_pose_with_conf(0.9, 0.55))
+    # 下半身关节全缺（conf=0）→ 没有数据也就没有污染，不判
+    assert not lower_body_unreliable(_pose_with_conf(0.9, 0.0))
+    # 有效下半身关节太少（< min_joints=2）→ 不判
+    p = _pose_with_conf(0.9, 0.3)
+    kp = p.keypoints.copy()
+    kp[list(LOWER_BODY_HALPE26)[1:], 2] = 0.0
+    assert not lower_body_unreliable(Pose2D(camera_id=0, keypoints=kp, score=0.9,
+                                            skeleton="halpe26"))
+
+
+def test_mask_lower_body_keeps_hips_and_coords():
+    """掩码只把下半身置信度置 0，坐标与髋部（根关节要用）保持不变。"""
+    p = _pose_with_conf(0.9, 0.3)
+    m = mask_lower_body(p)
+    assert np.allclose(m.keypoints[:, :2], p.keypoints[:, :2]), "坐标不该被改"
+    for i in LOWER_BODY_HALPE26:
+        assert m.keypoints[i, 2] == 0.0
+    for i in (11, 12, 19):                       # 双髋 + 骨盆（阶段 B/C 的根）
+        assert m.keypoints[i, 2] == p.keypoints[i, 2] > 0
+    assert p.keypoints[13, 2] > 0, "原对象不该被就地修改"
+    assert not lower_body_unreliable(m), "掩码后不该再判为不可信"
+
+
+def test_tracker_masks_lower_body_of_polluted_view():
+    """tracker 集成：某视角下半身低置信 → 只该视角的膝/踝被置 0，其余视角不受影响。"""
+    world = World(n_frames=8, cams=(0, 1, 2, 3))
+    bad_cid = 1
+    orig = world.poses_for
+
+    def poses_for(cid, t, boxes):
+        out = orig(cid, t, boxes)
+        if cid != bad_cid:
+            return out
+        for p in out:                            # 模拟「隔球桌看人」：膝/踝低置信
+            kp = np.array(p.keypoints, dtype=np.float64, copy=True)
+            for i in LOWER_BODY_HALPE26:
+                kp[i, 1] += 45.0                 # 同时几何上是错的（外推）
+                kp[i, 2] = 0.25
+            p.keypoints = kp.astype(np.float32)
+        return out
+
+    world.poses_for = poses_for
+    results, _ = run_tracker(world, n_frames=8)
+    last = results[-1]
+    assert last, "应有跟踪结果"
+    for r in last:
+        assert r.lower_body_masked.get(bad_cid) is True, "c1 的下半身应被判不可信"
+        assert r.obs[bad_cid].keypoints[13, 2] == 0.0, "掩码后该视角膝不该参与重建"
+        assert r.raw_obs[bad_cid].keypoints[13, 2] > 0.0, "原始观测（显示用）应保留"
+        for cid in r.obs:
+            if cid != bad_cid:
+                assert not r.lower_body_masked.get(cid)
+                assert r.obs[cid].keypoints[13, 2] > 0.0, "好视角不该被掩码"
+
+
+def test_tracker_lower_body_gate_can_be_disabled():
+    """--no-lower-body-gate 等价开关：关掉后不掩码、raw_obs 与 obs 一致。"""
+    world = World(n_frames=6)
+    cfg = TrackConfig(full_detect_interval=1, dt=0.01, lower_body_gate=False)
+    results, _ = run_tracker(world, cfg=cfg, n_frames=6)
+    for r in results[-1]:
+        assert r.lower_body_masked == {}
+        for cid in r.obs:
+            assert np.allclose(r.obs[cid].keypoints, r.raw_obs[cid].keypoints)

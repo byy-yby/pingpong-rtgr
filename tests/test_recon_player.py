@@ -325,3 +325,29 @@ def test_bake_body_shading_skin_tints_and_xyz_convex():
     assert (c > skin * 0.42).all()
     assert np.argmax(c) == 0                       # R 通道最多（肤色暖调保持）
     assert c[1] > c[2]
+
+
+def test_draw_pred_box_is_dashed_grey_rect():
+    """预测框：灰色**虚线**矩形（与实测框的实线彩色框一眼可分）。"""
+    from tabletennis.visualization.overlay2d import draw_pred_box
+    img = np.zeros((120, 160, 3), np.uint8)
+    out = draw_pred_box(img, (20, 40, 140, 100), label="pred p0")
+    assert out is img
+    row = out[40, 20:141]                      # 上边所在行
+    hit = np.where(row.any(axis=1))[0]
+    assert len(hit) > 0, "上边一个像素都没画"
+    assert len(hit) < 0.85 * 121, "整条实线 = 没走虚线逻辑"
+    assert np.diff(hit).max() > 1, "虚线应有间断"
+    lit = row[hit]
+    px = lit[int(np.argmax(lit.sum(axis=1)))]   # 最亮那点
+    assert int(px.max()) - int(px.min()) <= 24, f"应近似灰色，实际 BGR={px}"
+    # 框内不填充（保持可看见底下的画面）
+    assert not out[60, 80:100].any()
+
+
+def test_draw_pred_box_degenerate_box_does_not_crash():
+    from tabletennis.visualization.overlay2d import draw_pred_box
+    img = np.zeros((40, 40, 3), np.uint8)
+    draw_pred_box(img, (10, 10, 10, 10), label="")
+    draw_pred_box(img, (30, 30, 5, 5), label="pred")   # 反向/零尺寸
+    assert img.shape == (40, 40, 3)

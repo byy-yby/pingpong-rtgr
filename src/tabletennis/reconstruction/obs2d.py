@@ -8,10 +8,16 @@
 文件格式（键都是字符串，避免 JSON 只能字符串键的坑）：
     pose2d.json = {frame_str: {cid_str: [pose_dict, ...]}}
     ball2d.json = {frame_str: {cid_str: [ball_dict, ...]}}
+    pred_boxes.json = {frame_str: {cid_str: [[x1,y1,x2,y2,slot], ...]}}
 
 pose_dict = {"kpts": [[x,y,c]*N], "score": float, "bbox": [x1,y1,x2,y2] | null,
              "skeleton": "halpe26"}
 ball_dict = {"x": float, "y": float, "r": float, "c": float}
+
+``pred_boxes.json`` 是**纯显示**的卡尔曼预测框（该相机该帧没检出人时预测根关节的
+重投影位置 + 最近 bbox 尺寸），只给回放叠加画灰色虚线框用，**绝不参与重建**——
+阶段 A 的预测只用来开 ROI 搜索窗，伪造成检测会引发 3D→框→姿态→3D 自激回路
+（见 ``person_track`` 红线①）。``slot`` 是人在该段里的身份序号（0/1）。
 """
 from __future__ import annotations
 
@@ -26,6 +32,7 @@ from ..core.types import Ball2D, Pose2D
 __all__ = [
     "pose_to_dict", "ball_to_dict", "dict_to_pose", "dict_to_ball",
     "save_pose2d", "save_ball2d", "load_pose2d", "load_ball2d",
+    "save_pred_boxes", "load_pred_boxes",
 ]
 
 
@@ -111,3 +118,16 @@ def load_pose2d(out_dir: str) -> Dict:
 def load_ball2d(out_dir: str) -> Dict:
     """读回 ball2d dict；缺文件返回 {}。"""
     return _load_json(os.path.join(out_dir, "ball2d.json"))
+
+
+def save_pred_boxes(out_dir: str, pred: Dict) -> None:
+    """把 ``{frame_str: {cid_str: [[x1,y1,x2,y2,slot], ...]}}`` 写到 ``pred_boxes.json``。
+
+    **只用于回放叠加显示**（灰色虚线预测框），重建流程不读它——见模块 docstring。
+    """
+    _write_json(os.path.join(out_dir, "pred_boxes.json"), pred)
+
+
+def load_pred_boxes(out_dir: str) -> Dict:
+    """读回 pred_boxes dict；缺文件返回 {}。"""
+    return _load_json(os.path.join(out_dir, "pred_boxes.json"))
