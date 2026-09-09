@@ -82,9 +82,6 @@
 - 图层：相机视锥（`build_cameras_scene`）、球桌、骨架（`add_skeleton_layer`/`set_skeletons`）、红球（`add_ball_layer`/`set_ball`，跨线程传球心加锁）。
 - 每个方法里自己 `o3d = _o3d()` 惰性 import（`_update_ball_geometry` 曾漏写致渲染线程 NameError 窗口退出）；Open3D 窗口必须在主线程开，后台线程只加载模型。
 
-<<<<<<< HEAD
-### IMU 姿态（维特智能 WT9011DCL-BT5.0，按 i）
-=======
 ### 离线重建回放 `recon_player.py` + `scripts/visualize_recon.py`
 
 - `scripts/reconstruct_video.py` 每帧存 `frame_NNNNNN.npz`（vertices/joints/…）时**多写一次 `recon_faces.npy`**（13776×3 SMPL 拓扑，整段一次，`ensure_faces`）。
@@ -93,7 +90,8 @@
 - **GUI 播放 = 点云模式（2026-09-04 重构；用户拍板「只要点云就行」）**：Open3D 0.19 Filament 的 `Scene.update_geometry` **只收 PointCloud**；三角网格逐帧动画只能 remove+add，每次重挂留不可回收引擎级残留、~1 万次（实测 8k~11.5k ops）即段错误——旧的限频/对象池只能推迟到崩溃点（「播一段就停 / 干脆不播」的根因，GPU 渲染一直在跑、不是 CPU 软渲染）。修法：`ReconScene(mode=...)` 两条路——`mode="mesh"`（平滑三角网格）**只**用于 `render_still`（每次新建场景加一次、不累积）；`mode="points"`（`play_gui` 用，**mesh 默认参数不用动**）把人体表面（SMPL 顶点+每面质心 ≈20666 点）、地板影（顶点沿光水平投影、不透明深色点）、骨骼（关节连线等分点）、球（单点）、轨迹（逐采样点）全做成 `t.geometry.PointCloud`，**add 一次后每帧 `update_geometry` 原地改顶点缓冲 + `show_geometry` 切可见性**，全程 0 次 remove+add。实测 8 遍×714 帧播放（5712 次换帧）实体数恒 8（+0 churn）、RSS 平稳、中位换帧 7.7ms、无段错误 → 可无限长播。**⚠️ 别给场景里的 pcd 设 `.point.normals`**（normals 只 CPU 侧算法线烘焙用；设了会把云注册进别的低层入口 → update 报 `_Map_base::at`）。
 - **人体凸凹明暗 = 顶点色烘焙 `bake_body_shading`（defaultUnlit），不走 Filament 实时光照**：逐顶点 Lambert（`ambient=_BAKE_AMBIENT`+`key=_BAKE_KEY`×`max(n·光向,0)`），光从上方略偏左前来（`_KEY_LIGHT_FROM`，与假影太阳同侧）。朝光面≈肤色顶格、颌下/腋下/腹股沟等凹处法线背光自然暗一档 → 一眼看出身体起伏；纯 numpy 可单测。原因（EGL 实测，2026-09）：Filament **cast_shadows 不产真影**、fill/IBL 低强度无效；高 lux（~1e5）方向光**能出强漫反射**——旧结论「太阳定向光不生效」实为强度 1000 太小 + fill 用了 0.19 旧版参数序（color 位塞了方向向量），非平台限制。真影不可靠故地上阴影仍用程序化假影，明暗走烘焙，双保险。**影子两层都画在地板平面 `floor_z`（不是脚平面）**：重建 SMPL 脚底常悬空几 cm（142020 实测 median -0.713 vs floor -0.76），贴脚画盘会悬在地板上方成脱开深斑。① 接触椭圆 `contact_shadow_planes`（脚底核心深影）② 整身投影软影 `project_floor_shadow`+`convex_hull2d`（**纯 numpy 2D monotone-chain**，投影点全在同平面——open3d `compute_convex_hull` 会因退化抛 QH6154/每帧打 QH7089 精度告警刷屏；质心 apex 三角扇 CCW → 法线 +Z）——垂直俯视桌顶时人影被桌面挡住看不见（取景限制，侧视/低视角可见），这是物理遮挡不是 bug。透明材质必须显式 `shader="defaultLitTransparency"`——`base_color` alpha 默认不混合。
 - 键盘：Space 播放/暂停、←/→ 步进、Home/End、R 复位、-/= 调速、Esc 退出。
->>>>>>> worktree-easymocap-recon
+
+### IMU 姿态（维特智能 WT9011DCL-BT5.0，按 i）
 
 `scripts/live_control.py` 按 **i** 读插在拍柄末端的 IMU：3D 窗口里球拍**朝向来自 IMU**（notify 线程 100Hz 直接推 `viewer3d.set_imu_orientation`，绕开主循环 ~20FPS），**位置绑到检测到的右手腕**（主循环每帧 `right_wrist_anchor` 选「离桌面原点最近的有效右手腕」→ `set_imu_anchor`，两人时即按 i 放拍在原点那一侧）。代码在 `src/tabletennis/imu/`：
 - `witmotion.py`：0x55 协议解析 + 角度/四元数 -> 旋转矩阵（纯 numpy，无 I/O）。WT9011DCL 走**蓝牙 5.0 (BLE)**，默认 **0x61 组合包**（加速度6B+角速度6B+角度6B）@10Hz（可 0.2~200Hz），角度 int16/32768×180°、欧拉 Z-Y-X；兼容经典 0x53 角度 / 0x59 四元数。
@@ -187,6 +185,11 @@
   编码丢掉就没帧给（该视角缺帧）。录制 sink 挂在同一触发抓帧流上、四台从同一拍起写，
   所以「脉冲号相同 ⇒ 同一物理触发」成立。
 - `np.savez_compressed` 返回 None（不是 file 对象），别调 `.close()`。
+- **依赖 EasyMocap 源码**（默认 `/home/yby/projects/EasyMocap`，`EASYMOCAP_ROOT` /
+  `--easymocap-root` 可覆盖；SMPL 模型在项目 `data/bodymodels/`，缺 `smpl/SMPL_NEUTRAL.pkl`
+  时自动从 `SMPL_NEUTRAL.npz` 生成）。误删后恢复：
+  `git clone --depth 1 https://github.com/zju3dv/EasyMocap /home/yby/projects/EasyMocap`
+  （2026-09-09 实测该源 master 带 mv1p / `smooth_Rh` 补丁，不是纯官方 upstream）。
 - 默认档位 `--config stream`（EmFit 热启动 ~2.1s/帧）；`--fake-poses` 注入合成站姿人跑
   整条 录制→对齐→检测→拟合→存档 管道，无硬件/无真人视频也能验证与计时。
 - 实测单帧真机开销：检测不在此列；EmFit stream ~2.1s、official cold ~6.2s（GPU 5080）——
