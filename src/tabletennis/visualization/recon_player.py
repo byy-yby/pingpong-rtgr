@@ -241,6 +241,11 @@ class ReconTimeline:
             if self.n_ref <= 0 and self.files:
                 self.n_ref = max(self.files) + 1
 
+        # 3b) 只重建球（--ball-only）：无姿态帧 / 无 index 时，用 ball_trajectory 的帧号定 n_ref
+        self._load_ball()
+        if self.n_ref <= 0 and self.ball_ok and len(self.ball_refs):
+            self.n_ref = int(self.ball_refs[-1]) + 1
+
         # 4) 回放真实速率（录像是硬触发 100Hz，缺 ts 时回退 100）
         period = None
         if self.meta:
@@ -254,7 +259,6 @@ class ReconTimeline:
             self.ref_rate_hz = 100.0
 
         self._rebuild_state()
-        self._load_ball()
 
     # ------------------------------------------------------------------
     def _rebuild_state(self) -> None:
@@ -1673,7 +1677,8 @@ def play_gui(out_dir: str, easymocap_root: str = "", width: int = 1280,
     from tabletennis.reconstruction.triangulate import load_camera_rig
 
     tl = ReconTimeline(out_dir, hold_gaps=hold_gaps)
-    faces = load_faces(out_dir, easymocap_root)
+    # 只重建球（无姿态帧）时不需要 SMPL 网格拓扑，跳过 easymocap 补写（免噪音告警）
+    faces = load_faces(out_dir, easymocap_root if tl.files else "")
     # GUI 回放走点云路径（mode="points"）：动态层全部 Scene.update_geometry 原地更新、
     # 无 remove+add —— 不会像网格那样累积 ~1 万次即段错误（render_still 离屏才用 mesh）。
     scene_b = ReconScene(tl, faces, camera_rig=load_camera_rig(root),
