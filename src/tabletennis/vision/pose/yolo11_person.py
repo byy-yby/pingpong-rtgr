@@ -112,20 +112,31 @@ class Yolo11PersonDetector:
 
     # -- 预处理 / 后处理 --
 
-    def _fill_input(self, gray: np.ndarray, dst: np.ndarray
+    def _fill_input(self, gray: np.ndarray, dst: np.ndarray,
+                    roi: Optional[Tuple[int, int, int, int]] = None
                     ) -> Tuple[int, int, float, float, float, int, int]:
         """letterbox + 归一化直接写入 dst（(1,H,W) float32）。
 
         返回 ``(H, W, r, dw, dh, ox, oy)``：H/W 为裁剪后尺寸（无 ROI 时=原图），
         ox/oy 为 ROI 左上角在**全图**坐标（无 ROI 时=0），用于把检测框平移回全图。
+
+        ``roi`` 为**本次调用**的临时 ROI（None = 用构造时的 ``self.roi``；显式传
+        ``(-1, -1, -1, -1)`` 可强制全图）。ROI 引导重检测靠它。
         """
         if gray.ndim == 3:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        if roi is None:
+            roi = self.roi
+        elif roi[0] < 0:
+            roi = None
         ox = oy = 0
-        if self.roi is not None:
-            x0, y0, x1, y1 = self.roi
-            gray = gray[y0:y1, x0:x1]
-            ox, oy = x0, y0
+        if roi is not None:
+            x0, y0, x1, y1 = (int(v) for v in roi)
+            x0 = max(0, x0); y0 = max(0, y0)
+            x1 = min(gray.shape[1], x1); y1 = min(gray.shape[0], y1)
+            if x1 - x0 >= 8 and y1 - y0 >= 8:
+                gray = gray[y0:y1, x0:x1]
+                ox, oy = x0, y0
         H, W = gray.shape[:2]
         lb, (r, dw, dh) = _letterbox(gray, (self.imgsz, self.imgsz))
         np.multiply(lb, _SCALE, out=dst[0])  # uint8 -> float32，单遍
@@ -133,14 +144,22 @@ class Yolo11PersonDetector:
 
     def _postprocess(self, det: np.ndarray, H: int, W: int,
                      r: float, dw: float, dh: float,
-                     ox: int, oy: int) -> np.ndarray:
-        """单帧 ``(84, N)`` raw 输出 -> 全图坐标 xyxy 框 ``(M, 4)``（仅 person 类）。"""
+                     ox: int, oy: int,
+                     conf_thresh: Optional[float] = None,
+                     return_scores: bool = False):
+        """单帧 ``(84, N)`` raw 输出 -> 全图坐标 xyxy 框 ``(M, 4)``（仅 person 类）。
+
+        ``conf_thresh`` 为本次调用的临时阈值（None = ``self.conf_thresh``）；
+        ``return_scores`` 为 True 时返回 ``(boxes, scores)``（ROI 重检测要用框置信度）。
+        """
         boxes = det[:4, :]       # (4, N) cx,cy,w,h（letterbox 输入坐标）
         confs = det[4, :]        # (N,) person 类 0 分数
 
-        keep_mask = confs > self.conf_thresh
+        thr = self.conf_thresh if conf_thresh is None else float(conf_thresh)
+        keep_mask = confs > thr
         if not keep_mask.any():
-            return np.zeros((0, 4), dtype=np.float32)
+            empty = np.zeros((0, 4), dtype=np.float32)
+            return (empty, np.zeros((0,), np.float32)) if return_scores else empty
         boxes = boxes[:, keep_mask].T  # (K,4) cxcywh
         confs = confs[keep_mask]
 
@@ -151,6 +170,7 @@ class Yolo11PersonDetector:
         xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2.0
 
         out: List[np.ndarray] = []
+        out_scores: List[float] = []
         for i in _nms(xyxy, confs, self.iou_thresh):
             x0, y0, x1, y1 = xyxy[i]
             # unletterbox 回裁剪坐标，再平移到全图坐标（含 ROI 偏移）
@@ -159,28 +179,42 @@ class Yolo11PersonDetector:
             y0 = float(np.clip((y0 - dh) / r, 0.0, H - 1.0)) + oy
             y1 = float(np.clip((y1 - dh) / r, 0.0, H - 1.0)) + oy
             out.append([x0, y0, x1, y1])
-        return np.asarray(out, dtype=np.float32) if out else np.zeros((0, 4), np.float32)
+            out_scores.append(float(confs[i]))
+        boxes = np.asarray(out, dtype=np.float32) if out else np.zeros((0, 4), np.float32)
+        if return_scores:
+            return boxes, np.asarray(out_scores, dtype=np.float32)
+        return boxes
 
-    def detect(self, frame: Frame) -> np.ndarray:
-        """单帧检测，返回 person 框 ``(M, 4)`` xyxy（全图坐标）。"""
+    def detect(self, frame: Frame, *, conf_thresh: Optional[float] = None,
+               roi: Optional[Tuple[int, int, int, int]] = None,
+               return_scores: bool = False):
+        """单帧检测，返回 person 框 ``(M, 4)`` xyxy（全图坐标）。
+
+        ``conf_thresh`` / ``roi`` 是**本次调用**的临时覆盖（None = 构造值），
+        供 ROI 引导重检测用低阈值 + 小窗口再检测一次；``return_scores=True`` 时
+        额外返回逐框置信度 ``(M,)``（跨相机关联的权重要用）。
+        """
         gray = frame.image
-        H, W, r, dw, dh, ox, oy = self._fill_input(gray, self._inp[0])
+        H, W, r, dw, dh, ox, oy = self._fill_input(gray, self._inp[0], roi)
         out = self.session.run(None, {self.input_name: self._inp})[0]  # (1,84,N)
-        return self._postprocess(out[0], H, W, r, dw, dh, ox, oy)
+        return self._postprocess(out[0], H, W, r, dw, dh, ox, oy,
+                                 conf_thresh, return_scores)
 
-    def detect_batch(self, frames: List[Frame]) -> List[np.ndarray]:
+    def detect_batch(self, frames: List[Frame], *,
+                     conf_thresh: Optional[float] = None) -> List[np.ndarray]:
         """多帧一次推理（batch=N），返回逐帧 person 框列表。
 
         batch 维非动态、或帧数异常时自动回退逐帧 ``detect``。
         """
         n = len(frames)
         if n <= 1 or not self._batch_supported or n > self._inp_batch.shape[0]:
-            return [self.detect(f) for f in frames]
+            return [self.detect(f, conf_thresh=conf_thresh) for f in frames]
         buf = self._inp_batch[:n]
         metas = [self._fill_input(f.image, buf[i]) for i, f in enumerate(frames)]
         out = self.session.run(None, {self.input_name: buf})[0]  # (n,84,N)
         return [
             self._postprocess(out[i], metas[i][0], metas[i][1], metas[i][2],
-                              metas[i][3], metas[i][4], metas[i][5], metas[i][6])
+                              metas[i][3], metas[i][4], metas[i][5], metas[i][6],
+                              conf_thresh)
             for i in range(n)
         ]

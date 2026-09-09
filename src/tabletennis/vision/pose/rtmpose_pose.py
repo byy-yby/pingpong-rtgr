@@ -459,6 +459,37 @@ class RTMPoseDetector(PoseDetector):
             bboxes = self._det_model(bgr)
         if bboxes is None or len(bboxes) == 0:
             return []
+        return self.detect_on_boxes(frame, bboxes)
+
+    def detect_person_boxes(self, frame: Frame, *, conf_thresh: Optional[float] = None,
+                            roi=None, return_scores: bool = True):
+        """只跑人检测（不跑姿态），返回 ``(boxes (M,4), scores (M,))`` 全图坐标。
+
+        ROI 引导重检测用：小窗口 + 低阈值再检测一次，找不到人就不必再跑 RTMPose。
+        非 yolo11n-gray 人检测器（YOLOX 回退分支）不支持临时阈值/ROI，按原样返回。
+        """
+        if not self._use_yolo11_det:
+            bgr = (cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR)
+                   if frame.image.ndim == 2 else frame.image)
+            boxes = self._det_model(bgr)
+            boxes = np.zeros((0, 4), np.float32) if boxes is None else np.asarray(boxes)
+            return boxes[:, :4], np.ones(len(boxes), np.float32)
+        return self._det_person.detect(frame, conf_thresh=conf_thresh, roi=roi,
+                                       return_scores=return_scores)
+
+    def detect_on_boxes(self, frame: Frame, bboxes) -> List[Pose2D]:
+        """对**指定的人框**跑关键点估计（不重复做人检测）。
+
+        跟踪阶段 A 的 ROI 重检测拿到框后直接喂这里，省掉一次人检测；框坐标须是
+        全图像素坐标（与 ``detect`` 的输出同坐标系）。
+        """
+        if frame.image is None or frame.image.size == 0:
+            return []
+        bboxes = np.asarray(bboxes, dtype=np.float32)
+        if bboxes.ndim != 2 or len(bboxes) == 0:
+            return []
+        bgr = (cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR)
+               if frame.image.ndim == 2 else frame.image)
 
         # 2) 对每个人框跑关键点估计
         keypoints, scores = self._pose_model(bgr, bboxes=bboxes)

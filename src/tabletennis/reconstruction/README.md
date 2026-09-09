@@ -10,6 +10,11 @@
   从 `data/calibration/cam_N.yaml` 与 `data/extrinsics/table_extrinsics.yaml` 读标定。
 - `associate.py` —— 跨视角**实例级**球员匹配（`match_people`）：几何锚点 +
   两两三角化重投影门限 + 并查集合并 + 一致性精化。运动场景队服相同，不用外观。
+- `person_track.py` —— **宽视野一相机多人的跟踪/身份（阶段 A–D）**：
+  `MultiPersonTracker` 逐帧串联「单相机局部跟踪 → 世界系 3D 卡尔曼 →
+  枚举分配 + 重投影代价最小的跨相机关联 → 逐关键点鲁棒三角化」。
+  离线 `reconstruct_video.py --assoc tracker`（默认）与在线 `live_control.py` 都用它；
+  旧的 `match_people_fixed`（每相机只留 bbox 最大的一个人）只作 `--assoc fixed` 回退。
 - `easymocap.py` —— **EasyMocap SMPL 多视角重建（不依赖三角测量）**：把 SMPL
   参数化人体模型直接拟合到多视角 2D 关键点的重投影误差上，模型先验补全「只有
   单视角可见」的部位。基础版单人 / SMPL-24 关节（无手脸细节），依赖 EasyMocap
@@ -57,6 +62,45 @@ for obs in people:
 ```
 
 完整实时入口见 `scripts/reconstruct_pose.py`（`--synthetic` 可无硬件自检）。
+
+## 多人跟踪 / 身份（`person_track.py`，阶段 A–D）
+
+换广角镜头后一台相机能同时拍到近/远两人，「每相机只拍一个人」的前提失效，
+身份必须靠**世界系几何 + 时序**决定。`MultiPersonTracker.step(frame_idx, frames, time_s)`
+每帧走四步：
+
+- **阶段 A（单相机局部跟踪）**：每台相机独立，IoU + 质心最近邻匹配本帧检测到
+  该相机已有的 `local_track_id`（命中则重置 `missed_frames`）；未匹配的检测开新
+  id，未匹配的局部轨迹 `missed_frames += 1`，超过 `LOCAL_TRACK_MAX_MISSED` 删除。
+  **ROI 引导重检测**：某活跃轨迹在某相机本帧没匹配上检测时，用它卡尔曼预测的
+  3D 位置投到该相机（`project_distorted`）开小窗，边长 = 该人最近一次 bbox 对角线
+  ×2（缺失时 300px），窗内以 `ROI_REDETECT_CONF`(0.15) 重跑人检测；命中则坐标映射
+  回全图并标 `source="roi_redetect"`，未命中标 `source="predicted_only"`（**不参与
+  三角化**）。每 `FULL_DETECT_INTERVAL`(30) 帧强制全图检测。
+- **阶段 B（世界系 3D 卡尔曼）**：状态 `x=[p,v]∈R⁶`，匀速模型；观测 = 本帧鲁棒
+  三角化的**根关节**（骨盆）；`R` 由三角化协方差 + 基础观测噪声给出。
+- **阶段 C（跨相机身份关联）**：给定各相机检测与各轨迹预测，**枚举**分配方案
+  （人少时穷举），代价 `E = Σ 轨迹 Σ 分配到该轨迹的相机 w_cam·‖重投影根 − 检测中心‖²`，
+  `w_cam = bbox_conf × mean(kpt_conf)`；只有当 `E(best) < E(上一帧方案)·(1−SWITCH_MARGIN)`
+  时才切换（`SWITCH_MARGIN=0.2`），抑制身份抖动。
+- **阶段 D（逐关键点鲁棒三角化）**：见 `triangulate.py::triangulate_point_robust`。
+
+**三条不能踩的线**（都实测踩过，见 CLAUDE.md）：
+
+1. **不用「卡尔曼预测框」当伪检测**。非全图帧曾经把预测框喂给人检测器 → 图像里
+   未必有那个人，姿态凭空生成 → 三角化又「确认」了预测 → 3D→框→姿态→3D 自激回路，
+   根关节 10 帧漂到 1.5m 外。现在帧间观测**只**来自 ROI 小窗里真实图像上的检测。
+2. **根关节绝不回退到四肢**。骨盆（halpe26 #19）三角化失败时用**双髋中点**合成，
+   双髋也没有才置 `root_index=-1`（本帧不更新观测、走纯预测并计 `misses`）。
+   曾经用「置信度最高的关节」兜底，结果选到右手腕 → 卡尔曼观测瞬移 0.5m。
+3. **畸变口径**：`MultiViewTriangulator` 的 `_dlt/reproj/project` 吃**无畸变**像素；
+   ROI 开窗要投到**原始畸变**像素（`project_distorted`），两者不可混用。
+
+**拟合视角选择 `select_fit_views`**：某人只在某台相机的画面边缘露出半截时，人检测框
+被边界裁掉一半，姿态模型会把看不见的另一半**外推**出来（实测 kp 置信 0.2~0.35、
+bbox 高 128~168px），把关节投回该视角差 95~290px。该函数按「bbox 贴边帧 ≥50% 出场帧」
+剔掉这类相机，不足 2 台时回退出场最多的 2 台。离线 20 帧实测重投影误差中位
+36.7px → 18.7px。
 
 ## EasyMocap（按 S）
 

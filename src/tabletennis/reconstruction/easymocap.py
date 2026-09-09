@@ -82,6 +82,34 @@ DEFAULT_MIN_CONF = 0.3
 _MODEL_DIR_CANDIDATES = ["bodymodels", "data/bodymodels"]
 
 
+def select_shape_frames(kp3ds: np.ndarray, top_k: int = 5,
+                        min_joints: int = 8) -> np.ndarray:
+    """从整段 ``kp3ds (T, 25, 4)`` 里挑出**置信度最高的 top_k 帧**下标。
+
+    评分 = 有效关节（``conf > 0``）的平均置信度 × 有效关节占比——只取平均分会被
+    「只有 3 个关节、但都是 0.99」的帧骗到，乘占比才等价于「整具骨架都被可靠看到」。
+
+    Args:
+        kp3ds: ``(T, nJoints, 4)`` 的三角化 3D 关键点（第 4 列是置信度）。
+        top_k: 要选几帧。
+        min_joints: 有效关节数低于该值的帧不参选（防止残缺帧拉偏体型）。
+
+    Returns:
+        升序排列的下标数组（长度 ≤ top_k，至少 2 个——``optimizeShape`` 需要成对骨长）。
+    """
+    kp3ds = np.asarray(kp3ds, dtype=np.float64)
+    conf = kp3ds[..., 3]
+    valid = conf > 0
+    n_valid = valid.sum(axis=1)
+    mean_conf = np.where(valid, conf, 0.0).sum(axis=1) / np.maximum(n_valid, 1)
+    score = mean_conf * (n_valid / max(conf.shape[1], 1))
+    order = np.argsort(-score)
+    keep = [int(i) for i in order if n_valid[i] >= min_joints][:max(1, int(top_k))]
+    if len(keep) < 2:
+        keep = [int(i) for i in order[:max(2, int(top_k))]]
+    return np.asarray(sorted(keep), dtype=int)
+
+
 def _resolve_model_dir(project_data_dir: Optional[str]) -> Optional[str]:
     """找 load_model 的 model_path 目录（含 smpl/SMPL_NEUTRAL.pkl + J_regressor_body25.npy）。"""
     env = os.environ.get("EASYMOCAP_SMPL_DIR")
@@ -410,6 +438,8 @@ class EasymocapReconstructor:
         *,
         min_conf: float = DEFAULT_MIN_CONF,
         view_ids: Optional[List[int]] = None,
+        shape_top_k: int = 5,
+        kp3ds_override: Optional[np.ndarray] = None,
     ) -> Optional[List[Optional[dict]]]:
         """官方多帧批量 SMPL 拟合（视频管线）。
 
@@ -422,6 +452,11 @@ class EasymocapReconstructor:
             frames_obs: 每帧一个 ``{cid: Pose2D}``；空 dict 表示该帧无人（官方管线会对
                 完全无观测的帧做相邻帧插值，输出仍连续）。
             view_ids: 固定相机顺序（投影矩阵 Pall 的行序）。默认 ``sorted(所有出现过的 cid)``。
+            shape_top_k: **SMPL β 只用置信度最高的 K 帧估计**（默认 5，见
+                :func:`select_shape_frames`），姿态/RT 仍在整段上拟合。``0`` = 官方原版
+                （用全部帧一起估 β）。
+            kp3ds_override: 可选的 ``(T, 25, 4)`` 3D 关键点（世界系），用于**替换**内部
+                三角化结果（阶段 D 鲁棒三角化的产物）。None = 用官方 ``batch_triangulate``。
 
         Returns:
             ``List[Optional[dict]]``，与 :meth:`reconstruct` 单帧返回格式一致（每帧一份
@@ -472,6 +507,16 @@ class EasymocapReconstructor:
         bboxes = np.stack(bboxes_list)      # (T, nViews, 5)
         kp3ds = np.stack(kp3ds_list)        # (T, 25, 4)
 
+        # 3D 关键点：优先用调用方给的（阶段 D 鲁棒三角化产物），否则官方 batch_triangulate
+        if kp3ds_override is not None:
+            ov = np.asarray(kp3ds_override, dtype=np.float64)
+            if ov.shape[:2] != (T, kp3ds.shape[1]):
+                print(f"[EasyMocap] kp3ds_override 形状 {ov.shape} 与"
+                      f"(帧数 {T}, 关节 {kp3ds.shape[1]}) 不符，忽略。")
+            else:
+                kp3ds = ov
+                print("[EasyMocap] 3D 关键点改用外部覆盖（阶段 D 鲁棒三角化）")
+
         n_valid_max = int((kp3ds[..., 3] > 0).sum(axis=1).max())
         print(f"[EasyMocap] 批量拟合 {T} 帧 × {len(view_ids)} 视角，"
               f"单帧有效 3D 关节最多 {n_valid_max}/25")
@@ -496,17 +541,43 @@ class EasymocapReconstructor:
         args = _make_args(verbose=self._verbose)
         weight_shape = load_weight_shape("smpl", args.opts)
         weight_pose = load_weight_pose("smpl", args.opts)
-        params = smpl_from_keypoints3d2d(
-            self._model,
-            kp3ds_fit,      # (T_fit, 25, 4)
-            kp2ds_fit,      # (T_fit, nViews, 25, 3)
-            bboxes_fit,     # (T_fit, nViews, 5)
-            Pall,           # (nViews, 3, 4)
-            config=CONFIG["body25"],
-            args=args,
-            weight_shape=weight_shape,
-            weight_pose=weight_pose,
-        )
+
+        # β（体型）只用置信度最高的 shape_top_k 帧估计：全段一起估会被「只有少数
+        # 视角看到的残帧」拉偏；姿态/RT 仍在整段上拟合（时间平滑照旧）。
+        params = None
+        if shape_top_k and shape_top_k > 0 and T_fit > shape_top_k:
+            from easymocap.pipeline.basic import multi_stage_optimize
+            from easymocap.pipeline.config import Config
+            from easymocap.pyfitting import optimizeShape
+
+            idx = select_shape_frames(kp3ds_fit, shape_top_k)
+            print(f"[EasyMocap] β 用置信度最高的 {len(idx)} 帧估计"
+                  f"（帧号 {idx.tolist()} / 共 {T_fit} 帧）")
+            params_init = self._model.init_params(nFrames=1)
+            shape_out = optimizeShape(
+                self._model, params_init, kp3ds_fit[idx],
+                weight_loss=weight_shape,
+                kintree=CONFIG["body15"]["kintree"][1:])
+            params = self._model.init_params(nFrames=T_fit)
+            params["shapes"] = np.asarray(shape_out["shapes"]).copy()
+            cfg = Config(args)
+            cfg.device = self._model.device
+            params = multi_stage_optimize(
+                self._model, params, kp3ds_fit, kp2ds_fit, bboxes_fit, Pall,
+                weight_pose, cfg)
+
+        if params is None:
+            params = smpl_from_keypoints3d2d(
+                self._model,
+                kp3ds_fit,      # (T_fit, 25, 4)
+                kp2ds_fit,      # (T_fit, nViews, 25, 3)
+                bboxes_fit,     # (T_fit, nViews, 5)
+                Pall,           # (nViews, 3, 4)
+                config=CONFIG["body25"],
+                args=args,
+                weight_shape=weight_shape,
+                weight_pose=weight_pose,
+            )
         if params is None:
             print("[EasyMocap] 官方批量拟合返回空。")
             return None
