@@ -1436,15 +1436,18 @@ class _PlayerApp:
         self.win = self.app.create_window(
             f"EasyMocap 重建回放 — {os.path.basename(tl.out_dir)}", width, height)
         self.widget = gui.SceneWidget()
-        # 可拖动时间进度条：SceneWidget 在上、整数 Slider 在下（拖到哪 seek 到哪）
+        # 可拖动时间进度条：SceneWidget + Slider 作为窗口**直接子控件**，用自定义
+        # on_layout 摆放（SceneWidget 占满、Slider 贴底）。⚠️ 别把 SceneWidget 塞进
+        # Vert/Horiz 布局——Open3D 0.19 里那样会让 SceneWidget 坍缩成 0 高度：画面
+        # 不刷新、按键失灵、转视角后整屏空白（正是踩过的坑）。官方
+        # examples/visualization/vis_gui.py 即用「直接子控件 + set_on_layout」。
         self.slider = gui.Slider(gui.Slider.Type.INT)
         self._slider_sync = False           # 程序设值（回显）时挡掉 seek 回调
         self.slider.set_limits(0, max(1, max(0, tl.n_ref - 1)))
         self.slider.set_on_value_changed(self._on_slider)
-        panel = gui.Vert(0, gui.Margins(0, 0, 0, 0))
-        panel.add_child(self.widget)
-        panel.add_child(self.slider)
-        self.win.add_child(panel)
+        self.win.add_child(self.widget)
+        self.win.add_child(self.slider)
+        self.win.set_on_layout(self._on_layout)
 
     def run(self) -> None:
         self._setup()
@@ -1653,6 +1656,17 @@ class _PlayerApp:
             print(f"[回放] ⚠ 2D 叠加显示失败：{exc}")
 
     # -- 时间进度条（拖动 seek）--------------------------------------
+    def _on_layout(self, layout_context) -> None:
+        """自定义窗口布局：SceneWidget 占满、进度条 Slider 贴底。
+
+        SceneWidget 必须是窗口直接子控件才能正常渲染/收键盘（见 __init__ 注释），
+        所以不用 Vert/Horiz 布局，改用 on_layout 手动摆两个子控件的位置与大小。
+        """
+        r = self.win.content_rect
+        slider_h = 24                          # 进度条贴底高度（px）
+        self.widget.frame = self.gui.Rect(r.x, r.y, r.width, max(0, r.height - slider_h))
+        self.slider.frame = self.gui.Rect(r.x, r.get_bottom() - slider_h, r.width, slider_h)
+
     def _on_slider(self, value: float) -> None:
         """用户拖动进度条 → seek 到该帧并暂停（精确看单帧）。"""
         if self._slider_sync:
