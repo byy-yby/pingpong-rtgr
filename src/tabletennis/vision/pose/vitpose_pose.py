@@ -17,8 +17,11 @@ ONNX，与 halpe26 布局只差「halpe 17=头顶」，因此**输出重排成 h
 权重：
 - 来源 ``https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/coco_25/``
 - 名称 ``vitpose-s/b/l-coco_25.onnx``（s 97MB / b 360MB / l 1.2GB）
-- 本地缓存 ``VITPOSE_DIR``（默认 ``/mnt/newdisk1/vitpose``），``VITPOSE_ONNX`` 可覆盖路径。
-  缺失时自动下载到该目录。ViTPose 官方 Apache-2.0（非商用自用没问题）。
+- ``vitpose-h-coco_25`` **不是单文件**：图 226KB + 同目录 394 个外挂权重分片（~2.55GB），
+  必须整目录保留（见 ``_download_h``）。COCO body AP：s/b/l/h = 73.2/75.8/78.3/79.1。
+- 本地缓存 ``VITPOSE_DIR``（默认 ``/mnt/newdisk1/vitpose``，项目内 ``data/weights/vitpose``
+  是它的软链），``VITPOSE_ONNX`` 可覆盖路径。缺失时自动下载到该目录。
+  ViTPose 官方 Apache-2.0（非商用自用没问题）。
 
 关节序（coco_25 = easy_ViTPose 的 BodyWithFeet，25 点）：
   0 nose, 1/2 L/R eye, 3/4 L/R ear, 5 neck, 6/7 L/R shoulder, 8/9 L/R elbow,
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
@@ -63,6 +67,14 @@ VITPOSE_SIZES: Dict[str, int] = {
     "vitpose-l-coco_25": 1_234_336_007,
 }
 
+# ViTPose-h 不是单文件：图文件只有 226 KB，权重以「外挂数据分片」形式放在同名目录里
+# （394 个文件 / ~2.55 GB）。onnxruntime 按图内记录的相对路径去同目录找分片，故必须
+# **整目录一起保留**，路径指向目录里的图文件。
+VITPOSE_H_NAME = "vitpose-h-coco_25"
+VITPOSE_H_DIR = "vitpose-h-coco_25_onnx"
+VITPOSE_H_GRAPH = "vitpose-h-coco_25.onnx"
+VITPOSE_H_GRAPH_SIZE = 225_922
+
 # ImageNet 归一化（0-255 尺度，rtmlib ViTPose 约定）。灰度三通道相等 ⇒ 与 torchvision
 # [0,1] 归一化数值等价（(x-123.675)/58.395 == (x/255-0.485)/0.229）。
 _VP_MEAN = np.asarray((123.675, 116.28, 103.53), dtype=np.float32)
@@ -86,6 +98,13 @@ def resolve_vitpose_onnx(model: str) -> str:
     env = os.environ.get("VITPOSE_ONNX")
     if env:
         return env
+    if model == VITPOSE_H_NAME:
+        local = os.path.join(_default_vitpose_dir(), VITPOSE_H_DIR, VITPOSE_H_GRAPH)
+        if not os.path.exists(local):
+            _download_h()
+        if not os.path.exists(local):
+            raise FileNotFoundError(f"ViTPose-h 图文件仍缺失：{local}")
+        return local
     if model in VITPOSE_URLS:
         url = VITPOSE_URLS[model]
         local = os.path.join(_default_vitpose_dir(), f"{model}.onnx")
@@ -110,6 +129,34 @@ def resolve_vitpose_onnx(model: str) -> str:
         return model
     _download(url, local)
     return local
+
+
+def _download_h() -> None:
+    """下载 ViTPose-h 的图 + 外挂分片（394 文件 / ~2.55GB）到 ``<dir>/vitpose-h-coco_25_onnx/``。
+
+    走 ``huggingface_hub.snapshot_download``（本仓库只发布整目录形式，没有单文件 onnx）。
+    注意：本机 SOCKS 代理会让 huggingface_hub 崩溃，调用前请清掉 ``all_proxy``。
+    """
+    base = _default_vitpose_dir()
+    dest = os.path.join(base, VITPOSE_H_DIR)
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"ViTPose-h 是「图 + 外挂分片」发布（394 文件），需 huggingface_hub 下载。"
+            f"请 pip install huggingface_hub，或手动把整个目录放到 {dest}") from exc
+    stage = os.path.join(base, "_h_stage")
+    print(f"[ViTPose] 下载 vitpose-h（394 个分片，约 2.55GB）...", flush=True)
+    snapshot_download(repo_id="JunkyByte/easy_ViTPose",
+                      allow_patterns=[f"onnx/coco_25/{VITPOSE_H_DIR}/*"],
+                      local_dir=stage, max_workers=8)
+    src = os.path.join(stage, "onnx", "coco_25", VITPOSE_H_DIR)
+    if not os.path.isdir(src):
+        raise RuntimeError(f"下载后未找到 {src}")
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    os.replace(src, dest)
+    print(f"[ViTPose] 下载完成：{dest}", flush=True)
 
 
 def _download(url: str, dest: str) -> None:
@@ -188,8 +235,8 @@ class ViTPosePoseDetector(PoseDetector):
     ``(26, 3)``，``skeleton="halpe26"``，可直接替换下游。逐人推理（ONNX batch=1）。
 
     Args:
-        model: 模型名 ``vitpose-s/b/l-coco_25`` / onnx 路径 / URL。
-            默认 ``vitpose-b-coco_25``（s 97MB 最快、b 360MB 精度甜点、l 1.2GB 最强）。
+        model: 模型名 ``vitpose-s/b/l/h-coco_25`` / onnx 路径 / URL。
+            默认 ``vitpose-b-coco_25``（s 97MB 最快、b 360MB 甜点、l 1.2GB、h 2.55GB 最强）。
         input_size: ViTPose 输入尺寸 ``(H, W)``；None=从 onnx 静态输入读取。
             默认 easy_ViTPose 导出为 256×192 ⇒ (192, 256)。
         det: 人检测器，默认 ``yolo11n-gray``（灰度原生 1ch）。
