@@ -247,6 +247,27 @@ class VideoSource:
             )
         return out
 
+    def seek(self, ref: int) -> None:
+        """把各相机解码位置跳到主时钟 ``ref`` 帧附近（2D 叠加随机查看用）。
+
+        重建管线走顺序解码（``frames_for_ref`` 单调递增），不调用它；这里给
+        「拖进度条 / 首次打开 2D 叠加窗」这类大跳一个快路径：``CAP_PROP_POS_FRAMES``
+        seek 到目标帧最近的关键帧，之后 ``_read`` 再顺序解到精确 ``idx``。h264 无
+        精确随机访问，落点误差几帧内，诊断叠加可接受。
+        """
+        if not (0 <= ref < len(self.maps)):
+            return
+        for cid, idx in self.maps[ref].items():
+            cap = self._caps.get(cid)
+            if cap is None:
+                cap = cv2.VideoCapture(self.files[cid])
+                if not cap.isOpened():
+                    continue
+                self._caps[cid] = cap
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            self._pos[cid] = int(idx) - 1
+            self._cache.pop(cid, None)
+
     def close(self) -> None:
         for cap in self._caps.values():
             cap.release()

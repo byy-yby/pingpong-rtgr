@@ -93,7 +93,7 @@ _SHADOW_LAYERS = (
 # 球轨迹渲染：当前位置球（红）+ 到 t 为止的轨迹线（亮橙，缺测 >GAP 帧断开，不跨回合连线）
 _BALL_COLOR = np.array([0.95, 0.25, 0.18], np.float32)       # 当前位置球
 _BALL_TRAIL_COLOR = np.array([1.00, 0.55, 0.28], np.float32)  # 轨迹线
-_2D_FPS = 15.0                # 播放中 2D 叠加窗最大刷新率（逐帧解 4 路视频太贵，不必跟 3D）
+_2D_SEEK_GAP = 5              # 2D 叠加目标帧与上次相差超过该帧数就 seek（顺序步进保持顺序解）
 # mesh 路径专用（points 模式每帧原地 update，无 remove+add 残留、不需要降频）：
 _AUX_CADENCE = 3             # mesh 播放中「次层几何」（投影软影/接触盘/骨骼/球轨迹）每 N 个
                              # 内容帧才重挂一次——Filament remove+add 每次都有不可回收残留，
@@ -1353,6 +1353,7 @@ class Recon2DOverlay:
         self.session_dir = session_dir
         self.per_cam_size = tuple(per_cam_size)
         self._src = None
+        self._last_t: Optional[int] = None    # 上次取帧的主时钟帧号（判断是否要 seek）
 
     @property
     def available(self) -> bool:
@@ -1377,6 +1378,10 @@ class Recon2DOverlay:
         src = self._source()
         if src is None:
             return None
+        # 大步跳（首次打开 / 拖进度条）先 seek，别从 0 顺序解几千帧；顺序步进走快路径
+        if self._last_t is None or abs(int(t) - self._last_t) > _2D_SEEK_GAP:
+            src.seek(int(t))
+        self._last_t = int(t)
         frames = src.frames_for_ref(int(t))
         if not frames:
             return None
@@ -1424,14 +1429,22 @@ class _PlayerApp:
         self.overlay = overlay              # 2D 检测叠加（可为 None）
         self._2d_win = None
         self._2d_img_widget = None
-        self._last_2d_wall = 0.0            # 2D 叠加刷新节流（见 _refresh_2d）
+        self._last_title = 0.0              # 标题栏更新节流（见 _show）
 
         self.app = gui.Application.instance
         self.app.initialize()
         self.win = self.app.create_window(
             f"EasyMocap 重建回放 — {os.path.basename(tl.out_dir)}", width, height)
         self.widget = gui.SceneWidget()
-        self.win.add_child(self.widget)
+        # 可拖动时间进度条：SceneWidget 在上、整数 Slider 在下（拖到哪 seek 到哪）
+        self.slider = gui.Slider(gui.Slider.Type.INT)
+        self._slider_sync = False           # 程序设值（回显）时挡掉 seek 回调
+        self.slider.set_limits(0, max(1, max(0, tl.n_ref - 1)))
+        self.slider.set_on_value_changed(self._on_slider)
+        panel = gui.Vert(0, gui.Margins(0, 0, 0, 0))
+        panel.add_child(self.widget)
+        panel.add_child(self.slider)
+        self.win.add_child(panel)
 
     def run(self) -> None:
         self._setup()
@@ -1440,6 +1453,13 @@ class _PlayerApp:
         gc.disable()               # 回放期间关自动 GC（几何持久复用后临时对象已很少；
         was_playing = self.playing  # 真需要清积压就暂停时收一次）
         prev_wall = time.perf_counter()   # 上一循环墙钟（含 tick/渲染耗时），驱动实时推进
+        # 稳定节拍：播放按 60Hz 目标出帧（屏刷新率），暂停降到 30Hz 省 CPU。旧实现用固定
+        # sleep(2ms)，循环节奏随 run_one_tick 返回时长随意抖动、渲染次数远超 60Hz 屏能
+        # 显示的量（内容 100fps 时 ~100 次/秒），屏上被迫不均掉帧 → 明显卡顿/抖动。改成
+        # 固定节拍后每次 tick 均匀出帧，被跳过的内容帧也是等间隔，肉眼才顺。
+        frame_dt = 1.0 / 60.0
+        idle_dt = 1.0 / 30.0
+        next_wall = prev_wall
         try:
             while self.app.run_one_tick():
                 now = time.perf_counter()
@@ -1458,15 +1478,22 @@ class _PlayerApp:
                         # 被跳过的帧本来也不会在 60Hz 屏上分得一个刷新。
                         self.t = min(float(n), self.t + dt * self.fps * self.speed)
                 self._show()
-                if self.playing:
-                    time.sleep(0.002)     # 让出一丝调度；tick 自身 ~10ms 已是主节拍
-                else:
-                    if was_playing:
-                        gc.collect()      # 刚暂停/到尾时收一次积压
-                    time.sleep(0.02)      # 暂停：低 CPU 待命
+                if not self.playing and was_playing:
+                    gc.collect()      # 刚暂停/到尾时收一次积压
                 was_playing = self.playing
+                # 睡到下一整拍；渲染/事件超时则重同步，不越掉越多
+                next_wall += frame_dt if self.playing else idle_dt
+                sleep_t = next_wall - time.perf_counter()
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+                else:
+                    next_wall = time.perf_counter()
         finally:
             gc.enable()
+            if self._2d_win is not None:
+                self._2d_win.close()
+            if self.overlay is not None:
+                self.overlay.close()   # 释放四路 VideoCapture，退出不残留句柄/不卡
             self.win.close()
 
     # -- watch：重建进行中，周期性重扫输出目录，追新帧 ----------------------
@@ -1476,6 +1503,7 @@ class _PlayerApp:
         self._watch_last = now
         prev_n, prev_ok = self._watch_prev_n, self._watch_prev_ok
         self.tl.reload()
+        self._update_slider_range()
         new_n, new_ok = self.tl.n_ref, self.tl.n_ok()
         if new_ok != prev_ok or new_n != prev_n:
             self._watch_prev_n, self._watch_prev_ok = new_n, new_ok
@@ -1510,10 +1538,12 @@ class _PlayerApp:
         print(f"[回放] 目标 ≈{self.fps * self.speed:.0f} 帧/秒（录制 {self.fps:.0f}fps = 实时）。"
               f"内容时钟按真实时间跑：渲染跟不上就在 60Hz 屏上自然跳过中间帧，绝不停顿慢放。"
               f"- / + 半速/倍速可调。")
-        print("[回放] 鼠标：左拖=旋转/右拖=平移/滚轮=缩放；Space=播放/暂停（到尾再按=从头），"
-              "←/→=步进，Home/End=首/尾，R=复位视角，S=从头播放，Esc=退出")
+        print("[回放] 鼠标：左拖=旋转/右拖=平移/滚轮=缩放；底部进度条可拖动定位。"
+              "Space=播放/暂停（到尾再按=从头），←/→=步进，Home/End=首/尾，"
+              "R=复位视角，S=暂停，Esc=退出")
         if self.overlay is not None and self.overlay.available:
-            print("[回放] V=开关 2D 检测叠加窗口（四路视频 + 球框 + 关键点）")
+            print("[回放] V=开关 2D 检测叠加窗口（四路视频 + 球框 + 关键点；"
+                  "播放中冻结，暂停/步进/拖进度条时刷新）")
 
     def _warmup(self) -> None:
         """首帧预热：渲染几帧真人，提前编译透明阴影等 shader + 摊平 GPU 缓冲分配。
@@ -1538,7 +1568,7 @@ class _PlayerApp:
         t0 = int(self.t)
         if t0 == self.last_render_t and not self._need_show:
             return
-        force2d = (not self.playing) or self._need_show   # 暂停/步进时 2D 必同步，播放则节流
+        force2d = (not self.playing) or self._need_show   # 暂停/步进时 2D 必同步，播放则冻结
         self._need_show = False
         self.last_render_t = t0
         # 播放中次层几何（影/骨骼/轨迹）降频（apply_* 的 full=False）；暂停/单帧/预热全量
@@ -1546,12 +1576,22 @@ class _PlayerApp:
         person = self.scene_b.apply_people(self.widget.scene, t0, full=paused)
         has_ball = self.scene_b.apply_ball(self.widget.scene, t0, full=paused)
         self.widget.force_redraw()     # 场景变了立即重绘，别等事件流捎带（否则卡/跳帧）
-        rate = self.speed * self.fps
-        self.win.title = (f"EasyMocap 重建回放 — {os.path.basename(self.tl.out_dir)}"
-                          f"  |  t {t0}/{max(0, self.tl.n_ref - 1)}"
-                          f"  |  {'● 人物' if person else '— 无人'}"
-                          f"  |  {'● 球' if has_ball else ''}"
-                          f"  |  x{self.speed:.1f} ≈{rate:.0f}帧/秒")
+        # 进度条回显（只在换帧时同步；程序设值用 _slider_sync 挡住 _on_slider 的 seek）
+        self._slider_sync = True
+        try:
+            self.slider.int_value = t0
+        finally:
+            self._slider_sync = False
+        # 标题栏节流：每帧改 X11 标题会带来卡顿/闪烁，降到 ~4Hz
+        now = time.perf_counter()
+        if now - self._last_title >= 0.25:
+            self._last_title = now
+            rate = self.speed * self.fps
+            self.win.title = (f"EasyMocap 重建回放 — {os.path.basename(self.tl.out_dir)}"
+                              f"  |  t {t0}/{max(0, self.tl.n_ref - 1)}"
+                              f"  |  {'● 人物' if person else '— 无人'}"
+                              f"  |  {'● 球' if has_ball else ''}"
+                              f"  |  x{self.speed:.1f} ≈{rate:.0f}帧/秒")
         self._refresh_2d(force=force2d)
 
     # -- 2D 检测叠加窗口（V 开关）--------------------------------------
@@ -1586,24 +1626,53 @@ class _PlayerApp:
         self._2d_img_widget = None
 
     def _refresh_2d(self, force: bool = False) -> None:
-        """把当前 t 的四路画面推给 2D 叠加窗。
+        """把当前 t 的四路画面推给 2D 叠加窗（只在暂停/步进/开窗时解码）。
 
-        四路视频 + 画框 + resize 一次 ~15-25ms，逐帧解会把回放拖慢；播放中最多
-        ``_2D_FPS`` 次/秒（3D 每帧都换，2D 不必跟那么快），暂停/步进时 force 同步。
+        4 路 100fps 视频若播放中追帧，等于每秒顺序解 ~400 帧 h264（远超实时），
+        每次刷新都要解码上一刷新以来跳过的几十帧，必卡死主循环/叠加窗——这是
+        「按 V 后 UI 卡顿甚至强制退出」的根因。故播放中冻结、暂停/步进/拖进度条
+        时（force）才解码当前帧：诊断叠加即点即得、绝不拖垮 3D 回放。
         """
         if self._2d_img_widget is None or self.overlay is None:
             return
-        now = time.perf_counter()
-        if not force and now - self._last_2d_wall < 1.0 / _2D_FPS:
+        if not force:
             return
-        self._last_2d_wall = now
-        tile = self.overlay.tile(int(self.t))
+        try:
+            tile = self.overlay.tile(int(self.t))
+        except Exception as exc:  # noqa: BLE001 —— 视频解不出来不该拖垮主窗口
+            print(f"[回放] ⚠ 2D 叠加取帧失败：{exc}")
+            return
         if tile is None:
             return
-        img = _o3d().geometry.Image(np.ascontiguousarray(tile))
-        self._2d_img_widget.update_image(img)
-        if self._2d_win is not None:
-            self._2d_win.post_redraw()   # 独立窗口不随主窗口自动重绘，须显式请求
+        try:
+            img = _o3d().geometry.Image(np.ascontiguousarray(tile))
+            self._2d_img_widget.update_image(img)
+            if self._2d_win is not None:
+                self._2d_win.post_redraw()   # 独立窗口不随主窗口自动重绘，须显式请求
+        except Exception as exc:  # noqa: BLE001
+            print(f"[回放] ⚠ 2D 叠加显示失败：{exc}")
+
+    # -- 时间进度条（拖动 seek）--------------------------------------
+    def _on_slider(self, value: float) -> None:
+        """用户拖动进度条 → seek 到该帧并暂停（精确看单帧）。"""
+        if self._slider_sync:
+            return                        # 程序回显触发的回调，忽略
+        t = int(value)
+        if t == int(self.t):
+            return                        # 数值没变（回显）也忽略
+        self.t = float(t)
+        self.playing = False
+        self._need_show = True
+
+    def _update_slider_range(self) -> None:
+        """主时钟帧数变化（watch 追帧）时同步进度条上限。"""
+        hi = max(1, max(0, self.tl.n_ref - 1))
+        if int(self.slider.get_maximum_value) != hi:
+            self._slider_sync = True
+            try:
+                self.slider.set_limits(0.0, float(hi))
+            finally:
+                self._slider_sync = False
 
     def _on_key(self, ev) -> bool:
         k = ev.key
@@ -1615,6 +1684,7 @@ class _PlayerApp:
             n = max(0, self.tl.n_ref - 1)
             if self.playing:
                 self.playing = False
+                self._need_show = True
             elif self.t >= float(n):
                 # 停在末尾时按 Space = 从头再放（旧实现是死键：t 到 n 后 _step 直接
                 # return，再也播不起来）。残留已在每次播放里被 降频+限速 压到很小，
@@ -1644,8 +1714,7 @@ class _PlayerApp:
         elif k == ord("R"):
             self.widget.setup_camera(50.0, self.scene_b.bounds(), self.scene_b.center())
         elif k == ord("s") or k == ord("S"):
-            self.t = 0.0
-            self.playing = True
+            self.playing = False          # S = 暂停（不再是「从头播放」）
             self._need_show = True
         elif k == ord("V") or k == ord("v"):
             self._toggle_2d()
