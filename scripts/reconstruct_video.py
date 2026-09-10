@@ -85,6 +85,27 @@ def _median(x):
     return float(np.median(x)) if x else float("nan")
 
 
+def _err_summary(arr) -> Dict[str, float]:
+    """逐帧误差序列 → ``{median, mean, p90}``（都是「每帧一个数、再对帧聚合」）。
+
+    中位数 = 典型的一帧；平均数 > 中位数说明有长尾（少数帧被遮挡/动作怪异时误差拉到几倍）；
+    p90 量化这个长尾有多长。
+    """
+    x = np.asarray([v for v in arr
+                    if v is not None and not (isinstance(v, float) and np.isnan(v))],
+                   np.float64)
+    if not x.size:
+        nan = float("nan")
+        return {"median": nan, "mean": nan, "p90": nan}
+    return {"median": float(np.median(x)), "mean": float(np.mean(x)),
+            "p90": float(np.percentile(x, 90))}
+
+
+def _fmt_err(tag: str, s: Dict[str, float]) -> str:
+    return (f"{tag}中位 {s['median']:6.2f} / 平均 {s['mean']:6.2f} / "
+            f"p90 {s['p90']:6.2f} px")
+
+
 # ----------------------------------------------------------------------
 # 合成站姿观测（--fake-poses）：用同一套 2D 投影生成一个固定人，模拟每帧检测结果
 # ----------------------------------------------------------------------
@@ -133,20 +154,42 @@ def fake_obs_for(recon, intrinsics, extrinsics, cids, rng=None):
     return best
 
 
-def _proj_err_px(Pall: np.ndarray, kp2d: np.ndarray, j25: np.ndarray) -> tuple:
-    """拟合出的 body25 关节（世界系）投影回各视角 vs 观测 2D 的重投影误差 (mean, max) px。"""
-    errs = []
-    for i in range(kp2d.shape[0]):
+def _proj_err_multi(Pall: np.ndarray, kp2d: np.ndarray, j25: np.ndarray) -> tuple:
+    """拟合出的 body25 关节（世界系）投影回各视角 vs 观测 2D 的重投影误差。
+
+    返回 ``(mean_all, mean_best, worst)`` 三个像素值（只统计 conf>0 的观测）：
+
+    - ``mean_all``：所有 (视角,关节) 的均值 —— 每个视角**等权**。这是拟合的输入口径，
+      但低置信度视角的 2D 本身就不准（遮挡/外推），拿它当基准会污染指标。
+    - ``mean_best``：**每个关节只取置信度最高的那台相机**再取均值 —— 高置信度的 2D
+      更接近真值（误差随 conf 单调下降：conf 0.9-1.0 → 2.2cm，0.3-0.5 → 14.9cm，
+      见 docs/error_budget_report.md §1），所以这个口径更接近「和 Ground Truth 比」。
+      注意它与拟合目标不同源（拟合是加权最小二乘、不是只压最高 conf 那台），
+      数值天然比 ``mean_all`` 低。
+    - ``worst``：单个 (视角,关节) 的最大误差，长尾用。
+    """
+    nv = kp2d.shape[0]
+    dist = np.full((nv, 25), np.nan, np.float64)
+    for i in range(nv):
         c = np.hstack([j25, np.ones((25, 1))]) @ Pall[i].T      # (25,3) 相机系
         uv = c[:, :2] / c[:, 2:3]
         m = kp2d[i, :, 2] > 0
         if m.sum() == 0:
             continue
-        errs.append(np.linalg.norm(uv[m] - kp2d[i, m, :2], axis=1))
-    if not errs:
-        return float("nan"), float("nan")
-    all_err = np.concatenate(errs)
-    return float(np.mean(all_err)), float(np.max(all_err))
+        dist[i, m] = np.linalg.norm(uv[m] - kp2d[i, m, :2], axis=1)
+    valid = np.isfinite(dist)
+    if not valid.any():
+        return float("nan"), float("nan"), float("nan")
+    mean_all = float(np.mean(dist[valid]))
+    worst = float(np.max(dist[valid]))
+
+    # 逐关节挑 conf 最高的有效视角（无效视角给 -1 保证选不中）
+    conf = np.where(valid, kp2d[:, :, 2], -1.0)
+    best_row = conf.argmax(axis=0)
+    best_col = np.arange(25)
+    ok = valid[best_row, best_col]
+    mean_best = float(np.mean(dist[best_row[ok], best_col[ok]])) if ok.any() else float("nan")
+    return mean_all, mean_best, worst
 
 
 # ----------------------------------------------------------------------
@@ -631,7 +674,7 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
 
     # ---- 逐帧合并多人结果 + 写档 ----
     n_ok = n_gap = 0
-    err_mean_arr, err_worst_arr = [], []
+    err_mean_arr, err_best_arr, err_worst_arr = [], [], []
     idx_arr, status_arr, wall_arr = [], [], []
     code = {"ok": 0, "no_person": 1, "fit_failed": 2, "error": 3}
     per_frame_ms = (det_wall + fit_wall) / max(1, len(indices)) * 1000.0
@@ -644,7 +687,8 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
         if not people:
             n_gap += 1
             idx_arr.append(k); status_arr.append(code["no_person"]); wall_arr.append(per_frame_ms)
-            err_mean_arr.append(float("nan")); err_worst_arr.append(float("nan"))
+            err_mean_arr.append(float("nan")); err_best_arr.append(float("nan"))
+            err_worst_arr.append(float("nan"))
             continue
         # 重投影误差：逐人算，跨人取均值/最差
         errs = []
@@ -660,12 +704,14 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             Pall_g = np.stack([intrinsics[c].K
                                @ np.hstack([extrinsics[c].R, extrinsics[c].t.reshape(3, 1)])
                                for c in cids_g])
-            e = _proj_err_px(Pall_g, kp2d, np.asarray(r[t]["joints_body25"]))
+            e = _proj_err_multi(Pall_g, kp2d, np.asarray(r[t]["joints_body25"]))
             if np.isfinite(e[0]):
                 errs.append(e)
         em = float(np.mean([e[0] for e in errs])) if errs else float("nan")
-        ew = float(np.max([e[1] for e in errs])) if errs else float("nan")
-        err_mean_arr.append(em); err_worst_arr.append(ew)
+        eb = float(np.mean([e[1] for e in errs if np.isfinite(e[1])])) \
+            if any(np.isfinite(e[1]) for e in errs) else float("nan")
+        ew = float(np.max([e[2] for e in errs])) if errs else float("nan")
+        err_mean_arr.append(em); err_best_arr.append(eb); err_worst_arr.append(ew)
         idx_arr.append(k); status_arr.append(code["ok"]); wall_arr.append(per_frame_ms)
         n_ok += 1
         ensure_faces(out_dir, people[0])
@@ -682,7 +728,9 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
              status=np.asarray(status_arr, np.int8),
              wall_ms=np.asarray(wall_arr, np.float64),
              err_mean_px=np.asarray(err_mean_arr, np.float64),
+             err_best_px=np.asarray(err_best_arr, np.float64),
              err_worst_px=np.asarray(err_worst_arr, np.float64))
+    es_all, es_best = _err_summary(err_mean_arr), _err_summary(err_best_arr)
     index_data = {
         "session_dir": args.session_dir, "out_dir": out_dir,
         "config": args.config, "stride": args.stride,
@@ -696,7 +744,17 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
         "assoc": "tracker" if use_tracker else "fixed",
         "shape_top_k": args.shape_top_k,
         "robust_kp3d": bool(use_tracker and not args.no_robust_kp3d),
-        "reproj_err_mean_px_median": _median(err_mean_arr),
+        "reproj_err_mean_px_median": es_all["median"],
+        "reproj_err_mean_px_mean": es_all["mean"],
+        "reproj_err_mean_px_p90": es_all["p90"],
+        "reproj_err_best_px_median": es_best["median"],
+        "reproj_err_best_px_mean": es_best["mean"],
+        "reproj_err_best_px_p90": es_best["p90"],
+        "reproj_err_metric_note": (
+            "每帧每人把 SMPL 的 25 个 body25 关节投回各拟合视角取像素距离；"
+            "先对 (视角×关节) 取均值 → 对人数取均值 → 得每帧一个数 → 再对帧取 median/mean/p90。"
+            "mean_* = 所有视角等权；best_* = 每个关节只取置信度最高的那台相机"
+            "（低置信度视角的 2D 是外推的，拿它当基准会污染指标）。只统计 conf>0 的观测。"),
         "source": src.summary(),
     }
     with open(os.path.join(out_dir, "recon_meta.json"), "w", encoding="utf-8") as fh:
@@ -704,7 +762,9 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     print("=== 完成 ===")
     print(f"  处理 {len(indices)} 帧（ok={n_ok}, 无人缺口={n_gap}）耗时 {wall_s:.1f}s")
     print(f"  检测 {det_wall:.1f}s + 批量拟合 {fit_wall:.1f}s（{n_people} 人）")
-    print(f"  重投影误差中位 {_median(err_mean_arr):.2f}px |  → {out_dir}")
+    print(f"  重投影误差·全部视角     {_fmt_err('', es_all)}")
+    print(f"  重投影误差·最高置信视角 {_fmt_err('', es_best)}")
+    print(f"  → {out_dir}")
 
 
 def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
@@ -949,11 +1009,11 @@ def main() -> None:
         # 重投影误差（拟合关节 vs 观测，px）
         kp2d, _, Pall = recon._to_body25_2d(best, intrinsics, extrinsics, min_conf=0.0)
         if kp2d is not None:
-            em, ew = _proj_err_px(Pall, kp2d, np.asarray(res["joints_body25"]))
+            em, eb, ew = _proj_err_multi(Pall, kp2d, np.asarray(res["joints_body25"]))
         else:
-            em = ew = float("nan")
+            em = eb = ew = float("nan")
         return res, {"status": "ok", "cam_idx": {c: src.maps[k][c] for c in best},
-                     "err_mean": em, "err_worst": ew}
+                     "err_mean": em, "err_best": eb, "err_worst": ew}
 
     prev = None
     n_total = src.n_ref
@@ -966,7 +1026,8 @@ def main() -> None:
     err_list = []
 
     # 汇总数组（与 indices 一一对应，供 recon_index.npz 快速画图/分析）
-    idx_arr, status_arr, wall_arr, err_mean_arr, err_worst_arr = [], [], [], [], []
+    idx_arr, status_arr, wall_arr = [], [], []
+    err_mean_arr, err_best_arr, err_worst_arr = [], [], []
     code = {"ok": 0, "no_person": 1, "fit_failed": 2, "error": 3}
 
     for i, k in enumerate(indices):
@@ -988,9 +1049,11 @@ def main() -> None:
             save_one(out_dir, k, res, dt, extra.get("err_mean"),
                      extra.get("err_worst"), extra.get("cam_idx"))
             err_mean_arr.append(extra.get("err_mean"))
+            err_best_arr.append(extra.get("err_best"))
             err_worst_arr.append(extra.get("err_worst"))
         else:
             err_mean_arr.append(float("nan"))
+            err_best_arr.append(float("nan"))
             err_worst_arr.append(float("nan"))
             if status == "no_person":
                 n_gap += 1
@@ -1010,7 +1073,9 @@ def main() -> None:
              status=np.asarray(status_arr, np.int8),
              wall_ms=np.asarray(wall_arr, np.float64),
              err_mean_px=np.asarray(err_mean_arr, np.float64),
+             err_best_px=np.asarray(err_best_arr, np.float64),
              err_worst_px=np.asarray(err_worst_arr, np.float64))
+    es_all, es_best = _err_summary(err_mean_arr), _err_summary(err_best_arr)
     index_data = {
         "session_dir": session_dir, "out_dir": out_dir,
         "config": args.config, "stride": args.stride,
@@ -1019,7 +1084,17 @@ def main() -> None:
         "ok": n_ok, "no_person_gap": n_gap, "failed": n_fail,
         "wall_s": round(wall_s, 3),
         "recon_per_frame_ms_median": _median(wall_ms_list),
-        "reproj_err_mean_px_median": _median(err_mean_arr),
+        "reproj_err_mean_px_median": es_all["median"],
+        "reproj_err_mean_px_mean": es_all["mean"],
+        "reproj_err_mean_px_p90": es_all["p90"],
+        "reproj_err_best_px_median": es_best["median"],
+        "reproj_err_best_px_mean": es_best["mean"],
+        "reproj_err_best_px_p90": es_best["p90"],
+        "reproj_err_metric_note": (
+            "每帧每人把 SMPL 的 25 个 body25 关节投回各拟合视角取像素距离；"
+            "先对 (视角×关节) 取均值 → 对人数取均值 → 得每帧一个数 → 再对帧取 median/mean/p90。"
+            "mean_* = 所有视角等权；best_* = 每个关节只取置信度最高的那台相机"
+            "（低置信度视角的 2D 是外推的，拿它当基准会污染指标）。只统计 conf>0 的观测。"),
         "source": src.summary(),
     }
     with open(os.path.join(out_dir, "recon_meta.json"), "w", encoding="utf-8") as fh:
@@ -1027,7 +1102,9 @@ def main() -> None:
     print("=== 完成 ===")
     print(f"  处理 {len(indices)} 帧（ok={n_ok}, 无人缺口={n_gap}, 失败={n_fail}）耗时 {wall_s:.1f}s")
     print(f"  平均 {wall_s/max(1, len(indices))*1000:.0f}ms/帧 | 单帧中位 {_median(wall_ms_list):.0f}ms")
-    print(f"  重投影误差中位 {_median(err_mean_arr):.2f}px |  → {out_dir}")
+    print(f"  重投影误差·全部视角     {_fmt_err('', es_all)}")
+    print(f"  重投影误差·最高置信视角 {_fmt_err('', es_best)}")
+    print(f"  → {out_dir}")
 
 
 def ensure_faces(out_dir: str, res: dict) -> None:
