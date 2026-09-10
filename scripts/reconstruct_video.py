@@ -775,7 +775,7 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
     yolo`` / ``--ball-model`` 走 onnxruntime YOLO。结果写 ``out_dir/ball_trajectory.npz``
     （每帧 ``ref_frame`` + 3D 球心 ``X``，失败帧 ``X=NaN``），供 visualize_recon.py 回放渲染。
     """
-    from tabletennis.reconstruction.ball import triangulate_ball
+    from tabletennis.reconstruction.ball import ball_reproj_errors, triangulate_ball
     from tabletennis.reconstruction.obs2d import ball_to_dict, save_ball2d
     from tabletennis.reconstruction.triangulate import MultiViewTriangulator
     from tabletennis.vision.ball import ClassicalBallDetector, YoloBallDetector
@@ -812,6 +812,7 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
 
     ref_arr, X_arr = [], []
     conf_arr, err_arr, nv_arr, ang_arr = [], [], [], []
+    err_all_arr, err_best_arr = [], []
     ball2d_by_frame = {}
     t0 = time.time()
     n_ball = 0
@@ -845,11 +846,16 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
             X_arr.append(np.asarray(X, np.float64).reshape(3))
             conf_arr.append(float(conf)); err_arr.append(float(err))
             nv_arr.append(int(nv)); ang_arr.append(float(ang))
+            # 重投影误差两口径（all=视角等权 / best=只取置信度最高的那台相机）
+            ea, eb, _ew, _nvb = ball_reproj_errors(
+                balls, X, triangulator, min_conf=args.ball_min_conf)
+            err_all_arr.append(ea); err_best_arr.append(eb)
             n_ball += 1
         else:
             X_arr.append(np.full(3, np.nan))
             conf_arr.append(0.0); err_arr.append(np.nan)
             nv_arr.append(0); ang_arr.append(0.0)
+            err_all_arr.append(np.nan); err_best_arr.append(np.nan)
         if len(ref_arr) % max(1, args.progress) == 0:
             print(f"  球重建 {len(ref_arr)}/{len(indices)}（主时钟 {k}/{src.n_ref}，"
                   f"已成功 {n_ball}）")
@@ -862,11 +868,14 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
         X=np.asarray(X_arr, np.float64),
         conf=np.asarray(conf_arr, np.float64),
         reproj_err=np.asarray(err_arr, np.float64),
+        reproj_err_all=np.asarray(err_all_arr, np.float64),
+        reproj_err_best=np.asarray(err_best_arr, np.float64),
         n_views=np.asarray(nv_arr, np.int32),
         angle_deg=np.asarray(ang_arr, np.float64),
     )
     if ball2d_by_frame:
         save_ball2d(out_dir, ball2d_by_frame)
+    b_all, b_best = _err_summary(err_all_arr), _err_summary(err_best_arr)
     with open(os.path.join(out_dir, "ball_meta.json"), "w", encoding="utf-8") as fh:
         json.dump({
             "detector": "yolo" if ball_det is not None else "classical",
@@ -874,9 +883,22 @@ def run_ball_recon(args, src, intrinsics, extrinsics, cids_ok, out_dir):
             "n_frames": len(indices), "ok": n_ball,
             "wall_s": round(wall, 3),
             "ref_cam": src.ref_cam,
+            "reproj_err_all_px_median": b_all["median"],
+            "reproj_err_all_px_mean": b_all["mean"],
+            "reproj_err_all_px_p90": b_all["p90"],
+            "reproj_err_best_px_median": b_best["median"],
+            "reproj_err_best_px_mean": b_best["mean"],
+            "reproj_err_best_px_p90": b_best["p90"],
+            "reproj_err_metric_note": (
+                "球心的 3D 位置由各视角 2D 检测直接加权 DLT 得到，故这里的「重投影误差」"
+                "= 三角化自身的残差（跨视角一致性），不是和真值比；只统计参与三角化的视角"
+                "（conf>=min_conf 且去畸变成功）。all = 各视角等权；best = 只取置信度最高的"
+                "那台相机（低置信度检测的球心会飘，拿它当基准会污染指标）。"),
         }, fh, ensure_ascii=False, indent=2)
     print(f"球轨迹：{n_ball}/{len(indices)} 帧三角化成功，耗时 {wall:.1f}s"
           f" → {os.path.join(out_dir, 'ball_trajectory.npz')}")
+    print(f"  球重投影误差·全部视角     {_fmt_err('', b_all)}")
+    print(f"  球重投影误差·最高置信视角 {_fmt_err('', b_best)}")
     return {"n_frames": len(indices), "ok": n_ball, "wall_s": round(wall, 3)}
 
 

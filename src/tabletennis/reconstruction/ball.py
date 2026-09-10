@@ -17,7 +17,7 @@ from .triangulate import (
     undistort_keypoints,
 )
 
-__all__ = ["triangulate_ball"]
+__all__ = ["triangulate_ball", "ball_reproj_errors", "undistort_ball_center"]
 
 
 def undistort_ball_center(
@@ -85,3 +85,62 @@ def triangulate_ball(
     if nviews[0] < 2:
         return None
     return (X[0], float(conf3[0]), float(err[0]), int(nviews[0]), float(angle[0]))
+
+
+def ball_reproj_errors(
+    balls: Dict[int, Ball2D],
+    X: np.ndarray,
+    triangulator: MultiViewTriangulator,
+    min_conf: float = DEFAULT_MIN_CONF,
+) -> Tuple[float, float, float, int]:
+    """球心的重投影误差（像素）：``(err_all, err_best, err_worst, n_views)``。
+
+    「误差」= 把重建出的 3D 球心用 ``P = K·[R|t]`` 投回各相机，与该相机检出的 2D 球心
+    的欧氏距离（都在**无畸变**像素系，与三角化内部一致）。球没有 SMPL 那样的拟合步骤，
+    3D 直接由 2D 最小二乘三角化得到，所以这个误差就是**三角化自身的残差**（跨视角一致性），
+    **不是「和真值比」**——真值要靠 `scripts/error_budget/aruco_gt.py` 那类刚性靶标。
+
+    两个口径（与姿态的 ``reconstruct_video.py::_proj_err_multi`` 对齐）：
+    - ``err_all``：所有参与视角**等权**取均值 —— 就是三角化目标函数的口径。
+    - ``err_best``：**只取置信度最高的那台相机**的残差。球检测置信度低时球心会飘
+      （反光/遮挡/运动模糊/半个球出画），拿它当基准会污染指标；高置信度那台更接近真值。
+    - ``err_worst``：参与视角里最差的一个，长尾用。
+
+    参与视角的判定与 :func:`triangulate_ball` 完全一致（``conf >= min_conf`` 且去畸变成功），
+    保证两个口径的**分母与三角化实际用到的视角一致**。
+
+    Returns:
+        ``(err_all, err_best, err_worst, n_views)``；3D 非法或无参与视角时误差为 NaN、
+        ``n_views=0``。
+    """
+    X = np.asarray(X, dtype=np.float64).reshape(3)
+    if not np.isfinite(X).all():
+        return float("nan"), float("nan"), float("nan"), 0
+
+    dists: list = []
+    confs: list = []
+    for cid in triangulator.cameras:
+        ball = balls.get(cid)
+        if ball is None:
+            continue
+        cf = float(ball.confidence)
+        if cf < min_conf:
+            continue
+        p = undistort_ball_center(ball, triangulator.K[cid], triangulator.dist[cid])
+        if p is None:
+            continue
+        ph = triangulator.P[cid] @ np.append(X, 1.0)
+        if abs(float(ph[2])) < 1e-12:
+            continue
+        uv = ph[:2] / ph[2]
+        dists.append(float(np.hypot(uv[0] - p[0], uv[1] - p[1])))
+        confs.append(cf)
+    if not dists:
+        return float("nan"), float("nan"), float("nan"), 0
+
+    d = np.asarray(dists, dtype=np.float64)
+    c = np.asarray(confs, dtype=np.float64)
+    return (float(np.mean(d)),                     # all：视角等权
+            float(d[int(np.argmax(c))]),           # best：置信度最高那台
+            float(np.max(d)),                      # worst
+            int(d.size))
