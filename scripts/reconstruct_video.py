@@ -35,9 +35,16 @@
             前提是每相机只拍到一个人。单人用 ``--person-groups "[[1,3]]"``。
 
 SMPL β 只用置信度最高的 ``--shape-top-k`` 帧估计（默认 5，0=官方原版用全部帧）。
+
+``--pose-model`` 默认 **vitpose-h-coco_25**（ViTPose 最大档，离线不追推理速度）。固定观测集
+A/B（2 段视频）：h 比原默认 vitpose-b 重投影中位 −0.77/−0.92px、根关节最坏跳变
+14.8→3.9cm；vitpose-l 与 h 基本持平（−0.03/−0.79px）但快 ~2.8×，要速度切 ``--pose-model
+vitpose-l-coco_25``。h 的 onnx 是「226KB 图 + 394 个外挂分片」同目录结构，缺任一分片都加载不了。
+
 ``--det-conf`` 人检测阈值（默认 0.2）、
-``--fit-conf`` 拟合关键点阈值（默认 0.15）——黑衣服/低亮度人关键点置信度偏低，
-阈值太高会把 2D 已检出的关节在 3D 拟合里丢掉，致其退化成均值模型。
+``--fit-conf`` 拟合关键点阈值（**默认 0.5**）——低置信度关节不参与拟合。早期用 0.15
+是想给黑衣服/低亮度人多留约束，但固定观测集 A/B 证明 0.5 在同批点上更准（见
+``--fit-conf`` 的 help）。真要放宽用 ``--fit-conf 0.15`` 回退。
 
 调试选项
   --fake-poses  不跑检测，注入一个合成站姿人观测 → 专用于验证 录制→对齐→重建→存档
@@ -153,11 +160,36 @@ def build_args():
     ap.add_argument("--min-cams", type=int, default=2)
     ap.add_argument("--det-conf", type=float, default=0.2,
                     help="人检测置信度阈值（yolo11n bbox；黑衣服/低亮度人易被漏检，离线降到 0.2 少丢人）")
-    ap.add_argument("--fit-conf", type=float, default=0.15,
-                    help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此被丢弃；黑衣服人关键点偏低，降到 0.15 保留更多约束）")
-    ap.add_argument("--pose-model", default="vitpose-b-coco_25",
-                    help="姿态模型（默认 vitpose-b-coco_25，ViTPose：coco_25 25 点含脚，"
-                         "输出重排成 halpe26；vitpose-s 最快 / b 甜点 / l 最强）/ "
+    ap.add_argument("--fit-conf", type=float, default=0.5,
+                    help="SMPL 拟合关键点置信度阈值（halpe26 关键点低于此不参与拟合）。"
+                         "默认 0.5：固定观测集 A/B（3 段视频）比 0.15 在同批点上重投影更小、"
+                         "根关节抖动的最大值从 14.8cm 降到 7.7cm，无任何指标变差；"
+                         "ViTPose 的 conf 中位 0.87~0.90，0.5 不会误杀真实关节。")
+    ap.add_argument("--consensus-sigma", type=float, default=0.0,
+                    help="多视角 3D 共识降权（默认 0=关闭）：2D 观测与鲁棒三角化 3D 的偏差达到"
+                         "该像素值时权重降到 0.5（Cauchy）。0=关闭。实测 2D 系统性偏差占误差 "
+                         "39~48%%，该项专治「单视角偏/外推」的关节。**固定观测集 A/B（3 段视频）"
+                         "结论：开启后留出视角重投影 −7%%（14.71→13.69px，但留出视角恰是共识参考"
+                         "用到的相机，有循环成分），代价是拟合视角重投影 +2%%（11.83→12.18px）与 "
+                         "p0 根关节抖动中位 +0.04cm（0.20→0.24）。净账不划算故默认关；"
+                         "想让最坏跳变从 7.7cm 再降到 4.0cm 时用 --consensus-sigma 10")
+    ap.add_argument("--consensus-max", type=float, default=30.0,
+                    help="多视角 3D 共识降权：偏差超过该像素值直接丢弃该视角该关节（仅 sigma>0 时生效）")
+    ap.add_argument("--no-consensus-filter", action="store_true",
+                    help="关闭多视角 3D 共识降权（用于 A/B 对照）")
+    ap.add_argument("--save-pass1", default=None, metavar="PATH",
+                    help="把 Pass 1（检测+身份关联）的观测存成 npz，供后续 --load-pass1 秒级重跑拟合")
+    ap.add_argument("--load-pass1", default=None, metavar="PATH",
+                    help="跳过检测，直接读 --save-pass1 存的观测（保证 A/B 的 2D 输入逐位一致）")
+    ap.add_argument("--pose-model", default="vitpose-h-coco_25",
+                    help="姿态模型（默认 vitpose-h-coco_25 = ViTPose 最大档，离线不追速度就取最强；"
+                         "coco_25 25 点含脚，输出重排成 halpe26）。"
+                         "固定观测集 A/B（2 段视频，同批 2D 点）：h 比 vitpose-b 重投影中位 "
+                         "−0.77/−0.92px、根关节最坏跳变 14.8→3.9cm；"
+                         "vitpose-l 与 h 基本持平（一段 −0.03px、一段 −0.79px）但推理快 ~2.8×，"
+                         "要速度用 vitpose-l-coco_25。"
+                         "h 是「226KB 图 + 394 个外挂分片」目录（~2.55GB，首次自动下载，"
+                         "分片必须与图同目录，别单独拷 .onnx）/ "
                          "rtmpose-x-halpe26（384×288，RTMPose）/ rtmpose-l-halpe26（256×192）")
     ap.add_argument("--pose-input-size", type=int, nargs=2, default=(288, 384),
                     metavar=("H", "W"), help="姿态模型输入尺寸 (H, W)（RTMPose 用，默认 288 384；"
@@ -194,9 +226,14 @@ def build_args():
                     help="下半身门：下半身中位置信 < 该比例 × 同视角上半身中位（默认 0.5）")
     ap.add_argument("--lower-body-conf-abs", type=float, default=0.5,
                     help="下半身门：且下半身中位置信 < 该绝对值（默认 0.5）")
+    ap.add_argument("--mask-hips-when-unreliable", action="store_true",
+                    help="tracker：被判「下半身不可信」的视角**连髋（halpe26 11/12/19）也丢**，"
+                         "即该视角只用上半身。默认关闭——实测远端视角的髋残差 3.5cm（近端 "
+                         "5.5cm）、置信 0.84，比近端还准，丢掉它会削弱骨盆（拟合根）的约束；"
+                         "真正烂的是膝以下（踝 27cm、脚 42~49cm），已由下半身门覆盖")
     ap.add_argument("--upper-body-only", type=int, nargs="+", default=None,
                     metavar="PID",
-                    help="指定身份只用上半身重建（膝/踝/脚尖/脚跟的 2D 与 3D 数据全部丢弃，"
+                    help="指定身份只用上半身重建（下半身 + 髋的 2D 与 3D 数据全部丢弃，"
                          "腿部交给 SMPL 先验），如 --upper-body-only 0")
     ap.add_argument("--out", default=None, help="输出目录（默认 <session>/recon）")
     ap.add_argument("--root", default=None,
@@ -301,6 +338,7 @@ def _pass1_tracker(args, src, detector, triangulator, indices, cids_ok, n_people
         lower_body_gate=not args.no_lower_body_gate,
         lower_body_conf_ratio=args.lower_body_conf_ratio,
         lower_body_conf_abs=args.lower_body_conf_abs,
+        mask_hips_when_unreliable=args.mask_hips_when_unreliable,
     )
     # 卡尔曼 dt 用录制真实帧率（100fps 外部触发 → 0.01s；编码丢帧由 pulse 对齐吸收）
     try:
@@ -448,7 +486,25 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
     lower_gate = {g: {} for g in range(n_people)}           # pid -> {cid: 被判不可信的帧数}
     t_global0 = time.time()
     t0 = time.time()
-    if use_tracker and not args.fake_poses:
+    kp3ds_by_pid: dict = {}                                 # pid -> (T,25,4) 鲁棒 3D
+    if args.load_pass1:
+        # 跳过检测：读缓存的观测（A/B 调拟合参数时用，2D 输入逐位一致）
+        from tabletennis.reconstruction.obs_cache import load_pass1
+        cache = load_pass1(args.load_pass1)
+        if cache["n_people"] != n_people:
+            print(f"  ⚠ 缓存里是 {cache['n_people']} 人，命令行给的是 {n_people} 人，"
+                  f"以缓存为准")
+            n_people = cache["n_people"]
+        indices = cache["indices"]
+        frames_obs_by_pid = cache["frames_obs_by_pid"]
+        kp3ds_by_pid = cache["kp3ds_by_pid"]
+        lower_gate = cache["lower_gate"]
+        n_seen_by_pid = {g: sum(1 for o in frames_obs_by_pid[g] if o)
+                         for g in range(n_people)}
+        stats = [f"p{g} 出现 {n_seen_by_pid[g]} 帧" for g in range(n_people)]
+        print(f"  Pass 1 从缓存读取 {args.load_pass1}：{len(indices)} 帧 × "
+              f"{len(cache['cids'])} 视角")
+    elif use_tracker and not args.fake_poses:
         stats = _pass1_tracker(args, src, detector, triangulator, indices, cids_ok,
                                n_people, frames_obs_by_pid, frames_robust_by_pid,
                                n_seen_by_pid, pose2d_by_frame, lower_gate,
@@ -492,6 +548,34 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
         for g, v in enumerate(fit_views):
             print(f"  p{g} 拟合视角：{v if v else '（无）'}")
 
+    # 鲁棒 3D（阶段 D）统一在这里算一次：既给 Pass 2 当 3D 覆盖，也给共识降权当参照
+    if use_tracker and not args.no_robust_kp3d and not kp3ds_by_pid:
+        for g in range(n_people):
+            ov = _robust_kp3ds_override(
+                frames_robust_by_pid[g], frames_obs_by_pid[g])
+            if int((ov[..., 3] > 0).any(axis=1).sum()) == 0:
+                continue        # 阶段 D 无结果（如 --fake-poses）→ 不覆盖
+            kp3ds_by_pid[g] = ov
+
+    if args.save_pass1 and not args.load_pass1:
+        from tabletennis.reconstruction.obs_cache import save_pass1
+        save_pass1(args.save_pass1, frames_obs_by_pid, frames_robust_by_pid,
+                   indices, cids_ok, lower_gate, robust_override=kp3ds_by_pid)
+        print(f"  Pass 1 观测已存 {args.save_pass1}")
+
+    # ---- P0-1：按多视角 3D 共识给 2D 观测降权（见 obs_filter.py）----
+    if not args.no_consensus_filter:
+        from tabletennis.reconstruction.obs_filter import (
+            ConsensusConfig, filter_obs_by_consensus, format_stats,
+        )
+        cfgc = ConsensusConfig(sigma_px=args.consensus_sigma,
+                               max_px=args.consensus_max)
+        for g in range(n_people):
+            frames_obs_by_pid[g], st = filter_obs_by_consensus(
+                frames_obs_by_pid[g], kp3ds_by_pid.get(g),
+                intrinsics, extrinsics, cfgc)
+            print("  " + format_stats(st, f"p{g} 共识降权"))
+
     # ---- Pass 2：逐人批量拟合 ----
     t0 = time.time()
     results_by_pid = {}
@@ -503,10 +587,10 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
                 print(f"  ⚠ --upper-body-only {g} 超出身份范围 0..{n_people - 1}，忽略")
                 continue
             frames_obs_by_pid[g] = [
-                {cid: mask_lower_body(p) for cid, p in obs.items()}
+                {cid: mask_lower_body(p, include_hips=True) for cid, p in obs.items()}
                 for obs in frames_obs_by_pid[g]
             ]
-            print(f"  p{g}：--upper-body-only → 全部视角的膝/踝/脚尖/脚跟都不参与重建")
+            print(f"  p{g}：--upper-body-only → 全部视角的下半身 + 髋都不参与重建")
     for g, group in enumerate(person_groups):
         if len(group) < 2:
             print(f"  ⚠ p{g} 组内相机数 {len(group)} < 2，跳过（无法三角化）")
@@ -524,20 +608,18 @@ def run_batch_mode(args, src, intrinsics, extrinsics, cids_ok, recon, detector, 
             if results_by_pid[g] is None:
                 print(f"  ⚠ p{g} VPoser 拟合失败")
         else:
-            kp3d_ov = None
-            if use_tracker and not args.no_robust_kp3d:
-                kp3d_ov = _robust_kp3ds_override(
-                    frames_robust_by_pid[g], frames_obs_by_pid[g])
+            kp3d_ov = kp3ds_by_pid.get(g)
+            if kp3d_ov is not None:
                 n_ok_kp = int((kp3d_ov[..., 3] > 0).any(axis=1).sum())
-                if n_ok_kp == 0:       # 阶段 D 无结果（如 --fake-poses）→ 用官方三角化
-                    kp3d_ov = None
-                else:
-                    print(f"  p{g}：3D 关键点用阶段 D 鲁棒三角化覆盖"
-                          f"（{n_ok_kp}/{len(kp3d_ov)} 帧有有效关节）")
-                if kp3d_ov is not None and g in upper_only:
-                    from tabletennis.reconstruction.easymocap import LOWER_BODY_BODY25
-                    kp3d_ov[:, list(LOWER_BODY_BODY25), :] = 0.0
-                    print(f"  p{g}：3D 下半身关节已按 --upper-body-only 清零")
+                print(f"  p{g}：3D 关键点用阶段 D 鲁棒三角化覆盖"
+                      f"（{n_ok_kp}/{len(kp3d_ov)} 帧有有效关节）")
+                if g in upper_only:
+                    from tabletennis.reconstruction.easymocap import (
+                        HIP_BODY25, LOWER_BODY_BODY25,
+                    )
+                    kp3d_ov = kp3d_ov.copy()
+                    kp3d_ov[:, list(LOWER_BODY_BODY25 + HIP_BODY25), :] = 0.0
+                    print(f"  p{g}：3D 下半身 + 髋关节已按 --upper-body-only 清零")
             results_by_pid[g] = recon.reconstruct_batch(
                 frames_obs_by_pid[g], intrinsics, extrinsics,
                 min_conf=args.fit_conf, view_ids=sorted(group),

@@ -13,6 +13,8 @@
   离线 EasyMocap 重建（`reconstruction/video_source.py` 对齐 + `em_fit.py` 热启动流式拟合）。
 - **姿态 2D** `vision/pose/rtmpose_pose.py` —— RTMPose-l-halpe26（26 点），top-down。
   **人检测默认换 `yolo11n-gray`**（1ch 灰度原生），见「人检测」节。
+  离线 `reconstruct_video.py` 走 **ViTPose**（`vision/pose/vitpose_pose.py`，coco_25 25 点含脚
+  → 重排成 halpe26），默认 **`vitpose-h-coco_25`**；见「离线 2D 模型」节。
 - **球检测** `vision/ball/` —— 三条路线都实现：经典 CV、YOLO（yolov8n）、灰度 yolo11n（1ch）。
 - **球 3D 重建** `reconstruction/ball.py` + `scripts/reconstruct_ball.py` + live_control 按 b —— 三角化 + 红球渲染。
 - **姿态 2D→3D 重建** `reconstruction/triangulate.py`（置信度加权多视角 DLT，已向量化）+ `associate.py`（跨视角匹配）+ `person_track.py`（**阶段 A–D 多人跟踪/身份**，宽视野一相机多人，见「多人跟踪」节）。`pose_track.py::PoseTracker` 是旧的单相机时序身份跟踪，已被 person_track 取代。
@@ -66,6 +68,35 @@
 - 三处提速：① `conf_thresh` 0.35→**0.5**（对齐旧 YOLOX，0.35 太松致 RTMPose 裁剪数翻倍）；② RTMPose 预处理归一化 float64→**float32 就地算**（省 ~1ms）；③ 人检测 imgsz **640→416**（人够大，检测段 5.1→2.5ms）。
 - ONNX 在 `~/.cache/tabletennis/yolo11n_grayscale_person_416.onnx`（`scripts/export_yolo11_person.py` 从 `data/weights/gray/yolo11n-grayscale.pt` 导出，`fix_onnx_dynamic.py --ch 1` 修 h/w；gitignored 需重导）。`det="yolox-tiny"` 分支保留作回退。
 - 真实含人帧 `detect_batch`(4 相机) 优化后 ~10.0ms + 重建 1ms ≈ **~90fps**。
+
+### 离线 2D 模型 + 拟合置信度阈值（P0 落地，2026-09-10）
+
+**离线不追推理速度 → 默认换最强 2D 模型**。`scripts/reconstruct_video.py --pose-model`
+默认 **`vitpose-h-coco_25`**（`vision/pose/vitpose_pose.py`，coco_25 25 点含脚 → halpe26）。
+- 模型放 **`/mnt/newdisk1/vitpose/`**（新硬盘），项目内软链 `data/weights/vitpose`。
+  档位 b/s 单文件；**l = 1.23GB 单文件；h = 226KB 图 + 394 个外挂分片同目录（~2.55GB）**
+  ——分片靠相对路径解析，**别单独拷 .onnx**。`vitpose_pose.py::_download_h` 从
+  `JunkyByte/easy_ViTPose` 拉（走 HTTP 代理 `http://127.0.0.1:7897`；SOCKS 会让 hf_hub 崩）。
+- **跨模型公平 A/B**（`scripts/error_budget/ab_pose_model.py`，同一批 2D 点、除模型外参数全同，
+  两段视频）：h/l 比原默认 vitpose-b 重投影中位 **−0.77/−0.92px** 与 **−1.09px**，
+  收益集中在下身/脚（−1.4~−2.0px）；**h vs l 头对头**：一段打平（−0.03px）、
+  一段 h 好 0.79px。检测段耗时 161014：l 254.9s / h 323.5s（2015 帧）。
+- **根关节抖动（2D-free 指标，2 段合并）**：b→c50→l→h 的 p1 max = **14.79→7.68→3.69→3.86cm**，
+  p1 中位 0.32→0.28→0.25→0.22 —— **换模型对追踪稳定性的贡献比调 fit-conf 更大**。
+- 要速度用 `--pose-model vitpose-l-coco_25`（精度基本持平、快 ~2.8×）。
+
+**`--fit-conf` 默认 0.15 → 0.5**：低置信度（遮挡外推）关节不参与 SMPL 拟合。
+**必须用固定观测集评**——提高阈值会把低置信度关节从重投影误差的分母里剔除，裸看中位数
+是**假提升**（`ab_eval.py` 用同一批 (帧,人,视角,关节) 同时算 `--fit-conf 0.5` 与 `0` 两组）。
+8 配置 × 3 段视频（5462 帧）：c50 在 fit/outfit/conf>0 四个口径上**全部不劣**，
+根关节 p1 最坏跳变 **14.79→7.68cm（−48%）**。ViTPose conf 中位 0.87~0.90，0.5 不误杀。
+
+**多视角 3D 共识降权（`reconstruction/obs_filter.py`，默认关）**：Cauchy
+`w=1/(1+(r/σ)²)`，r = 2D 观测与阶段 D 鲁棒 3D 的重投影距离，> `--consensus-max` 直接丢。
+留出视角 −7% 但**有循环成分**（参考相机就是留出视角），拟合视角 +2%、p0 抖动 +0.04cm
+→ 净账不划算，默认 `--consensus-sigma 0`；要压最坏跳变用 `--consensus-sigma 10`
+（p1 max 7.7→4.0cm）。`--save-pass1/--load-pass1` 可缓存 Pass 1 观测秒级重跑拟合。
+权威数字见 `docs/error_budget_report.md` §6/§7。
 
 ### 三角化：已向量化
 
@@ -146,6 +177,22 @@ p1 c0×398帧/c2×289帧/c1×9帧。**别拿「重投影误差 18.70→13.27px�
 （p0 10.8→10.4）、下身·坏视角 49.8→51.4 / 50.7→62.1px（**故意变差**：不再追那些
 错点——它们与好视角的 3D 共识本就差 50~60px）。
 
+**「远端连髋也丢」是开关不是默认（`mask_hips_when_unreliable`，默认关，2026-09-09）**：
+用户要求「远端的髋也不要，就要上半身」，但实测**远端的髋是全视角里最准的**——同 2D、同
+口径拆组（`HIP25={8,9,12}`）：髋·远端 5.7px=**3.5cm**、置信 0.84，髋·近端 13.8px=5.5cm、
+置信 0.86；上半身也是远端更准（4.0px=2.5cm vs 11.5px=4.6cm）。真正烂的是**膝以下**
+（踝 27cm、脚 42~49cm，置信 0.29），已由下半身门覆盖。丢髋的代价是**削掉拟合的根约束**
+（阶段 B/C 的根关节就靠髋），A/B（240 帧，同配置只切该开关）实测追踪侧全面退化：
+`root_index==19` 帧数 235→226 / 232→**192**，骨盆内点数 2.49→1.95 / 2.07→1.61，
+p1 相邻帧根跳变 max 12.07→**28.32cm**。故**默认关**，开关留给现场 A/B：
+`TrackConfig.mask_hips_when_unreliable` / `--mask-hips-when-unreliable`，
+`mask_lower_body(pose, include_hips=True)` 是底层实现（`HIP_HALPE26=(11,12,19)` /
+`HIP_BODY25={8,9,12}`）。`--upper-body-only PID` 语义就是「只要上半身」，**已改成连髋一起丢**。
+端到端 A/B（同 240 帧，只切该开关）：报告口径重投影中位 11.46→**11.64px**（略差）、
+髋·远端 3.2→5.0cm（**故意变差**，不再拟合那些点）、**留出视角**（p0 的 c3 / p1 的 c2）
+上身 8.7→8.3 / 14.5→14.7cm、髋 4.6→5.0cm、下身 57.4→54.4cm——即丢髋**没有**换来更好的
+3D，只是少了一个根约束。结论：默认关。
+
 **「某相机某帧没框」的成因（实测 515 个「人×相机」帧无框）**：A 预测位置投影出画幅
 151（那人不在该相机视野里）· C 全图只看到**另一个人** 300（被球桌/另一人挡住或太小）·
 D 全图也没检出人 28 · **B ROI 小窗漏检 36（7%，唯一可修的）**——全图能检出、就在预测
@@ -175,6 +222,18 @@ bbox 高仅 128~168px vs 正常 190~405px，投回该视角差 95~290px），喂
 
 - `scripts/reconstruct_video.py` 每帧存 `frame_NNNNNN.npz`（vertices/joints/…）时**多写一次 `recon_faces.npy`**（13776×3 SMPL 拓扑，整段一次，`ensure_faces`）。
 - `scripts/visualize_recon.py <recon目录>` 弹出 Open3D 新渲染器窗口逐帧回放（`--watch` 重建进行中追帧；`--render T out.png` EGL 出 PNG；`--root` 指定含标定的项目根）。t 是主时钟帧号：no_person/失败帧清空人体，被 `--stride` 跳过帧保持上一姿态（`ReconTimeline`）。
+- **「重投影误差中位」怎么读（2026-09-09 实测标尺）**：口径 = 每帧每人取**拟合视角**
+  （已剔裁边）里 conf>0 的关节，SMPL 的 body25 关节投影 vs 2D 观测的像素距离，先对
+  (视角×关节) 取均值 → 对人数取均值 → 对帧取中位数（`reconstruct_video.py:566` +
+  `_proj_err_px`）。**被掩码的下半身与裁边视角都不进分母，是自洽性不是真值**。
+  标尺（20260908_161147）：全体中位 **4.97mm/px → 13px ≈ 5cm**（近端视角 3.6~4.2mm/px、
+  远端 5.7~6.2 → 同一 px 值物理误差差 1.7 倍，**px 跨视角不可比**）。
+  **地板** = 同一批 2D 直接逐关节三角化后的跨视角一致性：中位 6.0px≈2.6cm（还被最小
+  二乘吸收 ~30%：3 视角 6 方程 3 未知 → 残差≈0.71σ，真实分歧 ≈8.5px≈3.7cm）→ 拟合
+  13px 只有地板的 **~1.5×**。2D 检测器自身抖动单轴 σ **0.4~1.1px/帧** → 13px 不是检测
+  噪声，主要来自「同一关节在不同相机上定位不同」（标定/遮挡/姿态模型偏差）。分人
+  8.1px(3.6cm)/12.6px(5.2cm)、p90 11.5/18.5cm；最差关节 骨盆中 7.1cm、R髋 5.9、R踝 5.4，
+  最好 L肩 2.7、眼 2.8。**结论：偏大但正常，对姿态够用（肩宽 40cm 的 1/8），对球远远不够。**
 - **按 `v` 的真实画面叠加（`Recon2DOverlay`）**：从重建目录读 `pose2d.json`（**原始**
   2D 姿态，下半身门不改它）/ `ball2d.json` / `pred_boxes.json`，配 `VideoSource` 取主时钟
   帧，2×2 平铺。三件事：① **固定 4 格 + 每格标 `camN`**（缺帧画 `no frame (drop/misalign)`
@@ -420,6 +479,8 @@ MvCamera.MV_CC_Finalize()
 - [x] 卡尔曼 dt 写死 0.01 假设 100FPS 致快速球误判冻结 → 用实际帧间隔，最终整体移除卡尔曼走逐帧纯 DLT。
 
 ### 视觉 / 姿态
+- [x] 离线 2D 模型默认换 **vitpose-h**（比 vitpose-b 重投影 −0.8~−0.9px、根关节最坏跳变 14.8→3.9cm）+ `--fit-conf` 0.5；共识降权实现但默认关——见「离线 2D 模型」节。
+- [ ] 在线 `live_control.py` 的姿态仍走 RTMPose-l + TRT（追实时，没跟离线一起换 ViTPose-h）；若要在线也升级需另测吞吐。
 - [x] 人检测 yolo11n 灰度（`det="yolo11n-gray"` 默认）+ 三处提速 + conf 0.5 + float32 归一化——见「人检测」节。
 - [x] RTMPose 预处理瓶颈是**归一化**（uint8→float64 占 3.35ms 的 60%），不是 warp（0.09ms）；float32 就地算省 ~1ms。
 - [ ] RTMPose `_trt_session` 加动态 batch profile(1/4/8) + 预热 batch 8（避免人数变化触发引擎重建）。

@@ -74,6 +74,11 @@ LOWER_BODY_BODY25: Tuple[int, ...] = tuple(
     b25 for h, b25 in HALPE26_TO_BODY25
     if h in (13, 14, 15, 16, 20, 21, 22, 23, 24, 25))
 
+# 髋部（骨盆中点 8 + 左右髋 9/12）在 body25 里的下标——与
+# ``person_track.HIP_HALPE26`` 一一对应。只有「整段只用上半身」时才连它们一起丢。
+HIP_BODY25: Tuple[int, ...] = tuple(
+    b25 for h, b25 in HALPE26_TO_BODY25 if h in (11, 12, 19))
+
 # 每个映射的权重（默认 1.0）。脚部点（大脚趾/小脚趾/脚跟，halpe 20-25）conf 本就
 # 偏低，若再降权会在 min_conf 门槛处被双重丢弃 → 踝关节方向失去全部 2D 约束，
 # SMPL 优化器只能乱拧腿（腿部扭曲主因之一）。故脚点不再降权，噪声交给置信度

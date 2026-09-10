@@ -49,7 +49,7 @@ __all__ = [
     "TrackConfig", "BoxTrack", "LocalCameraTracker", "PersonKalman",
     "PersonTrack", "TrackFrameResult", "MultiPersonTracker",
     "iou_xyxy", "select_fit_views", "lower_body_unreliable", "mask_lower_body",
-    "LOWER_BODY_HALPE26",
+    "LOWER_BODY_HALPE26", "HIP_HALPE26",
 ]
 
 _EMPTY_BOXES = np.zeros((0, 4), dtype=np.float32)
@@ -60,6 +60,10 @@ _CLIP_MARGIN_PX = 3.0
 # 下半身关键点在 halpe26 里的下标：膝 13/14、踝 15/16、脚尖 20-23、脚跟 24/25。
 # **髋部（11/12/19）不在内**——阶段 B/C 的根关节靠它，且髋几乎不被球桌挡住。
 LOWER_BODY_HALPE26: Tuple[int, ...] = (13, 14, 15, 16, 20, 21, 22, 23, 24, 25)
+
+# 髋部关键点在 halpe26 里的下标：左髋 11、右髋 12、骨盆中点 19。默认**不**掩码
+# （见 mask_lower_body 的说明）；只在 ``mask_hips_when_unreliable`` 打开时才一起丢。
+HIP_HALPE26: Tuple[int, ...] = (11, 12, 19)
 
 
 def lower_body_unreliable(pose: Pose2D, *, ratio: float = 0.5, abs_min: float = 0.5,
@@ -93,14 +97,21 @@ def lower_body_unreliable(pose: Pose2D, *, ratio: float = 0.5, abs_min: float = 
     return bool(m_low < ratio * m_up and m_low < abs_min)
 
 
-def mask_lower_body(pose: Pose2D) -> Pose2D:
+def mask_lower_body(pose: Pose2D, *, include_hips: bool = False) -> Pose2D:
     """返回副本：下半身关节（膝/踝/脚尖/脚跟）置信度置 0，坐标保留。
 
     置 0 后该视角的这些关节在下游（阶段 D 鲁棒三角化 / SMPL 拟合）自动被丢弃，
     3D 下半身只由**看得见腿的相机**决定；上半身与髋部完全不受影响。
+
+    ``include_hips=True`` 时连**髋部（halpe26 11/12/19）一起置 0**——即「该视角只用
+    上半身」。**默认关闭**：实测远端视角的髋残差 3.5cm（近端 5.5cm）、置信 0.84，
+    比近端还准，丢掉它会削弱骨盆（拟合根）的约束；真正烂掉的是膝以下
+    （踝 27cm、脚 42~49cm），已由 ``LOWER_BODY_HALPE26`` 覆盖。开关暴露出来只为
+    现场 A/B（``TrackConfig.mask_hips_when_unreliable`` / ``--mask-hips-when-unreliable``）。
     """
     kp = np.array(pose.keypoints, dtype=np.float64, copy=True)
-    for i in LOWER_BODY_HALPE26:
+    idx = LOWER_BODY_HALPE26 + (HIP_HALPE26 if include_hips else ())
+    for i in idx:
         if i < len(kp):
             kp[i, 2] = 0.0
     return replace(pose, keypoints=kp)
@@ -210,6 +221,8 @@ class TrackConfig:
     lower_body_gate: bool = True
     lower_body_conf_ratio: float = 0.5     # 下半身中位置信 < 该比例 × 上半身中位
     lower_body_conf_abs: float = 0.5       # 且下半身中位置信 < 该绝对值
+    mask_hips_when_unreliable: bool = False  # 被判不可信的视角**连髋也丢**（只用上身）
+                                             # 默认关：远端髋实测 3.5cm、比近端还准
     # -- 通用 --
     max_people: int = 4
     anchor_min_conf: float = 0.3       # anchor_2d 的关节置信度门限
@@ -1189,7 +1202,8 @@ class MultiPersonTracker:
                     pose, ratio=self.cfg.lower_body_conf_ratio,
                     abs_min=self.cfg.lower_body_conf_abs)
                 masked[cid] = bool(bad)
-                tri_obs[cid] = mask_lower_body(pose) if bad else pose
+                tri_obs[cid] = mask_lower_body(
+                    pose, include_hips=self.cfg.mask_hips_when_unreliable) if bad else pose
 
         robust = None
         if len(tri_obs) >= 2:
